@@ -1,0 +1,106 @@
+---
+/* Engine flag explorer: build a `vllm serve` command and see the consequences
+   (fits? KV capacity, max concurrent full-length sequences, scheduling trade-offs). */
+---
+<div data-viz="stack-flags"></div>
+
+<script>
+  import { mountAll, h, ctrlBar, select, slider, checkbox, stats, narration, C, fmt } from '../../lib/viz';
+  import { getModel, getGPU, GPUS, kvBytesPerToken } from '../../data/hardware';
+
+  const MODEL_IDS: [string, string][] = [
+    ['llama3-8b', 'meta-llama/Llama-3.1-8B-Instruct'],
+    ['qwen3-8b', 'Qwen/Qwen3-8B'],
+    ['qwen3-32b', 'Qwen/Qwen3-32B'],
+    ['qwen3-30b-a3b', 'Qwen/Qwen3-30B-A3B'],
+    ['llama3-70b', 'meta-llama/Llama-3.1-70B-Instruct'],
+  ];
+  const CTX = [4096, 8192, 16384, 32768, 65536, 131072];
+
+  mountAll('stack-flags', (root) => {
+    let mid = 'llama3-8b', gid = 'h100', tp = 1, ctxI = 3, util = 0.9, seqs = 256, batched = 8192, kvd = 'auto', quant = 'none', prefix = true;
+
+    const b1 = ctrlBar(root);
+    select(b1, 'Model', MODEL_IDS.map(([id, hf]) => ({ value: id, label: hf.split('/')[1] })), mid, (v) => { mid = v; render(); });
+    select(b1, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gid, (v) => { gid = v; render(); });
+    select(b1, '--tensor-parallel-size', [1, 2, 4, 8].map((n) => ({ value: String(n), label: String(n) })), '1', (v) => { tp = Number(v); render(); });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: '--max-model-len', min: 0, max: CTX.length - 1, value: ctxI, format: (i) => fmt.num(CTX[i], 0), onInput: (i) => { ctxI = i; render(); } });
+    slider(b2, { label: '--gpu-memory-utilization', min: 0.5, max: 0.98, step: 0.01, value: util, format: (v) => v.toFixed(2), onInput: (v) => { util = v; render(); } });
+    const b3 = ctrlBar(root);
+    slider(b3, { label: '--max-num-seqs', min: 8, max: 1024, step: 8, value: seqs, onInput: (v) => { seqs = v; render(); } });
+    slider(b3, { label: '--max-num-batched-tokens', min: 512, max: 32768, step: 512, value: batched, format: (v) => fmt.int(v), onInput: (v) => { batched = v; render(); } });
+    const b4 = ctrlBar(root);
+    select(b4, '--quantization', [{ value: 'none', label: 'none (BF16)' }, { value: 'fp8', label: 'fp8' }, { value: 'awq', label: 'awq (int4)' }], quant, (v) => { quant = v; render(); });
+    select(b4, '--kv-cache-dtype', [{ value: 'auto', label: 'auto (BF16)' }, { value: 'fp8', label: 'fp8' }], kvd, (v) => { kvd = v; render(); });
+    checkbox(b4, 'prefix caching', prefix, (v) => { prefix = v; render(); });
+
+    const pre = h('pre', { class: 'sf-cmd' }, root);
+    const st = stats(root, ['Weights / GPU', 'KV cache capacity', 'Full-length seqs that fit', 'Effective concurrency']);
+    const say = narration(root);
+    const tbl = h('div', { class: 'sf-tbl' }, root);
+
+    function render() {
+      const m = getModel(mid); const g = getGPU(gid);
+      const ctx = CTX[ctxI];
+      const wB = quant === 'none' ? 2 : quant === 'fp8' ? 1 : 0.55;
+      const kvB = kvd === 'fp8' ? 1 : 2;
+      const perGpuW = (m.params * wB) / tp;
+      const budget = g.memGB * 1e9 * util;
+      const overhead = 1.5e9 + 0.05 * g.memGB * 1e9 * (batched / 32768);
+      const kvRoom = budget - perGpuW - overhead;
+      const kvTokGpu = kvBytesPerToken(m, kvB) / Math.min(tp, m.kvHeads);
+      const kvTokens = Math.max(0, kvRoom / kvTokGpu);
+      const fullSeqs = kvTokens / ctx;
+      const eff = Math.min(seqs, Math.floor(kvTokens / Math.min(ctx, 2048)));
+      const hf = MODEL_IDS.find(([id]) => id === mid)![1];
+      const lines = [
+        `vllm serve ${hf}`,
+        tp > 1 ? `  --tensor-parallel-size ${tp}` : '',
+        `  --max-model-len ${ctx}`,
+        `  --gpu-memory-utilization ${util.toFixed(2)}`,
+        `  --max-num-seqs ${seqs}`,
+        `  --max-num-batched-tokens ${batched}`,
+        quant !== 'none' ? `  --quantization ${quant}` : '',
+        kvd !== 'auto' ? `  --kv-cache-dtype ${kvd}` : '',
+        prefix ? '  --enable-prefix-caching' : '  --no-enable-prefix-caching',
+      ].filter(Boolean);
+      pre.textContent = lines.join(' \\\n');
+
+      const fitsW = kvRoom > 0;
+      const fitsCtx = fullSeqs >= 1;
+      st.set('Weights / GPU', `${fmt.num(perGpuW / 1e9, 1)} GB`, `of ${g.memGB} GB × ${util.toFixed(2)}`, fitsW ? undefined : C.waste);
+      st.set('KV cache capacity', fitsW ? `${fmt.num(kvTokens, 1)} tok` : '—', fitsW ? `${fmt.num(kvRoom / 1e9, 1)} GB per GPU` : '');
+      st.set('Full-length seqs that fit', fitsW ? fmt.num(fullSeqs, 1) : '0', `at ${fmt.num(ctx, 0)} tokens`, fitsCtx ? C.good : C.waste);
+      st.set('Effective concurrency', fitsW ? String(Math.max(0, eff)) : '0', `min(max-num-seqs, KV at ~2K avg)`, eff < seqs ? C.prefill : undefined);
+
+      if (!fitsW) say('<b>Startup fails:</b> the weights plus runtime overhead exceed the memory budget. Raise TP, quantize, or use a bigger GPU.');
+      else if (!fitsCtx) say(`<b>Startup fails:</b> the engine checks that at least one <code>max-model-len</code> sequence (${fmt.num(ctx, 0)} tokens) fits in KV, but only ${fmt.num(kvTokens, 1)} tokens fit. Lower <code>--max-model-len</code>, use FP8 KV, or add GPUs.`);
+      else if (eff < seqs) say(`KV memory, not <code>--max-num-seqs</code>, is the real limit here: about <b>${eff}</b> average-length sequences fit, so extra requests will <b>queue</b>, or be <b>preempted</b> as contexts grow.`);
+      else say(`Fits. <code>--max-num-seqs ${seqs}</code> is the binding limit. A larger <code>--max-num-batched-tokens</code> (${fmt.int(batched)}) gives faster prefill and better TTFT, but each step gets longer, so ITL rises when long prompts arrive.`);
+
+      const rows: [string, string, string][] = [
+        ['--gpu-memory-utilization', 'Fraction of VRAM the engine may use. Whatever is left after weights and activations becomes KV cache.', `KV room ${fitsW ? fmt.num(kvRoom / 1e9, 1) + ' GB' : 'none'}`],
+        ['--max-model-len', 'Longest prompt + output allowed. Must fit in KV at least once; the default comes from the model config, often far too long.', `${fmt.num(ctx, 0)} tok · ${fmt.bytes(kvTokGpu * ctx)} per seq per GPU`],
+        ['--max-num-seqs', 'Cap on sequences in one batch. Higher means more throughput, until KV runs out.', `${seqs}`],
+        ['--max-num-batched-tokens', 'Token budget per scheduler step (prefill chunks + decodes). The TTFT vs ITL knob for chunked prefill.', `${fmt.int(batched)} / step`],
+        ['--tensor-parallel-size', 'Shard every layer across N GPUs in one node: more KV room, lower latency, but all-reduce overhead.', `${tp} GPU${tp > 1 ? 's' : ''}`],
+        ['--quantization', 'Load quantized weights (e.g. FP8, AWQ/GPTQ INT4) to save memory and bandwidth.', quant === 'none' ? 'BF16' : quant],
+        ['--kv-cache-dtype', 'Store K/V in FP8: about 2× tokens in the same memory. Validate on long-context evals.', kvd === 'fp8' ? '1 B / elem' : '2 B / elem'],
+        ['--enable-prefix-caching', 'Reuse KV for shared prompt prefixes (system prompts, multi-turn chat).', prefix ? 'on' : 'off'],
+      ];
+      tbl.innerHTML = `<table><thead><tr><th>Flag</th><th>What it controls</th><th>Now</th></tr></thead><tbody>${rows.map((r) => `<tr><td><code>${r[0]}</code></td><td>${r[1]}</td><td class="sf-now">${r[2]}</td></tr>`).join('')}</tbody></table>`;
+    }
+    render();
+  });
+</script>
+
+<style is:global>
+  .sf-cmd { margin: 4px 0 0; font-size: 0.8rem; background: var(--surface-solid); color: var(--c-kv); white-space: pre; }
+  .sf-tbl { margin-top: 12px; overflow-x: auto; }
+  .sf-tbl table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  .sf-tbl th { text-align: left; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-faint); padding: 6px 8px; border-bottom: 1px solid var(--border-strong); }
+  .sf-tbl td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; color: var(--text-dim); }
+  .sf-tbl td:first-child { white-space: nowrap; }
+  .sf-tbl .sf-now { font-family: var(--font-mono); color: var(--text); white-space: nowrap; font-size: 0.78rem; }
+</style>

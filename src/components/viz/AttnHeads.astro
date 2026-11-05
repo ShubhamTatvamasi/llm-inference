@@ -1,0 +1,88 @@
+---
+/* MHA vs GQA vs MQA vs MLA: how many K/V heads are cached, for the same model shape. */
+---
+<div data-viz="attn-heads"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, segmented, select, stats, C, fmt } from '../../lib/viz';
+  import { MODELS, getModel } from '../../data/hardware';
+
+  type Scheme = 'MHA' | 'GQA' | 'MQA' | 'MLA';
+  const W = 940, H = 352;
+  const NQ = 16; // drawn query heads
+
+  mountAll('attn-heads', (root) => {
+    let scheme: Scheme = 'GQA';
+    let model = getModel('llama3-70b');
+    const bar = ctrlBar(root);
+    segmented(bar, (['MHA', 'GQA', 'MQA', 'MLA'] as Scheme[]).map((v) => ({ value: v, label: v })), scheme, (v) => { scheme = v as Scheme; render(); });
+    select(bar, 'Model shape', MODELS.filter((m) => m.attn !== 'MLA').map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Query heads sharing key/value heads' });
+    const st = stats(root, ['KV heads cached / layer', 'KV per token', 'Tokens in 40 GB of cache', 'vs MHA']);
+
+    function kvPerToken(sc: Scheme) {
+      const L = model.layers, hd = model.headDim, b = 2;
+      if (sc === 'MHA') return 2 * L * model.heads * hd * b;
+      if (sc === 'GQA') return 2 * L * model.kvHeads * hd * b;
+      if (sc === 'MQA') return 2 * L * 1 * hd * b;
+      return L * (512 + 64) * b; // MLA latent (DeepSeek-style 512 + 64 rope dims)
+    }
+
+    function render() {
+      clear(svg);
+      const groups = scheme === 'MHA' ? NQ : scheme === 'GQA' ? Math.max(1, Math.round(NQ / (model.heads / model.kvHeads))) : 1;
+      const qW = 42, gap = 12, x0 = (W - (NQ * qW + (NQ - 1) * gap)) / 2;
+      const qY = 34, kvY = 190;
+      text(svg, 20, qY - 16, `Query heads (drawing ${NQ} of ${model.heads})`, { class: 't-small t-bold', style: `fill:${C.token}` });
+      for (let q = 0; q < NQ; q++) {
+        const x = x0 + q * (qW + gap);
+        rect(svg, x, qY, qW, 34, C.tokenSoft, { stroke: C.token, rx: 7 });
+        text(svg, x + qW / 2, qY + 17, `q${q}`, { 'text-anchor': 'middle', class: 't-mono t-small' });
+      }
+      if (scheme === 'MLA') {
+        // latent box + up-projections
+        const lx = W / 2 - 150, lw = 300;
+        text(svg, 20, kvY + 120, 'Cached per token', { class: 't-small t-bold', style: `fill:${C.kv}` });
+        rect(svg, lx, kvY + 50, lw, 44, C.kv, { rx: 9 });
+        text(svg, W / 2, kvY + 72, 'one latent c_KV (512) + rope key (64)', { 'text-anchor': 'middle', class: 't-bold t-small', style: 'fill:var(--bg)' });
+        for (let q = 0; q < NQ; q++) {
+          const x = x0 + q * (qW + gap) + qW / 2;
+          s('path', { d: `M${W / 2},${kvY + 50} C${W / 2},${kvY} ${x},${kvY - 40} ${x},${qY + 36}`, fill: 'none', stroke: C.kv, 'stroke-width': 1.2, 'stroke-dasharray': '4 3', opacity: 0.7 }, svg);
+        }
+        rect(svg, W / 2 - 120, kvY - 18, 240, 26, C.surface2, { stroke: C.border, rx: 6 });
+        text(svg, W / 2, kvY - 5, 'up-projected to per-head K, V on the fly', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      } else {
+        const kW = Math.min(64, (W - 80) / groups - 10);
+        const span = groups * kW + (groups - 1) * 10;
+        const kx0 = (W - span) / 2;
+        text(svg, 20, kvY + 120, `KV heads cached (${scheme === 'MHA' ? model.heads : scheme === 'GQA' ? model.kvHeads : 1} real)`, { class: 't-small t-bold', style: `fill:${C.kv}` });
+        for (let g = 0; g < groups; g++) {
+          const x = kx0 + g * (kW + 10);
+          rect(svg, x, kvY + 50, kW, 22, C.kv, { rx: 5 });
+          rect(svg, x, kvY + 75, kW, 22, C.kvSoft, { rx: 5, stroke: C.kv });
+          if (kW > 30) { text(svg, x + kW / 2, kvY + 61, 'K', { 'text-anchor': 'middle', class: 't-small t-bold', style: 'fill:var(--bg)' }); text(svg, x + kW / 2, kvY + 86, 'V', { 'text-anchor': 'middle', class: 't-small t-bold' }); }
+          const per = NQ / groups;
+          for (let q = g * per; q < (g + 1) * per; q++) {
+            const qx = x0 + q * (qW + gap) + qW / 2;
+            s('path', { d: `M${x + kW / 2},${kvY + 50} C${x + kW / 2},${kvY} ${qx},${qY + 80} ${qx},${qY + 36}`, fill: 'none', stroke: C.kv, 'stroke-width': 1.3, opacity: 0.65 }, svg);
+          }
+        }
+      }
+      const desc: Record<Scheme, string> = {
+        MHA: 'Every query head has its own K and V head.',
+        GQA: `Groups of ${model.heads / model.kvHeads} query heads share one K/V head.`,
+        MQA: 'All query heads share a single K/V head.',
+        MLA: 'K and V are rebuilt from one small compressed latent per token.',
+      };
+      text(svg, W / 2, H - 14, desc[scheme], { 'text-anchor': 'middle', class: 't-dim' });
+
+      const kv = kvPerToken(scheme), mha = kvPerToken('MHA');
+      st.set('KV heads cached / layer', scheme === 'MLA' ? '1 latent' : String(scheme === 'MHA' ? model.heads : scheme === 'GQA' ? model.kvHeads : 1), `for ${model.heads} query heads`);
+      st.set('KV per token', fmt.bytes(kv), `${model.layers} layers, BF16`, C.kv);
+      st.set('Tokens in 40 GB of cache', fmt.num(40e9 / kv, 1), 'shared by all users');
+      st.set('vs MHA', `${(mha / kv).toFixed(1)}× smaller`, scheme === 'MHA' ? 'baseline' : 'more users or longer context');
+    }
+    render();
+  });
+</script>

@@ -1,0 +1,53 @@
+---
+/* Ridge point (FLOPs/byte needed to become compute-bound) for every GPU, by precision.
+   Newer GPUs add FLOPs faster than bandwidth → the ridge keeps moving right. */
+---
+<div data-viz="roofline-ridges"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, segmented, slider, C, fmt } from '../../lib/viz';
+  import { GPUS } from '../../data/hardware';
+
+  const W = 940, ROW = 34;
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+
+  mountAll('roofline-ridges', (root) => {
+    let prec: 'bf16' | 'fp8' | 'fp4' = 'bf16';
+    let batch = 64;
+    const bar = ctrlBar(root);
+    segmented(bar, [{ value: 'bf16', label: 'BF16' }, { value: 'fp8', label: 'FP8' }, { value: 'fp4', label: 'FP4' }], prec, (v) => { prec = v as typeof prec; render(); });
+    slider(bar, { label: 'Your decode batch', min: 1, max: 1024, value: batch, onInput: (v) => { batch = v; render(); } });
+    const H = 60 + GPUS.length * ROW + 30;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Ridge point by GPU' });
+
+    function render() {
+      clear(svg);
+      const LX = 170, BW = W - LX - 120;
+      const xs = (v: number) => LX + (Math.log10(Math.min(v, 2000)) / Math.log10(2000)) * BW;
+      const bytes = prec === 'bf16' ? 2 : prec === 'fp8' ? 1 : 0.5;
+      text(svg, 10, 18, 'GPU', { class: 't-faint t-small t-bold' });
+      text(svg, LX, 18, 'ridge point: FLOPs per byte needed to stop being memory-bound (log)', { class: 't-faint t-small t-bold' });
+      for (const k of [1, 10, 100, 1000]) {
+        s('line', { x1: xs(k), y1: 30, x2: xs(k), y2: H - 26, stroke: C.border }, svg);
+        text(svg, xs(k), H - 12, String(k), { 'text-anchor': 'middle', class: 't-faint t-small t-mono' });
+      }
+      // decode intensity marker for chosen batch (weight GEMM: ≈ 2·batch / bytes-per-weight)
+      const ai = (2 * batch) / bytes;
+      s('line', { x1: xs(ai), y1: 30, x2: xs(ai), y2: H - 26, stroke: C.decode, 'stroke-width': 2.5 }, svg);
+      text(svg, xs(ai) + 6, 40, `decode @ batch ${batch} ≈ ${fmt.int(ai)}`, { class: 't-small t-bold', ...fillStyle(C.decode), 'text-anchor': xs(ai) > W - 260 ? 'end' : 'start', dx: xs(ai) > W - 260 ? -12 : 0 });
+
+      GPUS.forEach((g, i) => {
+        const y = 56 + i * ROW;
+        const tf = prec === 'bf16' ? g.bf16TF : prec === 'fp8' ? g.fp8TF : g.fp4TF;
+        text(svg, 10, y + 10, g.name, { class: 't-small t-bold' });
+        if (!tf) { text(svg, LX, y + 10, 'not supported in hardware', { class: 't-faint t-small' }); return; }
+        const r = tf / g.bwTBs;
+        const compute = ai >= r;
+        rect(svg, LX, y, xs(r) - LX, 20, compute ? C.compute : C.weight, { rx: 5, opacity: 0.88 });
+        text(svg, xs(r) + 8, y + 10, `${fmt.int(r)}`, { class: 't-small t-mono t-bold' });
+        text(svg, W - 10, y + 10, compute ? 'compute-bound' : 'memory-bound', { 'text-anchor': 'end', class: 't-small', ...fillStyle(compute ? C.compute : C.weight) });
+      });
+    }
+    render();
+  });
+</script>

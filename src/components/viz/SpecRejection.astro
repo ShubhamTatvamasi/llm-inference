@@ -1,0 +1,93 @@
+---
+/* Lossless speculative sampling: accept a draft token x with prob min(1, p(x)/q(x)),
+   otherwise resample from the residual max(0, p − q). The output follows p exactly. */
+---
+<div data-viz="spec-reject"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, slider, button, stats, legend, C, rng, s } from '../../lib/viz';
+
+  const TOKS = ['Paris', 'Lyon', 'the', 'a', 'France', 'Rome'];
+  const P = [0.55, 0.08, 0.15, 0.1, 0.07, 0.05];
+  const QBAD = [0.12, 0.34, 0.04, 0.3, 0.05, 0.15];
+  const W = 940, H = 300;
+
+  mountAll('spec-reject', (root) => {
+    let lam = 0.6;
+    let emp: number[] | null = null;
+    let drawStats = { acc: 0, n: 0 };
+    let seed = 7;
+
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Draft quality (how close q is to p)', min: 0, max: 1, step: 0.05, value: lam, format: (v) => v.toFixed(2), onInput: (v) => { lam = v; emp = null; render(); } });
+    button(bar, 'Sample 5,000 tokens', () => simulate(), { primary: true, icon: 'play' });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Target distribution p, draft distribution q, and the resulting output distribution' });
+    const st = stats(root, ['Acceptance rate α (theory)', 'Observed acceptance', 'Output distribution = p?']);
+    legend(root, [['p: target model', C.decode], ['q: draft model', C.token], ['min(p, q): accepted mass', C.kv], ['Observed output (after sampling)', C.prefill]]);
+
+    const Q = () => P.map((p, i) => lam * p + (1 - lam) * QBAD[i]);
+
+    function sample(dist: number[], r: () => number) {
+      let u = r(), acc = 0;
+      for (let i = 0; i < dist.length; i++) { acc += dist[i]; if (u < acc) return i; }
+      return dist.length - 1;
+    }
+
+    function simulate() {
+      const q = Q(); const r = rng(seed++);
+      const resid = P.map((p, i) => Math.max(0, p - q[i]));
+      const rs = resid.reduce((a, b) => a + b, 0) || 1;
+      const residN = resid.map((x) => x / rs);
+      const counts = new Array(TOKS.length).fill(0);
+      let acc = 0; const N = 5000;
+      for (let n = 0; n < N; n++) {
+        const x = sample(q, r);
+        if (r() < Math.min(1, P[x] / q[x])) { counts[x]++; acc++; }
+        else counts[sample(residN, r)]++;
+      }
+      emp = counts.map((c) => c / N);
+      drawStats = { acc, n: N };
+      render();
+    }
+
+    function render() {
+      clear(svg);
+      const q = Q();
+      const X0 = 60, Y0 = 30, PH = 190, GW = (W - X0 - 20) / TOKS.length;
+      const maxV = 0.6;
+      const y = (v: number) => Y0 + PH - (v / maxV) * PH;
+      for (const g of [0, 0.2, 0.4, 0.6]) {
+        s('line', { x1: X0 - 6, x2: W - 20, y1: y(g), y2: y(g), stroke: C.border }, svg);
+        text(svg, X0 - 12, y(g), g.toFixed(1), { 'text-anchor': 'end', class: 't-faint t-small t-mono' });
+      }
+      TOKS.forEach((t, i) => {
+        const gx = X0 + i * GW + 14;
+        const bw = (GW - 40) / 3;
+        // p bar
+        rect(svg, gx, y(P[i]), bw, Y0 + PH - y(P[i]), C.decode, { rx: 3 });
+        // q bar with overlap min(p,q) shaded
+        rect(svg, gx + bw + 4, y(q[i]), bw, Y0 + PH - y(q[i]), C.token, { rx: 3, opacity: 0.85 });
+        const m = Math.min(P[i], q[i]);
+        rect(svg, gx + bw + 4, y(m), bw, Y0 + PH - y(m), C.kv, { rx: 3, opacity: 0.9 });
+        // empirical
+        if (emp) rect(svg, gx + 2 * (bw + 4), y(emp[i]), bw, Y0 + PH - y(emp[i]), C.prefill, { rx: 3 });
+        else rect(svg, gx + 2 * (bw + 4), Y0 + PH - 2, bw, 2, C.border, {});
+        text(svg, gx + (3 * bw + 8) / 2, Y0 + PH + 16, t, { 'text-anchor': 'middle', class: 't-bold' });
+        const a = Math.min(1, P[i] / q[i]);
+        text(svg, gx + (3 * bw + 8) / 2, Y0 + PH + 34, `accept ${Math.round(a * 100)}%`, { 'text-anchor': 'middle', class: 't-small t-mono', fill: a > 0.99 ? C.kv : C.dim });
+        text(svg, gx + (3 * bw + 8) / 2, Y0 + PH + 50, 'if drafted', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      });
+      text(svg, X0, 12, 'probability of each next token', { class: 't-small t-dim' });
+
+      const alpha = P.reduce((a, p, i) => a + Math.min(p, q[i]), 0);
+      st.set('Acceptance rate α (theory)', `${(alpha * 100).toFixed(1)}%`, 'Σ min(p, q) = 1 − TV(p, q)', C.kv);
+      st.set('Observed acceptance', emp ? `${((drawStats.acc / drawStats.n) * 100).toFixed(1)}%` : '–', emp ? 'of 5,000 drafted tokens' : 'press Sample');
+      if (emp) {
+        const tv = P.reduce((a, p, i) => a + Math.abs(p - emp![i]), 0) / 2;
+        st.set('Output distribution = p?', tv < 0.02 ? '✓ yes' : `TV ${tv.toFixed(3)}`, `max gap ${(Math.max(...P.map((p, i) => Math.abs(p - emp![i]))) * 100).toFixed(1)} pts: sampling noise only`, C.good);
+      } else st.set('Output distribution = p?', '–', 'sample to check');
+    }
+    render();
+  });
+</script>

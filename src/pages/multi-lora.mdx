@@ -1,0 +1,104 @@
+---
+layout: ../layouts/Chapter.astro
+title: Multi-LoRA Serving
+description: Serve hundreds of fine-tuned variants from one copy of the base model, in the same batch, by attaching tiny low-rank adapters per request.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import LoraRank from '../components/viz/LoraRank.astro';
+import LoraBatch from '../components/viz/LoraBatch.astro';
+import LoraCache from '../components/viz/LoraCache.astro';
+
+Imagine 200 customers who each want "the model, but fine-tuned on *our* data." Deploying 200 full copies of an 8B model would need 3.2 TB of weights and 200 mostly idle GPUs. **LoRA** makes each fine-tune a few tens of megabytes. **Multi-LoRA serving** goes one step further and runs requests for *different* fine-tunes together, in one batch, on one base model.
+
+## LoRA in one equation
+
+Low-Rank Adaptation freezes the pretrained weight matrix $W \in \mathbb{R}^{d_\text{out} \times d_\text{in}}$ and learns a small **update** as the product of two thin matrices:
+
+$$
+W' = W + \frac{\alpha}{r}\, B A, \qquad A \in \mathbb{R}^{r \times d_\text{in}},\; B \in \mathbb{R}^{d_\text{out} \times r},\; r \ll d
+$$
+
+At inference you never form $W'$. You compute both paths and add them:
+
+$$
+y = xW^\top + \frac{\alpha}{r}\,(x A^\top) B^\top
+$$
+
+The first term is the normal, expensive matmul. The second goes through an $r$-dimensional bottleneck, usually $r$ = 8–64, so it costs a tiny fraction of the FLOPs and memory.
+
+<Viz title="How big is an adapter?" label="Explore">
+  <LoraRank />
+  <Fragment slot="caption">
+    <p>Thin slivers vs a big square: at rank 16, the adapter for a 4096×4096 projection is under 1% of its size. Adding the MLP projections (gate, up, down) roughly triples the adapter but usually improves quality. A full fine-tune would duplicate the entire model.</p>
+  </Fragment>
+</Viz>
+
+## Many adapters, one batch
+
+The naive way to serve adapters is to **merge** each one into its own model copy: $W' = W + BA$. That gives zero runtime overhead, but costs a full copy of the weights per adapter and a separate deployment. Multi-LoRA serving keeps one shared $W$ and applies each request's own $A_i, B_i$ on the fly:
+
+<Viz title="Different adapters in the same forward pass" label="Live">
+  <LoraBatch />
+  <Fragment slot="caption">
+    <p>The expensive base GEMM is shared by all rows, so <a href="../batching/">continuous batching</a> still works. Specialized kernels (often called SGMV / BGMV, popularized by Punica and S-LoRA) handle the per-row adapter math in one launch: they gather each row's Aᵢ and Bᵢ by adapter index, instead of looping over adapters.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key">
+The adapter path is **memory-light but not free**. Each step adds two extra skinny matmuls per LoRA-wrapped layer and some gather overhead. A typical rule of thumb is single-digit-percent slower decode than the plain base model, in exchange for serving many variants on one GPU.
+</Callout>
+
+## Where do the adapters live?
+
+GPU memory is precious: it holds the base weights and the [KV cache](../kv-cache/). So engines keep only a limited number of adapters **resident on the GPU** (`max_loras` in vLLM), cache more in **CPU RAM**, and load the rest from disk or object storage on demand.
+
+<Viz title="The adapter cache: GPU ↔ CPU ↔ disk" label="Live">
+  <LoraCache />
+  <Fragment slot="caption">
+    <p>With skewed popularity, a handful of GPU slots serves most traffic. Set the skew to 0 (every adapter equally popular) and the hit rate collapses: the rare adapters keep evicting each other, and every cold miss adds hundreds of milliseconds to time-to-first-token.</p>
+  </Fragment>
+</Viz>
+
+Key engine knobs (vLLM naming):
+
+| Flag | What it controls | Trade-off |
+|---|---|---|
+| `--enable-lora` | Turns on the LoRA code path | Small constant overhead |
+| `--lora-modules name=path` | Adapters registered at startup | Clients select one via the `model` field |
+| `--max-loras` | Adapters that can be **active in one batch** | More slots → more GPU memory reserved |
+| `--max-lora-rank` | Largest supported rank | Buffers are sized for this, so set it no higher than needed |
+| `--max-cpu-loras` | CPU-side adapter cache size | More RAM, fewer slow disk loads |
+
+## Routing matters
+
+With many replicas, the **router** decides how often adapters have to be loaded. Spreading requests round-robin means every replica eventually loads every adapter. **Adapter-aware routing** sends requests for the same adapter to the replicas that already hold it, while still balancing load. See [routing & autoscaling](../routing-autoscaling/).
+
+## Merge, multi-LoRA, or dedicated deployment?
+
+| Situation | Best fit |
+|---|---|
+| One fine-tune with heavy, latency-critical traffic | **Merge** the adapter into the weights and deploy it on its own: no adapter overhead |
+| Dozens to thousands of variants, each with modest traffic | **Multi-LoRA** on a shared base: one deployment, high utilization |
+| A few popular adapters plus a long tail | Multi-LoRA with **pinned/pre-loaded** hot adapters and adapter-aware routing; consider dedicated replicas for the hottest |
+| Adapters trained on different base models | Separate base-model pools; adapters only work with the base they were trained on |
+
+<Interview>
+  <Q q="What is LoRA, and why are adapters so small?" level="core">
+    LoRA freezes the base weights and learns a low-rank update ΔW = B·A with rank r much smaller than the hidden size. For a d×d matrix that is r·2d parameters instead of d². At r = 16 and d = 4096 that is about 0.8% of the matrix, so a whole-model adapter is often tens of MB.
+  </Q>
+  <Q q="How can one batch contain requests for different adapters?" level="core">
+    All rows share the expensive base matmul xW. The LoRA term x·Aᵢ·Bᵢ is computed per row with batched gather kernels (SGMV/BGMV) that look up each row's adapter by index, so one launch handles all adapters. The results are added to the base output.
+  </Q>
+  <Q q="When would you merge an adapter instead of serving it with multi-LoRA?" level="mid">
+    When one variant has enough steady traffic to justify its own replicas and needs the lowest latency. A merged model has no adapter overhead and no adapter-loading risk. Multi-LoRA wins when there are many variants, each with too little traffic to keep dedicated GPUs busy.
+  </Q>
+  <Q q="40 adapters on one deployment: popular ones are fast, rare ones are slow. Why, and what do you do?" level="senior">
+    Rare adapters miss the GPU (and maybe CPU) cache and are loaded from storage on demand, which adds hundreds of ms to TTFT. They also evict each other when `max_loras` is small. Fixes: size `max_loras` and the CPU cache from traffic data, pre-load or pin important adapters, use adapter-aware routing so each replica serves a stable subset, and give the heaviest adapters dedicated or merged deployments.
+  </Q>
+  <Q q="Why does --max-lora-rank matter even if most adapters are low rank?" level="senior">
+    The engine pre-allocates per-slot buffers and picks kernels for the maximum rank, so a high limit wastes GPU memory (taking it from the KV cache) and can slow every adapter. Set it to the largest rank you actually serve, and keep a separate pool for unusually high-rank adapters.
+  </Q>
+</Interview>

@@ -1,0 +1,92 @@
+---
+/* LoRA: W' = W + (α/r)·B·A. Explore how rank and target modules set adapter size. */
+---
+<div data-viz="lora-rank"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, select, slider, checkbox, stats, legend, C, fmt, s } from '../../lib/viz';
+  import { MODELS, getModel, type Model } from '../../data/hardware';
+
+  const RANKS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+  const MODS = ['q', 'k', 'v', 'o', 'gate', 'up', 'down'] as const;
+  type Mod = typeof MODS[number];
+  const dims = (m: Model, mod: Mod): [number, number] => {
+    const q = m.heads * m.headDim, kv = m.kvHeads * m.headDim;
+    switch (mod) {
+      case 'q': return [m.hidden, q];
+      case 'k': case 'v': return [m.hidden, kv];
+      case 'o': return [q, m.hidden];
+      case 'gate': case 'up': return [m.hidden, m.ffn];
+      case 'down': return [m.ffn, m.hidden];
+    }
+  };
+  const W = 940, H = 270;
+
+  mountAll('lora-rank', (root) => {
+    const dense = MODELS.filter((m) => !m.experts);
+    let model = getModel('llama3-8b');
+    let r = 16;
+    const on: Record<Mod, boolean> = { q: true, k: true, v: true, o: true, gate: false, up: false, down: false };
+
+    const bar = ctrlBar(root);
+    select(bar, 'Base model', dense.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    slider(bar, { label: 'Rank r', min: 0, max: RANKS.length - 1, value: 4, format: (i) => String(RANKS[i]), onInput: (i) => { r = RANKS[i]; render(); } });
+    const bar2 = ctrlBar(root);
+    const lab = document.createElement('span'); lab.className = 'field'; lab.textContent = 'Target modules:'; bar2.appendChild(lab);
+    for (const m of MODS) checkbox(bar2, m === 'gate' ? 'gate' : m, on[m], (v) => { on[m] = v; render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Frozen weight matrix W next to the low-rank factors A and B' });
+    const st = stats(root, ['Adapter parameters', 'Adapter size (BF16)', 'vs. full fine-tune', 'Adapters per 10 GB']);
+    legend(root, [['Frozen base weight W (shared by all users)', C.weight], ['A: d_in → r (down-projection)', C.token], ['B: r → d_out (up-projection)', C.kv]]);
+
+    function render() {
+      clear(svg);
+      const [din, dout] = dims(model, 'q');
+      const S = 180;
+      const X0 = 40, Y0 = 40;
+      const mx = Math.max(din, dout);
+      const wW = (S * din) / mx, hW = (S * dout) / mx;
+      // W
+      rect(svg, X0, Y0, wW, hW, C.weight, { rx: 4, opacity: 0.85 });
+      text(svg, X0 + wW / 2, Y0 + hW / 2, 'W', { 'text-anchor': 'middle', class: 't-big', fill: 'var(--bg)', 'font-size': 28 });
+      text(svg, X0 + wW / 2, Y0 - 12, `${fmt.int(dout)} × ${fmt.int(din)} (q_proj, one layer)`, { 'text-anchor': 'middle', class: 't-small t-dim' });
+      text(svg, X0 + wW / 2, Y0 + hW + 18, `${fmt.num(din * dout, 1)} params · frozen`, { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+      text(svg, X0 + S + 30, Y0 + hW / 2, '+', { 'text-anchor': 'middle', class: 't-big', 'font-size': 26 });
+      text(svg, X0 + S + 80, Y0 + hW / 2, 'α/r ·', { 'text-anchor': 'middle', class: 't-mono t-dim', 'font-size': 14 });
+      // B (dout × r) and A (r × din), drawn to scale (min 2px)
+      const bx = X0 + S + 116;
+      const rw = Math.max(2, (S * r) / mx);
+      rect(svg, bx, Y0, rw, hW, C.kv, { rx: 1 });
+      text(svg, bx, Y0 + hW + 18, `B: ${fmt.int(dout)} × ${r}`, { class: 't-small t-mono', fill: C.kv });
+      text(svg, bx + rw + 14, Y0 + hW / 2, '·', { 'text-anchor': 'middle', class: 't-big', 'font-size': 24 });
+      const ax = bx + rw + 28;
+      rect(svg, ax, Y0, wW, rw, C.token, { rx: 1 });
+      text(svg, ax + wW / 2, Y0 + rw + 16, `A: ${r} × ${fmt.int(din)}`, { 'text-anchor': 'middle', class: 't-small t-mono', fill: C.token });
+      text(svg, ax + wW / 2, Y0 + hW / 2 + 20, `rank-${r} update: ${fmt.num(r * (din + dout), 1)} params`, { 'text-anchor': 'middle', class: 't-small t-dim' });
+      text(svg, ax + wW / 2, Y0 + hW / 2 + 38, `${((r * (din + dout)) / (din * dout) * 100).toFixed(2)}% of W`, { 'text-anchor': 'middle', class: 't-small t-mono', fill: C.kv });
+
+      // right: per-module bars for the whole model
+      const RX = 700;
+      text(svg, RX, 26, 'Adapter params per module (all layers)', { class: 't-small t-bold t-dim' });
+      let total = 0;
+      const per = MODS.map((m) => { const [a, b] = dims(model, m); const p = on[m] ? r * (a + b) * model.layers : 0; total += p; return { m, p }; });
+      const pmax = Math.max(...MODS.map((m) => { const [a, b] = dims(model, m); return r * (a + b) * model.layers; }));
+      per.forEach(({ m, p }, i) => {
+        const y = 40 + i * 28;
+        text(svg, RX, y + 8, m, { class: 't-mono t-small', fill: on[m] ? C.text : C.faint });
+        rect(svg, RX + 44, y, 150, 16, C.surface3, { rx: 4 });
+        if (p) rect(svg, RX + 44, y, (p / pmax) * 150, 16, C.kv, { rx: 4 });
+        if (p) text(svg, RX + 200, y + 8, fmt.num(p, 1), { class: 't-mono t-small', 'font-size': 10.5 });
+      });
+      s('line', { x1: RX, x2: W - 10, y1: 238, y2: 238, stroke: C.border }, svg);
+      text(svg, RX, 254, `total ${fmt.num(total, 1)} params`, { class: 't-bold t-mono' });
+
+      const bytes = total * 2;
+      st.set('Adapter parameters', fmt.num(total, 1), `rank ${r} × ${MODS.filter((m) => on[m]).length} modules × ${model.layers} layers`);
+      st.set('Adapter size (BF16)', fmt.bytes(bytes), 'what you load per tenant');
+      st.set('vs. full fine-tune', `${((total / model.params) * 100).toFixed(2)}%`, `full copy = ${fmt.num((model.params * 2) / 1e9, 1)} GB`, C.good);
+      st.set('Adapters per 10 GB', total ? fmt.int(Math.floor(10e9 / bytes)) : '–', `full fine-tunes in 10 GB: ${Math.floor(10e9 / (model.params * 2))}`);
+    }
+    render();
+  });
+</script>

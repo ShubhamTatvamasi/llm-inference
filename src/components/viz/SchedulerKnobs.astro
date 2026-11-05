@@ -1,0 +1,94 @@
+---
+/* "What happens if…" explorer for the main engine knobs. */
+---
+<div data-viz="scheduler-knobs"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, select, slider, h, C, fmt } from '../../lib/viz';
+  import { MODELS, GPUS, getModel, getGPU, kvBytesPerToken } from '../../data/hardware';
+
+  const LENS = [2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const SEQS = [8, 16, 32, 64, 128, 256, 512, 1024];
+
+  mountAll('scheduler-knobs', (root) => {
+    let model = getModel('llama3-8b'), gpu = getGPU('h100'), tp = 1;
+    let util = 0.9, li = 3, si = 5, avg = 3000, kvb = 2;
+
+    const b1 = ctrlBar(root);
+    select(b1, 'Model', MODELS.filter((m) => m.params <= 8e10).map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(b1, 'GPU', GPUS.map((x) => ({ value: x.id, label: x.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    select(b1, 'tensor_parallel_size', ['1', '2', '4', '8'].map((v) => ({ value: v, label: v })), '1', (v) => { tp = Number(v); render(); });
+    select(b1, 'kv_cache_dtype', [{ value: '2', label: 'auto (BF16)' }, { value: '1', label: 'fp8' }], '2', (v) => { kvb = Number(v); render(); });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'gpu_memory_utilization', min: 0.5, max: 0.98, step: 0.01, value: util, format: (v) => v.toFixed(2), onInput: (v) => { util = v; render(); } });
+    slider(b2, { label: 'max_model_len', min: 0, max: LENS.length - 1, value: li, format: (i) => fmt.num(LENS[i], 0), onInput: (i) => { li = i; render(); } });
+    const b3 = ctrlBar(root);
+    slider(b3, { label: 'max_num_seqs', min: 0, max: SEQS.length - 1, value: si, format: (i) => String(SEQS[i]), onInput: (i) => { si = i; render(); } });
+    slider(b3, { label: 'Avg tokens / request (traffic)', min: 256, max: 32000, step: 256, value: avg, format: (v) => fmt.num(v, 1), onInput: (v) => { avg = v; render(); } });
+
+    const W = 940, H = 150;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Per-GPU memory split and concurrency gauge' });
+    const g = s('g', {}, svg);
+    const verdicts = h('ul', { class: 'knob-verdicts' }, root);
+    const style = h('style', {}, root);
+    style.textContent = `.knob-verdicts{list-style:none;margin:10px 0 0;padding:0;display:grid;gap:6px;font-size:.88rem}
+      .knob-verdicts li{display:flex;gap:10px;align-items:flex-start;padding:8px 12px;border-radius:10px;background:var(--surface-2);border:1px solid var(--border)}
+      .knob-verdicts b.i{flex:none;width:20px;height:20px;border-radius:6px;display:grid;place-items:center;font-size:.75rem;color:var(--bg)}`;
+
+    function render() {
+      clear(g); verdicts.innerHTML = '';
+      const maxLen = LENS[li], maxSeqs = SEQS[si];
+      const memPer = gpu.memGB * 1e9;
+      const budgetPer = memPer * util;
+      const wPer = (model.params * 2) / tp;
+      const overheadPer = Math.max(1.5e9, 0.04 * memPer);
+      const kvPer = Math.max(0, budgetPer - wPer - overheadPer);
+      const kvTok = (kvPer * tp) / kvBytesPerToken(model, kvb);
+      const fitsW = wPer + overheadPer <= budgetPer;
+      const cap = Math.floor(kvTok / Math.min(avg, maxLen));
+      const conc = Math.min(maxSeqs, cap);
+
+      // per-GPU bar
+      const X0 = 160, X1 = W - 20, sx = (b: number) => ((X1 - X0) * b) / memPer;
+      text(g, 0, 26, `Each of ${tp} GPU${tp > 1 ? 's' : ''}`, { class: 't-small t-bold' });
+      text(g, 0, 42, `${gpu.memGB} GB`, { class: 't-small t-mono t-dim' });
+      rect(g, X0, 14, X1 - X0, 36, C.surface2, { rx: 6, stroke: C.border });
+      let x = X0;
+      const seg = (w: number, col: string, lbl: string) => { const ww = Math.max(0, Math.min(w, X1 - x)); if (ww <= 0) return; rect(g, x, 14, ww, 36, col, { rx: 0 }); if (ww > 80) text(g, x + 8, 32, lbl, { class: 't-small t-bold', fill: 'var(--bg)' }); x += ww; };
+      seg(sx(wPer), C.weight, `weights ${fmt.num(wPer / 1e9, 1)} GB`);
+      seg(sx(overheadPer), C.mem, 'runtime');
+      seg(sx(kvPer), C.kv, `KV pool ${fmt.num(kvPer / 1e9, 1)} GB`);
+      const bx = X0 + sx(budgetPer);
+      s('line', { x1: bx, y1: 8, x2: bx, y2: 56, stroke: C.text, 'stroke-dasharray': '4 3', 'stroke-width': 1.4 }, g);
+      text(g, bx, 66, `utilization ${util.toFixed(2)}`, { 'text-anchor': 'middle', class: 't-small t-dim' });
+
+      // concurrency gauge
+      const GY = 96;
+      text(g, 0, GY + 10, 'Concurrency', { class: 't-small t-bold' });
+      const top = Math.max(maxSeqs, cap, 1) * 1.05;
+      const gx = (v: number) => X0 + ((X1 - X0) * Math.min(v, top)) / top;
+      rect(g, X0, GY, X1 - X0, 20, C.surface2, { rx: 10, stroke: C.border });
+      rect(g, X0, GY, gx(conc) - X0, 20, cap < maxSeqs ? C.prefill : C.decode, { rx: 10 });
+      s('line', { x1: gx(cap), y1: GY - 6, x2: gx(cap), y2: GY + 26, stroke: C.kv, 'stroke-width': 2 }, g);
+      text(g, gx(cap), GY + 38, `KV fits ${fmt.int(cap)}`, { 'text-anchor': gx(cap) > X1 - 60 ? 'end' : 'middle', class: 't-small t-bold', fill: C.kv });
+      s('line', { x1: gx(maxSeqs), y1: GY - 6, x2: gx(maxSeqs), y2: GY + 26, stroke: C.decode, 'stroke-width': 2 }, g);
+      text(g, gx(maxSeqs), GY - 12, `max_num_seqs ${maxSeqs}`, { 'text-anchor': gx(maxSeqs) > X1 - 60 ? 'end' : 'middle', class: 't-small t-bold', fill: C.decode });
+
+      const add = (ok: 'ok' | 'warn' | 'bad', html: string) => {
+        const li2 = h('li', {}, verdicts);
+        const ic = h('b', { class: 'i', text: ok === 'ok' ? '✓' : ok === 'warn' ? '!' : '✗' }, li2);
+        ic.style.background = ok === 'ok' ? 'var(--c-good)' : ok === 'warn' ? 'var(--c-prefill)' : 'var(--c-waste)';
+        h('span', { html }, li2);
+      };
+      if (!fitsW) { add('bad', `<b>Fails at load:</b> weights (${fmt.num(wPer / 1e9, 1)} GB/GPU) + runtime exceed the ${util.toFixed(2)} budget. Use more tensor parallelism, a bigger GPU, or quantized weights.`); return; }
+      if (kvTok < maxLen) add('bad', `<b>Refuses to start:</b> the KV pool holds ${fmt.int(kvTok)} tokens, which is less than one <code>max_model_len</code> sequence (${fmt.int(maxLen)}). Lower max_model_len, raise utilization, use FP8 KV, or add GPUs.`);
+      else add('ok', `KV pool holds <b>${fmt.int(kvTok)} tokens</b>, enough for ${fmt.num(kvTok / maxLen, 1)} max-length sequences.`);
+      if (cap < maxSeqs) add('warn', `<b>KV memory, not max_num_seqs, limits the batch:</b> about ${fmt.int(cap)} requests of ~${fmt.num(avg, 1)} tokens fit. Under load the scheduler stops admitting and starts <b>preempting</b>, so tail latency suffers.`);
+      else add('ok', `<b>max_num_seqs caps the batch at ${maxSeqs}</b> while KV could hold ~${fmt.int(cap)}. ${cap > maxSeqs * 1.5 ? 'You could raise max_num_seqs for more throughput, if latency SLOs allow.' : 'Balanced.'}`);
+      if (util > 0.95) add('warn', 'Utilization above 0.95 leaves little headroom for activation spikes, CUDA graphs and other processes on the GPU: risk of OOM at runtime.');
+      if (tp > 1) add('ok', `Tensor parallelism ${tp}: each GPU holds 1/${tp} of the weights and of every KV head group, so the KV pool scales almost ×${tp}, at the cost of all-reduce traffic every layer.`);
+      if (kvb === 1) add('ok', 'FP8 KV cache halves bytes per token: about twice the concurrency or context. Validate accuracy on long-context tasks.');
+    }
+    render();
+  });
+</script>

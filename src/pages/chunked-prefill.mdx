@@ -1,0 +1,89 @@
+---
+layout: ../layouts/Chapter.astro
+title: Chunked Prefill
+description: Long prompts can freeze everyone else's token stream. Chunked prefill splits them into pieces and mixes them with decodes under a per-iteration token budget.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import ChunkedTimeline from '../components/viz/ChunkedTimeline.astro';
+import ChunkedBudget from '../components/viz/ChunkedBudget.astro';
+
+[Continuous batching](../batching/) puts every request into the same forward pass: users who are mid-answer need one <span class="chip decode">decode</span> token each, and newcomers need a <span class="chip prefill">prefill</span> of their whole prompt. Both kinds of work run in the **same iteration**, and an iteration lasts as long as its slowest part.
+
+A decode token costs almost nothing extra; the step is dominated by reading the weights. A 6,000-token prefill is a large compute-bound matmul that can take hundreds of milliseconds. If it runs in one iteration, **every user streaming tokens sees their output freeze** until it finishes.
+
+## The stall, visualized
+
+<Viz title="A long prompt arrives while four users stream" label="Live">
+  <ChunkedTimeline />
+  <Fragment slot="caption">
+    <p>The top lane shows GPU iterations, each block as wide as it took. Below, each dot is a token delivered to a user. With <b>no chunking</b>, one 400+ ms iteration creates a visible freeze in every stream (red). With a <b>token budget</b>, the prompt is split into chunks small enough that streams keep their normal pace. The cost is a somewhat later first token for the long prompt.</p>
+  </Fragment>
+</Viz>
+
+## How chunked prefill works
+
+Each iteration gets a **token budget**. vLLM calls it `max_num_batched_tokens`; other engines have equivalent knobs. The scheduler fills the budget in priority order:
+
+1. **Decodes first.** Every running sequence gets its one token. These are cheap and latency-critical.
+2. **Then prefill chunks.** The rest of the budget goes to the next slice of any pending prompt, which might be a partially prefilled prompt from the previous iteration or a new request.
+3. A prompt that is **not finished** keeps its partial KV cache and continues in the next iteration. Its first output token comes after its last chunk.
+
+$$
+\text{chunk}_t = \text{budget} - \#\text{decoding sequences}, \qquad
+\text{iterations to prefill} = \left\lceil \frac{\text{prompt length}}{\text{chunk}} \right\rceil
+$$
+
+The trick works because attention over a chunk needs only the **K/V of earlier chunks**, which are already in the [KV cache](../kv-cache/). Chunk *k* attends to the cached chunks 1…*k*−1 plus itself, causally. The result is identical to doing the prefill in one pass.
+
+<Callout type="key">
+Chunked prefill does not make prefill cheaper. It **bounds the size of every iteration**, so no single step can stall the streams, and it fills the leftover compute of memory-bound decode steps with useful prefill work.
+</Callout>
+
+## Picking the budget
+
+The budget is a direct trade-off between the two latencies users feel:
+
+- **Smaller budget** → each iteration is short → smooth streaming (low **ITL**), but long prompts take more iterations, so **TTFT** rises, and each step pays the fixed per-iteration overhead more often.
+- **Larger budget** → fewer, bigger iterations → faster prefill and better GPU efficiency, but decodes stall longer whenever a big chunk is in flight.
+
+<Viz title="Token budget: ITL vs TTFT" label="Explore">
+  <ChunkedBudget />
+  <Fragment slot="caption">
+    <p>Simple cost model: each iteration costs a fixed 8 ms (reading the weights) plus 0.07 ms per token processed, roughly an 8B model on an H100. Notice that with many decoding sequences and a tiny budget, almost nothing is left for prefill, and long prompts starve.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="tip" title="Practical defaults">
+Interactive chat services usually choose a budget in the low thousands of tokens to keep inter-token latency smooth. Batch or offline workloads, where nobody watches a stream, should use a large budget, or disable chunking, for maximum throughput. Always tune it against **p99 ITL** and **p95 TTFT** measured on your own traffic.
+</Callout>
+
+## Beyond chunking
+
+Chunked prefill makes prefill and decode **share** each GPU fairly. Two related techniques go further:
+
+- **Decode-priority scheduling with prefill caps** limits how many prefill tokens or new requests can join per step, to protect existing streams under bursty load.
+- **[Disaggregated prefill/decode](../disaggregation/)** runs prefill and decode on **separate GPU pools** and ships the KV cache between them, so they never interfere. It is more complex and only pays off at scale, or when tail ITL SLOs are strict.
+
+<Interview>
+  <Q q="What problem does chunked prefill solve?" level="core">
+    In continuous batching, a long prompt's prefill shares an iteration with other users' decode steps. Prefilling a long prompt in one shot makes that iteration very slow, so every streaming user's output freezes: an ITL spike. Chunking splits the prompt so each iteration's work is bounded.
+  </Q>
+  <Q q="Explain the token budget and how the scheduler fills it." level="core">
+    <code>max_num_batched_tokens</code> caps the total tokens processed per iteration. The scheduler first adds one token for each running decode sequence, then fills the remaining budget with the next chunk of pending prefills. Unfinished prompts continue next iteration.
+  </Q>
+  <Q q="How does changing max_num_batched_tokens affect TTFT and ITL?" level="mid">
+    A smaller budget gives shorter iterations, so ITL is better while prefills are in flight, but long prompts need more iterations and per-step overhead adds up, so TTFT is worse. A larger budget gives better TTFT and throughput but bigger decode stalls. Tune it against your SLO percentiles.
+  </Q>
+  <Q q="Is chunked prefill mathematically identical to normal prefill?" level="mid">
+    Yes, up to floating-point differences. Each chunk's queries attend causally to the cached K/V of all earlier chunks plus the chunk's own earlier tokens, which is exactly the set of keys they would see in a single-pass prefill.
+  </Q>
+  <Q q="Clinicians report that the assistant's streaming freezes for 1–2 s whenever someone uploads a long discharge summary. Diagnose and fix." level="senior">
+    That is a classic prefill/decode interference pattern. Confirm by plotting p99 ITL against concurrent prompt lengths. Fixes: enable or shrink the chunked-prefill budget; route long-document ingestion to a separate pool; cap prompt size at the gateway; at larger scale, consider P/D disaggregation.
+  </Q>
+  <Q q="Why does chunked prefill often raise overall throughput too?" level="senior">
+    Decode iterations are memory-bound and leave tensor cores mostly idle. Mixing a prefill chunk into those iterations uses that spare compute at little extra cost, so the GPU does more useful work per weight read than when it alternates between pure-prefill and pure-decode steps.
+  </Q>
+</Interview>

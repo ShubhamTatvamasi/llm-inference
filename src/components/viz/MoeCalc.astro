@@ -1,0 +1,84 @@
+---
+/* MoE economics: memory follows TOTAL params, compute follows ACTIVE params,
+   and the bytes read per decode step grow with batch as more experts are touched. */
+---
+<div data-viz="moe-calc"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, select, slider, stats, narration, C, fmt } from '../../lib/viz';
+  import { MODELS, getModel, getGPU } from '../../data/hardware';
+
+  const W = 940, H = 256;
+  const moeModels = MODELS.filter((m) => m.experts);
+
+  mountAll('moe-calc', (root) => {
+    let model = getModel('qwen3-30b-a3b');
+    let wBytes = 2, batch = 16;
+    const gpu = getGPU('h100');
+    const b1 = ctrlBar(root);
+    select(b1, 'MoE model', moeModels.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(b1, 'Weights', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }, { value: '0.5', label: 'INT4 / FP4' }], '2', (v) => { wBytes = Number(v); render(); });
+    slider(b1, { label: 'Decode batch', min: 0, max: 9, value: 4, format: (i) => String(2 ** i), onInput: (i) => { batch = 2 ** i; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Total vs active parameters and experts touched vs batch size' });
+    const st = stats(root, ['Memory (all experts)', 'Active per token', 'FLOPs per token', 'Bytes read / step', 'H100s for weights']);
+    const say = narration(root);
+
+    function touched(b: number) {
+      const e = model.experts!;
+      return 1 - Math.pow(1 - e.active / e.total, b);
+    }
+
+    function render() {
+      clear(svg);
+      const total = model.params * wBytes;
+      const active = model.activeParams * wBytes;
+      const frac = touched(batch);
+      const read = active + (total - active) * frac;
+      // left: two bars
+      const X = 20, BW = 400;
+      text(svg, X, 18, 'What you pay for…', { class: 't-small t-faint' });
+      const maxB = total;
+      const bars: [string, number, string, string][] = [
+        ['Memory: ALL params', total, C.weight, fmt.num(total / 1e9, 0) + ' GB'],
+        ['Compute: active params / token', active, C.compute, fmt.num(active / 1e9, 1) + ' GB-equiv'],
+        [`Bytes read per step (batch ${batch})`, read, C.decode, fmt.num(read / 1e9, 1) + ' GB'],
+      ];
+      bars.forEach(([lab, v, col, val], i) => {
+        const y = 36 + i * 62;
+        text(svg, X, y, lab, { class: 't-small t-bold' });
+        rect(svg, X, y + 10, BW, 26, C.surface2, { rx: 6 });
+        rect(svg, X, y + 10, Math.max(3, (v / maxB) * BW), 26, col, { rx: 6 });
+        text(svg, X + BW + 8, y + 23, val, { class: 't-small t-mono' });
+      });
+
+      // right: experts touched vs batch (log2 x axis)
+      const cx0 = 540, cx1 = W - 16, cy0 = 30, cy1 = 210;
+      text(svg, cx0, 18, 'Fraction of experts touched in one decode step', { class: 't-small t-faint' });
+      s('line', { x1: cx0, y1: cy1, x2: cx1, y2: cy1, stroke: C.border }, svg);
+      s('line', { x1: cx0, y1: cy0, x2: cx0, y2: cy1, stroke: C.border }, svg);
+      const px = (i: number) => cx0 + (i / 9) * (cx1 - cx0);
+      const py = (f: number) => cy1 - f * (cy1 - cy0);
+      let d = '';
+      for (let i = 0; i <= 90; i++) { const b = 2 ** (i / 10); d += `${i ? 'L' : 'M'}${px(i / 10)},${py(touched(b))}`; }
+      s('path', { d, fill: 'none', stroke: C.decode, 'stroke-width': 2.5 }, svg);
+      [0, 3, 6, 9].forEach((i) => text(svg, px(i), cy1 + 14, String(2 ** i), { 'text-anchor': 'middle', class: 't-small t-faint t-mono' }));
+      text(svg, (cx0 + cx1) / 2, cy1 + 32, 'tokens in the batch (log scale)', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      [0, 0.5, 1].forEach((f) => text(svg, cx0 - 6, py(f), `${f * 100}%`, { 'text-anchor': 'end', class: 't-small t-faint t-mono' }));
+      const bi = Math.log2(batch);
+      s('circle', { cx: px(bi), cy: py(frac), r: 6, fill: C.decode, stroke: 'var(--bg)', 'stroke-width': 2 }, svg);
+      text(svg, px(bi) + (bi > 6 ? -10 : 10), py(frac) - 12, `${(frac * 100).toFixed(0)}%`, { 'text-anchor': bi > 6 ? 'end' : 'start', class: 't-small t-bold', fill: C.decode });
+
+      const bw = gpu.bwTBs * 1e12;
+      st.set('Memory (all experts)', `${fmt.num(total / 1e9, 0)} GB`, `${fmt.num(model.params, 1)} params`);
+      st.set('Active per token', fmt.num(model.activeParams, 1), `${((model.activeParams / model.params) * 100).toFixed(0)}% of total`);
+      st.set('FLOPs per token', fmt.num(2 * model.activeParams, 1), '≈ 2 × active params');
+      st.set('Bytes read / step', `${fmt.num(read / 1e9, 1)} GB`, `≥ ${fmt.ms((read / bw) * 1e3)} on one H100's bandwidth`);
+      st.set('H100s for weights', String(Math.ceil(total / (gpu.memGB * 1e9 * 0.85))), 'before any KV cache');
+      say(frac < 0.3
+        ? `At batch ${batch}, each step touches only <b>${(frac * 100).toFixed(0)}%</b> of the experts, so decode reads far fewer bytes than a dense model of the same size. That is MoE's latency win.`
+        : `At batch ${batch}, the tokens collectively touch <b>${(frac * 100).toFixed(0)}%</b> of the experts. Each step now streams almost the <b>whole</b> model from memory, while each token still gets the FLOPs of a small model. Big-batch MoE decode is bandwidth-hungry; spread experts across many GPUs (EP) to multiply bandwidth.`);
+    }
+    render();
+  });
+</script>

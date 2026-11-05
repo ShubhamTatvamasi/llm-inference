@@ -1,0 +1,16 @@
+---
+/**
+ * Frame for every interactive diagram.
+ * <Viz label="Live" title="KV cache growth"> <MyDiagram /> <Fragment slot="caption">…</Fragment></Viz>
+ */
+interface Props { label?: string; title: string; live?: boolean }
+const { label = 'Interactive', title, live = true } = Astro.props;
+---
+<figure class="viz">
+  <div class="viz-head">
+    <span class="viz-label">{live && <span class="live" />}{label}</span>
+    <span class="viz-title">{title}</span>
+  </div>
+  <div class="viz-body"><slot /></div>
+  {Astro.slots.has('caption') && <figcaption class="viz-caption"><slot name="caption" /></figcaption>}
+</figure>

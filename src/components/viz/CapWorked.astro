@@ -1,0 +1,66 @@
+---
+/* Step-by-step worked capacity plan (animated): Llama 3.1 70B, FP8 weights, 2×H100 per replica,
+   3 req/s, 3,000-token prompts, 500-token answers, TPOT ≤ 50 ms, 70% target utilisation. */
+---
+<div data-viz="cap-worked"></div>
+
+<script>
+  import { mountAll, h, clear, ctrlBar, player, fmt } from '../../lib/viz';
+  import { getModel, getGPU, kvBytesPerToken } from '../../data/hardware';
+  import { plan, money } from './capacityModel';
+
+  mountAll('cap-worked', (root) => {
+    const model = getModel('llama3-70b'), gpu = getGPU('h100');
+    const P = { model, gpu, tp: 2, wBytes: 1, kvBytes: 2, prompt: 3000, output: 500, rps: 3, tpotSlo: 50, ttftSlo: 2, util: 0.7 };
+    const r = plan(P);
+    const kvTok = kvBytesPerToken(model, 2);
+    const seqTok = P.prompt + P.output;
+    const outPerHr = P.rps * P.output * 3600;
+
+    const STEPS: { t: string; f: string; res: string; why: string }[] = [
+      { t: 'Memory budget per replica', f: `2 GPUs × ${gpu.memGB} GB × 0.90 (gpu_memory_utilization)`, res: `${fmt.num(r.budget / 1e9, 0)} GB`, why: 'Engines pre-allocate a fixed fraction of HBM and leave the rest for the CUDA context and fragmentation.' },
+      { t: 'Weights + runtime', f: `70.6 B params × 1 byte (FP8) + ~${fmt.num(r.overhead / 1e9, 1)} GB activations/graphs`, res: `${fmt.num((r.weights + r.overhead) / 1e9, 1)} GB`, why: 'FP8 halves the weight footprint compared with BF16, which leaves twice as much room for KV cache.' },
+      { t: 'KV cache room', f: `${fmt.num(r.budget / 1e9, 0)} − ${fmt.num((r.weights + r.overhead) / 1e9, 1)} GB`, res: `${fmt.num(r.kvAvail / 1e9, 1)} GB`, why: 'Everything left over becomes KV-cache blocks shared by all in-flight requests.' },
+      { t: 'Sequences that fit', f: `KV/token = 2 × 80 × 8 × 128 × 2 B = ${fmt.bytes(kvTok)}; × ${fmt.int(seqTok)} tokens = ${fmt.bytes(r.kvSeq)} each`, res: `${r.maxSeqMem} seqs`, why: 'This is the memory ceiling on concurrency at full length. Real requests are often shorter, but plan for the long tail.' },
+      { t: 'Batch that meets the TPOT SLO', f: `each step reads ~70 GB of weights + KV at ~${fmt.num(2 * gpu.bwTBs * 0.75, 1)} TB/s ≈ ${(r.step * 1000).toFixed(1)} ms; + prefill interference`, res: `${r.C} seqs @ ${(r.tpot * 1000).toFixed(1)} ms`, why: 'Larger batches raise throughput but slow every step. The SLO, not memory, decides the batch here.' },
+      { t: 'Throughput per replica', f: `1 ÷ (500 tokens × ${(r.step * 1000).toFixed(1)} ms ÷ ${r.C} + ${fmt.ms(r.pT * 1000)} prefill)`, res: `${r.rpsRep.toFixed(2)} req/s`, why: `≈ ${fmt.int(r.outTokS)} output tokens/s at the SLO, measured fully loaded. A load test should confirm this number.` },
+      { t: 'Concurrency needed (Little’s law)', f: `${P.rps} req/s × E2E ${r.e2e.toFixed(1)} s`, res: `${Math.round(r.inflight)} in flight`, why: 'A cross-check: this many requests are holding KV cache at any moment, across the fleet.' },
+      { t: 'Replicas', f: `${P.rps} ÷ (${r.rpsRep.toFixed(2)} × ${P.util} target utilisation) = ${(P.rps / (r.rpsRep * P.util)).toFixed(2)} → round up`, res: `${r.replicas} (+1 spare)`, why: 'Headroom absorbs bursts and keeps you on the left side of the goodput knee. Add one spare replica for failures and rollouts.' },
+      { t: 'Cost', f: `${r.gpus} GPUs × $${gpu.pricePerHr}/h = ${money(r.costHr)}/h ÷ ${fmt.num(outPerHr / 1e6, 1)} M output tokens/h`, res: `${money(r.costPerM)} / M tok`, why: 'This assumes traffic stays at 3 req/s around the clock. At 40% average utilisation the effective price is ~2.5× higher; idle GPUs still cost money.' },
+    ];
+
+    const bar = ctrlBar(root);
+    const list = h('ol', { class: 'cwe-list' }, root);
+    let shown = 0;
+    function reset() { shown = 0; }
+    function step() { shown = Math.min(STEPS.length, shown + 1); return shown < STEPS.length; }
+    function render() {
+      clear(list);
+      STEPS.forEach((s0, i) => {
+        const li = h('li', { class: `cwe-step ${i < shown ? 'on' : ''} ${i === shown - 1 ? 'cur' : ''}` }, list);
+        h('span', { class: 'cwe-n', text: String(i + 1) }, li);
+        const body = h('div', { class: 'cwe-b' }, li);
+        const top = h('div', { class: 'cwe-top' }, body);
+        h('span', { class: 'cwe-t', text: s0.t }, top);
+        h('span', { class: 'cwe-r', text: i < shown ? s0.res : '?' }, top);
+        if (i < shown) { h('code', { class: 'cwe-f', text: s0.f }, body); h('div', { class: 'cwe-w', text: s0.why }, body); }
+      });
+    }
+    player(bar, root, { step, reset, render, interval: 1500, autoplay: true });
+  });
+</script>
+
+<style is:global>
+  .cwe-list { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 8px; }
+  .cwe-step { display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface-2); opacity: 0.45; transition: opacity 0.3s, border-color 0.3s, box-shadow 0.3s; }
+  .cwe-step.on { opacity: 1; }
+  .cwe-step.cur { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .cwe-n { flex: none; width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; font-family: var(--font-mono); font-size: 0.75rem; font-weight: 650; background: var(--surface-3); color: var(--text-dim); }
+  .cwe-step.on .cwe-n { background: var(--accent); color: var(--bg); }
+  .cwe-b { flex: 1; min-width: 0; }
+  .cwe-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .cwe-t { font-weight: 620; font-size: 0.92rem; }
+  .cwe-r { font-family: var(--font-mono); font-weight: 650; font-size: 0.92rem; color: var(--c-kv); white-space: nowrap; }
+  .viz .cwe-f { display: block; margin-top: 4px; font-size: 0.76rem; color: var(--text-dim); background: none; border: 0; padding: 0; white-space: normal; }
+  .cwe-w { margin-top: 3px; font-size: 0.82rem; color: var(--text-dim); line-height: 1.5; }
+</style>

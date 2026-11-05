@@ -1,0 +1,136 @@
+---
+layout: ../layouts/Chapter.astro
+title: The Serving Stack
+description: Follow one chat request from the SDK call to the last streamed token, through gateway, router, engine, scheduler and GPU. Then compare the engines, the flags that matter, and how it all runs on Kubernetes.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import StackPipeline from '../components/viz/StackPipeline.astro';
+import StackFlags from '../components/viz/StackFlags.astro';
+import StackColdStart from '../components/viz/StackColdStart.astro';
+
+Every earlier chapter zoomed in on one mechanism. This one zooms out to the whole path. A production LLM endpoint is a **pipeline of seven stages**, and almost every latency problem, outage or cost overrun can be traced to one of them.
+
+## The life of one request
+
+<Viz title="From SDK call to streamed answer" label="Live">
+  <StackPipeline />
+  <Fragment slot="caption">
+    <p>The request travels left to right once. The answer travels back right to left as many small Server-Sent Events. Try <b>Cancel</b> mid-stream: a disconnect has to reach the engine, or the GPU keeps generating tokens nobody will read, and holds KV memory.</p>
+  </Fragment>
+</Viz>
+
+In timing terms:
+
+- **TTFT** (time to first token) = gateway + routing + tokenization + **queueing in the scheduler** + **prefill** + one network hop back. Queueing is the part that blows up under load.
+- **ITL** (inter-token latency) = one **decode step** for the whole batch, plus detokenization and streaming, which are usually small.
+- Everything in front of the engine should add milliseconds, not hundreds of them. If it does, look for proxies that **buffer** responses (common with default nginx or ingress settings), which breaks streaming entirely.
+
+See [latency metrics](../metrics/) for exact definitions.
+
+<Callout type="key" title="OpenAI-compatible is a contract, not a guarantee">
+vLLM, SGLang, TensorRT-LLM (`trtllm-serve`) and llama.cpp (`llama-server`) all expose `/v1/chat/completions`, `/v1/completions` and `/v1/models`, so the same SDK works by changing `base_url`. Tool-call formats, structured-output parameters, error bodies and token accounting still differ, so keep a small **contract test suite** for whichever engine you run.
+</Callout>
+
+## Choosing an engine
+
+| Engine | Sweet spot | Watch out for |
+|---|---|---|
+| **vLLM** | General-purpose GPU serving; widest model coverage; PagedAttention, prefix caching, multi-LoRA, structured output, speculative decoding, P/D connectors | Many knobs; defaults (like max context) are often not right for your workload |
+| **SGLang** | Workloads with heavy prefix sharing (agents, RAG, few-shot) via RadixAttention; strong large-MoE and P/D support | Smaller ecosystem; check model support |
+| **TensorRT-LLM** | Highest performance on NVIDIA, FP8/FP4 kernels, in-flight batching, pairs with Triton / Dynamo | NVIDIA-only; engine builds per GPU and config |
+| **llama.cpp** | CPU, Apple Silicon, edge and laptops; GGUF single-file models with many quantization types | Not built for high-concurrency datacenter GPU serving |
+| **Hugging Face TGI** | Existing deployments | In maintenance mode; prefer an actively developed engine for new work |
+
+Whatever you pick, **pin the exact versions** of the engine, model revision, tokenizer and chat template, and the quantized artifacts. A silent change to any of them changes outputs.
+
+## The flags that matter
+
+Engines have hundreds of options, but a handful decide memory, concurrency and latency. Build a `vllm serve` command and watch what each change does:
+
+<Viz title="Engine flag explorer" label="Explore">
+  <StackFlags />
+  <Fragment slot="caption">
+    <p>The capacity numbers use the same model as the <a href="../kv-cache/">KV-cache calculator</a>. Two common startup failures appear here: weights that don't fit the memory budget, and a <code>--max-model-len</code> whose KV cache doesn't fit even once.</p>
+  </Fragment>
+</Viz>
+
+A practical tuning order:
+
+1. **`--max-model-len`**: set it to what your product really needs. A 128K default reserves room you will never use.
+2. **`--gpu-memory-utilization`**: as high as is stable (0.90–0.95), so KV gets everything left over.
+3. **`--tensor-parallel-size`**: the smallest value that leaves healthy KV room.
+4. **`--kv-cache-dtype fp8`** and **`--quantization`**: once you have evals that show quality holds.
+5. **`--max-num-seqs`** and **`--max-num-batched-tokens`**: tune last, against your TTFT and ITL SLOs under realistic load.
+
+## Running it on Kubernetes
+
+The engine is just a container, but a **very** heavy one: a 10 GB image, tens to hundreds of GB of weights, and minutes of initialization. The deployment shape reflects that:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama-70b
+spec:
+  replicas: 2
+  template:
+    spec:
+      nodeSelector: { nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3 }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:<pinned-version>
+          args: ["meta-llama/Llama-3.1-70B-Instruct",
+                 "--tensor-parallel-size", "4",
+                 "--max-model-len", "16384",
+                 "--gpu-memory-utilization", "0.92"]
+          resources:
+            limits: { nvidia.com/gpu: 4 }
+          volumeMounts:
+            - { name: weights, mountPath: /root/.cache/huggingface }   # pre-staged weights
+            - { name: shm, mountPath: /dev/shm }                       # needed for TP workers
+          startupProbe:   { httpGet: { path: /health, port: 8000 }, periodSeconds: 10, failureThreshold: 90 }
+          readinessProbe: { httpGet: { path: /health, port: 8000 }, periodSeconds: 5 }
+          livenessProbe:  { httpGet: { path: /health, port: 8000 }, periodSeconds: 15, failureThreshold: 6 }
+```
+
+What makes cold starts slow, and what makes them fast:
+
+<Viz title="Cold start of an inference pod" label="Live">
+  <StackColdStart />
+  <Fragment slot="caption">
+    <p>Untick each option to see a worst-case scale-up from zero: a new GPU node, an image pull, and weights from the internet. Tick them one by one to see which fix buys the most. A warm standby replica turns minutes into a traffic shift.</p>
+  </Fragment>
+</Viz>
+
+Operational rules of thumb:
+
+- **Startup probe** with a generous budget, so a slow weight load is not mistaken for a crash and restarted in a loop.
+- **Readiness only after warm-up**, so the first real user doesn't pay for compilation.
+- **Lenient liveness**: an engine at 100% load answers health checks slowly, and killing it under load turns a spike into an outage.
+- Treat a **TP group** (or a multi-node PP group) as **one unit**: if one rank dies, the whole replica is down.
+- Watch **GPU health** through DCGM: Xid errors, ECC errors, thermal throttling.
+- Scale on **queue depth and KV usage**, not CPU or GPU utilization. See [routing & autoscaling](../routing-autoscaling/).
+
+<Interview>
+  <Q q="Walk through what happens between a client calling /v1/chat/completions and seeing the first token." level="core">
+    The gateway authenticates the caller and applies rate limits. The router picks a replica (ideally load- and prefix-cache-aware). The engine's API server applies the chat template and tokenizes. The scheduler queues the request until KV blocks are available, then batches it. The GPU runs prefill and samples the first token. The detokenizer emits it as an SSE event back through the stack. TTFT is the sum of all of these, and queueing plus prefill usually dominate.
+  </Q>
+  <Q q="What does an inference server provide beyond a model.generate() loop?" level="core">
+    A scheduler with continuous batching; a KV-cache manager (paging, prefix sharing, preemption); optimized kernels and CUDA graphs; an API layer (streaming, cancellation, tokenization, chat templates, structured output); and operational surfaces such as health endpoints, metrics, and adapter loading. The scheduler and memory manager matter more for throughput than the model code.
+  </Q>
+  <Q q="Why must client cancellation propagate all the way to the engine?" level="mid">
+    An abandoned stream still occupies a batch slot and its KV blocks, wasting decode capacity that other users need. Disconnects must flow from the client through the gateway and proxies to the engine's abort path. Buffering proxies and missing timeouts are the usual culprits when they don't.
+  </Q>
+  <Q q="A vLLM pod fails to start after you raised max-model-len to 128K. Why?" level="mid">
+    At startup the engine profiles memory and checks that at least one sequence of max-model-len tokens fits in the KV cache that's left. With 128K tokens of KV per sequence, smaller or shared GPUs can't satisfy that. Fix it by lowering max-model-len, using FP8 KV, raising TP, or moving long-context traffic to a dedicated pool.
+  </Q>
+  <Q q="How would you design health probes for an LLM engine pod?" level="senior">
+    Use a startup probe whose failureThreshold × period exceeds the worst-case weight download, load and compile time. Make readiness pass only after the model is loaded and warmed up, and fail while draining during rollouts. Keep liveness lenient so a busy engine isn't restarted under load. Treat the whole TP/PP group as one unit, and alert on GPU Xid and ECC errors separately.
+  </Q>
+  <Q q="Your first request after each deploy is slow. What's going on, and how do you fix it?" level="senior">
+    Lazy work on the first request: kernel compilation or autotuning, CUDA-graph capture, structured-output grammar compilation, or cold caches. Do this during startup with a warm-up request, persist compile caches across restarts, pre-compile common schemas, and only mark the pod Ready after warm-up.
+  </Q>
+</Interview>

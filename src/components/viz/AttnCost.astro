@@ -1,0 +1,74 @@
+---
+/* How attention's quadratic term grows with context length during prefill. */
+---
+<div data-viz="attn-cost"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, slider, select, stats, legend, C, fmt } from '../../lib/viz';
+  import { MODELS, getModel, getGPU } from '../../data/hardware';
+
+  const W = 940, H = 280;
+  const PX = 70, PY = 20, PW = W - PX - 30, PH = H - 70;
+  const LMIN = Math.log2(256), LMAX = Math.log2(131072);
+
+  mountAll('attn-cost', (root) => {
+    let model = getModel('llama3-8b');
+    let lg = Math.log2(8192);
+    const bar = ctrlBar(root);
+    select(bar, 'Model', MODELS.filter((m) => m.attn !== 'MLA').map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    slider(bar, { label: 'Prompt length', min: LMIN, max: LMAX, step: 0.25, value: lg, format: (v) => fmt.num(Math.round(2 ** v), 0), onInput: (v) => { lg = v; render(); } });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Share of prefill FLOPs spent in attention versus prompt length' });
+    legend(root, [['Linear layers (weights): grows like n', C.weight], ['Attention scores & mixing: grows like n²', C.compute]]);
+    const st = stats(root, ['Prefill FLOPs', 'Attention share', 'Naive score matrix', 'Ideal prefill time (H100)']);
+
+    const flops = (n: number) => {
+      const lin = 2 * model.activeParams * n;
+      const att = 2 * model.layers * n * n * model.heads * model.headDim; // QKᵀ + PV, causal halves 4→2
+      return { lin, att };
+    };
+    const xOf = (l: number) => PX + ((l - LMIN) / (LMAX - LMIN)) * PW;
+    const yOf = (f: number) => PY + PH - f * PH;
+
+    function render() {
+      clear(svg);
+      // axes / grid
+      for (let f = 0; f <= 1; f += 0.25) {
+        s('line', { x1: PX, y1: yOf(f), x2: PX + PW, y2: yOf(f), stroke: C.border }, svg);
+        text(svg, PX - 8, yOf(f), `${f * 100}%`, { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      }
+      for (let l = LMIN; l <= LMAX; l += 1) {
+        text(svg, xOf(l), PY + PH + 16, fmt.num(2 ** l, 0), { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      }
+      text(svg, PX + PW / 2, H - 12, 'prompt length (tokens, log scale)', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      // stacked area: attention share
+      let top = '', area = '';
+      const pts: [number, number][] = [];
+      for (let l = LMIN; l <= LMAX + 1e-9; l += 0.05) {
+        const n = 2 ** l; const { lin, att } = flops(n);
+        pts.push([xOf(l), yOf(att / (lin + att))]);
+      }
+      top = pts.map((p, i) => `${i ? 'L' : 'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ');
+      area = `${top} L${PX + PW},${PY + PH} L${PX},${PY + PH} Z`;
+      rect(svg, PX, PY, PW, PH, C.weightSoft, { rx: 0 });
+      s('path', { d: area, fill: C.computeSoft, stroke: 'none' }, svg);
+      s('path', { d: top, fill: 'none', stroke: C.compute, 'stroke-width': 2.5 }, svg);
+      text(svg, PX + 12, PY + 16, 'linear layers', { class: 't-small t-bold', style: `fill:${C.weight}` });
+      text(svg, PX + PW - 12, PY + PH - 14, 'attention', { 'text-anchor': 'end', class: 't-small t-bold', style: `fill:${C.compute}` });
+      // marker
+      const n = Math.round(2 ** lg); const { lin, att } = flops(n);
+      const share = att / (lin + att);
+      const mx = xOf(lg), my = yOf(share);
+      s('line', { x1: mx, y1: PY, x2: mx, y2: PY + PH, stroke: C.text, 'stroke-dasharray': '3 3', opacity: 0.6 }, svg);
+      s('circle', { cx: mx, cy: my, r: 6, fill: C.compute, stroke: C.surface, 'stroke-width': 2 }, svg);
+      text(svg, mx + (mx > W - 200 ? -10 : 10), my - 14, `${(share * 100).toFixed(1)}% attention`, { 'text-anchor': mx > W - 200 ? 'end' : 'start', class: 't-bold t-small' });
+
+      const total = lin + att;
+      const gpu = getGPU('h100');
+      st.set('Prefill FLOPs', fmt.num(total, 1), `${fmt.num(n, 0)} tokens, ${model.name}`);
+      st.set('Attention share', fmt.pct(share, 1), 'the rest is weight matmuls', C.compute);
+      st.set('Naive score matrix', fmt.bytes(n * n * model.heads * 2), 'per layer, BF16, if materialised');
+      st.set('Ideal prefill time (H100)', fmt.ms((total / (gpu.bf16TF * 1e12 * 0.6)) * 1000), 'at 60% of peak BF16');
+    }
+    render();
+  });
+</script>

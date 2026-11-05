@@ -1,0 +1,104 @@
+---
+layout: ../layouts/Chapter.astro
+title: Kernels, Fusion & CUDA Graphs
+description: A decode step is hundreds of tiny GPU programs. When each runs for only a few microseconds, the cost of launching them, not the math, can become the bottleneck. Fusion and CUDA graphs fix that.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import KernelTimeline from '../components/viz/KernelTimeline.astro';
+import KernelOverheadCalc from '../components/viz/KernelOverheadCalc.astro';
+import KernelBuckets from '../components/viz/KernelBuckets.astro';
+
+A **kernel** is a function that runs on the GPU. A forward pass is not one big program; it is a sequence of kernels (norm, matmul, rotary embedding, attention, activation, add) repeated for every layer. The CPU **launches** each one into a queue (a CUDA *stream*), and the GPU executes them in order.
+
+During [prefill](../prefill-decode/), each kernel processes thousands of tokens and runs for milliseconds, so launch cost is irrelevant. During **decode**, each kernel processes a handful of tokens and may finish in **1–10 microseconds**. That is comparable to, or less than, the CPU time it takes to launch it.
+
+## When the CPU becomes the bottleneck
+
+<Viz title="Eager vs fused vs CUDA graph: two layers of a decode step" label="Live">
+  <KernelTimeline />
+  <Fragment slot="caption">
+    <p>The kernel durations model a ~1B-parameter model at batch 1 on an H100. In <b>eager</b> mode the CPU launches kernels one at a time, about 8 µs each, while most kernels finish in 1–3 µs, so the GPU spends most of its time idle (hatched gaps). <b>Fusion</b> cuts the number of kernels. A <b>CUDA graph</b> records the whole step once and replays it with a single launch, so the GPU runs back-to-back.</p>
+  </Fragment>
+</Viz>
+
+The GPU and CPU run **asynchronously**: the CPU queues launches and moves on. While kernels take longer than launches, the CPU stays ahead and the overhead is hidden. Once kernels are shorter than launches, the GPU drains the queue and **waits**. That happens with small models, small batches, fast GPUs, or tensor parallelism, which splits each kernel into even smaller pieces.
+
+## Fix 1: kernel fusion
+
+Fusion merges several operations into one kernel. That cuts launches and, more importantly, avoids writing intermediate results to HBM only to read them straight back.
+
+| Fused kernel | Replaces | Why it helps |
+|---|---|---|
+| **QKV projection** | 3 matmuls (Q, K, V) | One bigger GEMM, one launch, one read of the input |
+| **Gate + up projection** | 2 MLP matmuls | Same, for the largest matrices in the layer |
+| **Residual add + RMSNorm** | add, then norm | Element-wise ops are pure memory traffic; doing both in one pass halves it |
+| **SiLU × mul** (SwiGLU activation) | 2 element-wise ops | Same |
+| **RoPE + KV-cache write** | rotate, then copy into [paged blocks](../paged-attention/) | One read, one write |
+| **Attention** ([FlashAttention](../flash-attention/)) | QKᵀ, mask, softmax, ·V | Avoids the N×N matrix in HBM entirely |
+| **Fused MoE** | route, gather, many expert GEMMs, scatter | Groups tokens by expert into one grouped GEMM ([MoE](../moe/)) |
+| **Sampling** | softmax, top-k/p, sample | Keeps the vocabulary-sized logits on chip ([sampling](../sampling/)) |
+
+Engines get fused kernels from hand-written CUDA/Triton, from libraries (cuBLAS, CUTLASS, FlashInfer and others), and from compilers such as `torch.compile`, which traces the model and generates fused Triton kernels for chains of element-wise operations.
+
+## Fix 2: CUDA graphs
+
+A **CUDA graph** is a recording of a whole sequence of kernel launches, with their arguments and memory addresses, that can be **replayed with one call**. For decode, the engine:
+
+1. **Captures** the full forward pass at startup, once for each of a set of batch sizes.
+2. At runtime, **pads** the live batch up to the nearest captured size and replays that graph.
+3. Falls back to **eager** execution for shapes it did not capture: very large batches, and usually prefill, where launch overhead does not matter.
+
+<Viz title="How much does launch overhead cost you?" label="Calculator">
+  <KernelOverheadCalc />
+  <Fragment slot="caption">
+    <p>GPU work per step = max(weight bytes ÷ bandwidth, FLOPs ÷ compute). Eager step time = max(GPU work, number of launches × CPU cost per launch). Small models and fast GPUs suffer most. Real eager frameworks add Python and dispatcher overhead, often 10–30 µs per op, so drag the CPU-cost slider up to see why graphs commonly give 1.5–3× on small-batch decode.</p>
+  </Fragment>
+</Viz>
+
+<Viz title="Captured batch sizes and padding" label="Explore">
+  <KernelBuckets />
+  <Fragment slot="caption">
+    <p>Graphs are shape-specific, so engines capture a ladder of batch sizes, for example 1, 2, 4, then every 8. Here 13 running sequences replay the graph for 16; the 3 padding rows are wasted work. Above the largest captured size the engine falls back to eager launches.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="warn" title="The costs of graphs">
+Capturing takes time at startup, which adds to cold-start latency, and each graph pins its own buffers, which takes memory away from the [KV cache](../kv-cache/). Everything inside a graph must be shape-static and must not synchronise with the CPU. That is why dynamic parts such as scheduling and sampling decisions live outside the graph, and why engines expose a flag to disable graphs when debugging.
+</Callout>
+
+## The serving engine's kernel stack
+
+Putting it together, a modern engine's decode step looks like this:
+
+- **Scheduler** (Python/C++ on the CPU) picks the batch, prepares block tables and metadata. To keep the GPU fed, this overlaps with the previous step's GPU work.
+- **One graph replay** for the model forward: fused norms, fused QKV, paged attention, fused MLP, all with static shapes.
+- **Sampling kernel** turns logits into token IDs.
+- A small copy back to the CPU to detokenize and stream.
+
+<Callout type="tip" title="Rule of thumb">
+If `nvidia-smi` shows the GPU "busy" but throughput at small batch is poor, profile a single decode step with a timeline profiler such as Nsight Systems or the PyTorch profiler. Many short kernels separated by gaps means you are **launch-bound**. Enable CUDA graphs, or fuse.
+</Callout>
+
+<Interview>
+  <Q q="What is kernel launch overhead, and why does it matter more for decode than prefill?" level="core">
+    It is the CPU-side and driver time needed to enqueue each GPU kernel: a few microseconds natively, more through Python frameworks. Prefill kernels run for milliseconds, so it is negligible there. Decode kernels at small batch run for only microseconds, so launches can take as long as the work and leave the GPU idle between kernels.
+  </Q>
+  <Q q="Name three common fused kernels in LLM inference and what each saves." level="core">
+    **QKV projection** (one GEMM instead of three), **residual add + RMSNorm** (one pass over memory instead of two), **FlashAttention** (no N×N matrix in HBM). Others: gate+up MLP, SiLU×mul, RoPE + KV write, fused MoE, fused sampling. Each saves launches and, more importantly, HBM round-trips for intermediates.
+  </Q>
+  <Q q="How do CUDA graphs work with a dynamic batch size?" level="mid">
+    Graphs are captured for a fixed set of batch sizes at startup. Each step, the engine pads the actual batch up to the nearest captured size, copies inputs into the graph's static buffers, and replays it. Batches above the largest captured size, and usually prefill, run eagerly.
+  </Q>
+  <Q q="What are the downsides of CUDA graphs?" level="mid">
+    Longer startup (capture time), extra GPU memory reserved for graph buffers (less KV cache), padding waste, and rigidity: no CPU synchronisation or data-dependent control flow inside the graph, and shapes must be static. They also make debugging harder, so engines provide an eager mode.
+  </Q>
+  <Q q="Why does tensor parallelism make launch overhead worse?" level="senior">
+    TP splits each matmul across GPUs, so each GPU's kernels are smaller and shorter, and it adds communication kernels (all-reduce) per layer. Per-GPU work shrinks but launch count does not, so the share of time spent on launches and synchronisation grows. CUDA graphs that also capture the communication help a lot.
+  </Q>
+  <Q q="What does torch.compile contribute to an inference engine?" level="senior">
+    It traces the model into a graph and generates fused Triton kernels for chains of element-wise and reduction ops (norms, activations, residual adds). This removes intermediate HBM traffic and launches without hand-writing CUDA. Engines typically combine it with CUDA graph capture of the compiled model for the decode path, and keep specialised hand-written kernels for attention, GEMMs and MoE.
+  </Q>
+</Interview>

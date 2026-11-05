@@ -1,0 +1,61 @@
+---
+/* CUDA graphs are captured for fixed batch sizes. A live batch is padded up to the
+   nearest captured size; above the largest size the engine falls back to eager. */
+---
+<div data-viz="kernel-buckets"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, slider, stats, legend, C, hatchDefs, uniq } from '../../lib/viz';
+
+  const W = 940, H = 170, MAXB = 96;
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+
+  mountAll('kernel-buckets', (root) => {
+    let batch = 13, maxCap = 64;
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Running sequences', min: 1, max: MAXB, value: batch, onInput: (v) => { batch = v; render(); } });
+    slider(bar, { label: 'Largest captured graph', min: 8, max: 88, step: 8, value: maxCap, onInput: (v) => { maxCap = v; render(); } });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Batch padded to the nearest captured CUDA graph size' });
+    const hid = uniq('kbh');
+    const st = stats(root, ['Captured sizes', 'This step runs as', 'Padding waste', 'Path']);
+    legend(root, [['Real sequences', C.decode], ['Padding slots (wasted compute)', C.waste], ['Captured size boundaries', C.accent]]);
+
+    const buckets = () => { const b = [1, 2, 4]; for (let x = 8; x <= maxCap; x += 8) b.push(x); return b; };
+
+    function render() {
+      clear(svg);
+      const hatch = hatchDefs(svg, hid, C.waste);
+      const bs = buckets();
+      const eager = batch > maxCap;
+      const padded = eager ? batch : bs.find((b) => b >= batch)!;
+      const cw = (W - 20) / MAXB;
+      text(svg, 10, 14, 'decode batch slots', { class: 't-small t-dim' });
+      for (let i = 0; i < MAXB; i++) {
+        const x = 10 + i * cw;
+        let fill: string = C.surface2;
+        if (i < batch) fill = C.decode; else if (i < padded) fill = hatch;
+        rect(svg, x + 0.5, 26, cw - 1, 40, fill, { rx: 2, stroke: i < padded && i >= batch ? C.waste : 'none' });
+      }
+      // bucket markers
+      for (const b of bs) {
+        const x = 10 + b * cw;
+        rect(svg, x - 1, 20, 2, 54, C.accent, { rx: 1, opacity: b === padded ? 1 : 0.4 });
+        if (b >= 8 || b === 1 || b === 4) text(svg, x, 86, String(b), { 'text-anchor': 'middle', class: 't-small t-mono', ...fillStyle(b === padded ? C.accent : C.faint) });
+      }
+      if (eager) {
+        rect(svg, 10 + maxCap * cw, 22, (MAXB - maxCap) * cw, 48, 'none', { stroke: C.waste, 'stroke-dasharray': '5 4', rx: 4 });
+        text(svg, 10, 106, `${batch} sequences is beyond the largest captured graph (${maxCap}): eager fallback, launch overhead returns`, { class: 't-small t-bold', ...fillStyle(C.waste) });
+      } else {
+        text(svg, 10, 106, `${batch} real sequences → replay the graph captured for ${padded}`, { class: 't-small t-bold', ...fillStyle(C.decode) });
+      }
+      text(svg, 10, 132, 'Each captured graph has fixed tensor shapes and memory addresses, so it can only replay at exactly that batch size.', { class: 't-small t-faint' });
+      text(svg, 10, 150, 'More capture sizes = less padding, but more startup time and more GPU memory reserved for graphs.', { class: 't-small t-faint' });
+
+      st.set('Captured sizes', String(bs.length), `1, 2, 4, then every 8 up to ${maxCap}`);
+      st.set('This step runs as', eager ? 'eager' : `batch ${padded}`, eager ? 'no matching graph' : 'graph replay', eager ? C.waste : C.decode);
+      st.set('Padding waste', eager ? '0%' : `${(((padded - batch) / padded) * 100).toFixed(0)}%`, `${eager ? 0 : padded - batch} dummy rows computed`);
+      st.set('Path', eager ? 'slow path' : 'fast path', eager ? 'consider a larger max capture size' : 'one launch per step', eager ? C.waste : C.good);
+    }
+    render();
+  });
+</script>

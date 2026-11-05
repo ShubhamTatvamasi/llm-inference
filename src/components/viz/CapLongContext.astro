@@ -1,0 +1,70 @@
+---
+/* How context length changes concurrency, TTFT and cost per request (small multiples). */
+---
+<div data-viz="cap-longctx"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, select, slider, stats, narration, C, fmt } from '../../lib/viz';
+  import { MODELS, GPUS, getModel, getGPU } from '../../data/hardware';
+  import { plan } from './capacityModel';
+
+  const CTX = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const LAB = ['1k', '2k', '4k', '8k', '16k', '32k', '64k', '128k'];
+  const W = 940, H = 230, PW = 280, GAP = 30, PY0 = 40, PY1 = 190;
+
+  mountAll('cap-longctx', (root) => {
+    const S = { model: getModel('llama3-8b'), gpu: getGPU('h100'), tp: 1, i: 3 };
+    const bar = ctrlBar(root);
+    select(bar, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), S.model.id, (v) => { S.model = getModel(v); render(); });
+    select(bar, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), S.gpu.id, (v) => { S.gpu = getGPU(v); render(); });
+    select(bar, 'TP', [1, 2, 4, 8].map((n) => ({ value: String(n), label: `TP=${n}` })), '1', (v) => { S.tp = Number(v); render(); });
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'Prompt length', min: 0, max: CTX.length - 1, value: S.i, format: (i) => `${LAB[i]} tokens`, onInput: (i) => { S.i = i; render(); } });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Concurrency, prefill time and cost per request versus context length' });
+    const st = stats(root, ['KV per request', 'Max concurrent (memory)', 'TTFT floor', 'Cost per request']);
+    const say = narration(root);
+
+    function panel(k: number, title: string, vals: (number | null)[], color: string, fmtV: (v: number) => string, logY = true) {
+      const x0 = 10 + k * (PW + GAP), x1 = x0 + PW;
+      text(svg, x0, 16, title, { class: 't-bold t-small' });
+      const ok = vals.filter((v): v is number => v !== null && v > 0 && isFinite(v));
+      if (!ok.length) { text(svg, x0, PY0 + 40, 'does not fit', { class: 't-small', fill: C.waste }); return; }
+      const lo = logY ? Math.log10(Math.min(...ok)) : 0, hi = logY ? Math.log10(Math.max(...ok)) : Math.max(...ok);
+      const ny = (v: number) => { const t = logY ? (Math.log10(v) - lo) / Math.max(1e-9, hi - lo) : v / hi; return PY1 - t * (PY1 - PY0); };
+      const nx = (i: number) => x0 + 10 + (i / (CTX.length - 1)) * (PW - 20);
+      line(svg, x0, PY1, x1, PY1, C.borderStrong, { 'stroke-width': 1 });
+      LAB.forEach((l, i) => { if (i % 2 === 1 || i === CTX.length - 1) text(svg, nx(i), PY1 + 14, l, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' }); });
+      const pts = vals.map((v, i) => (v && v > 0 && isFinite(v) ? [nx(i), ny(v)] : null)).filter(Boolean) as number[][];
+      s('path', { d: pts.map((p, i) => `${i ? 'L' : 'M'}${p[0]},${p[1]}`).join(' '), fill: 'none', stroke: color, 'stroke-width': 2.2 }, svg);
+      vals.forEach((v, i) => {
+        if (!(v && v > 0 && isFinite(v))) { text(svg, nx(i), PY1 - 8, '✗', { 'text-anchor': 'middle', class: 't-small', fill: C.waste }); return; }
+        const cur = i === S.i;
+        s('circle', { cx: nx(i), cy: ny(v), r: cur ? 5.5 : 3, fill: cur ? color : C.surface, stroke: color, 'stroke-width': 1.6 }, svg);
+        if (cur) {
+          const label = fmtV(v); const tx = Math.min(x1 - 4, Math.max(x0 + 4, nx(i)));
+          rect(svg, tx - label.length * 3.6 - 6, ny(v) - 28, label.length * 7.2 + 12, 18, C.surface3, { rx: 5 });
+          text(svg, tx, ny(v) - 19, label, { 'text-anchor': 'middle', class: 't-small t-mono t-bold' });
+        }
+      });
+    }
+
+    function render() {
+      clear(svg);
+      const rows = CTX.map((c) => plan({ model: S.model, gpu: S.gpu, tp: S.tp, wBytes: 2, kvBytes: 2, prompt: c, output: 256, rps: 1, tpotSlo: 5000, ttftSlo: 100, util: 1 })); // no latency SLO: memory-bound picture
+      panel(0, 'Max concurrent requests (memory)', rows.map((r) => (r.fits ? r.maxSeqMem : null)), C.kv, (v) => fmt.int(v));
+      panel(1, 'TTFT floor: prefill time', rows.map((r) => (r.fits ? r.pT * 1000 : null)), C.prefill, (v) => fmt.ms(v));
+      const cpr = rows.map((r) => (r.fits && r.rpsRep > 0 ? (S.tp * S.gpu.pricePerHr) / (r.rpsRep * 3600) : null));
+      panel(2, 'GPU cost per request (fully loaded)', cpr, C.weight, (v) => (v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(3)}`));
+
+      const r = rows[S.i];
+      st.set('KV per request', fmt.bytes(r.kvSeq), `${LAB[S.i]} prompt + 256 out`);
+      st.set('Max concurrent (memory)', r.fits ? fmt.int(r.maxSeqMem) : '—', 'requests at this length', r.maxSeqMem < 8 ? C.waste : undefined);
+      st.set('TTFT floor', r.fits ? fmt.ms(r.pT * 1000) : '—', 'prefill only, no queue');
+      const usd = (v: number | null) => (v ? (v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(3)}`) : '—');
+      st.set('Cost per request', usd(cpr[S.i]), `vs ${usd(cpr[0])} at 1k`);
+      const ratio = rows[0].maxSeqMem && r.maxSeqMem ? rows[0].maxSeqMem / Math.max(1, r.maxSeqMem) : 0;
+      say(`At <b>${LAB[S.i]}</b> tokens each request holds <b>${fmt.bytes(r.kvSeq)}</b> of KV, so ${ratio ? `<b>${Math.round(ratio)}× fewer</b> requests fit than at 1k` : 'the cache cannot hold even one'}. Prefill grows faster than linearly because attention is quadratic. Long contexts are expensive in three ways at once: fewer concurrent users, slower first tokens, and more GPU time per request.`);
+    }
+    render();
+  });
+</script>

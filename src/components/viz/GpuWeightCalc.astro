@@ -1,0 +1,91 @@
+---
+/* Lower bound on decode step time = bytes that must be read / memory bandwidth.
+   Plots aggregate throughput vs batch size and shows where compute takes over. */
+---
+<div data-viz="gpu-wcalc"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, select, slider, stats, legend, C, fmt } from '../../lib/viz';
+  import { MODELS, GPUS, getModel, getGPU } from '../../data/hardware';
+
+  const W = 940, H = 300;
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+  const BATCHES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+
+  mountAll('gpu-wcalc', (root) => {
+    let model = getModel('llama3-8b');
+    let gpu = getGPU('h100');
+    let nGpu = 1, bpp = 2, mbu = 0.8, mfu = 0.6, bi = 0;
+
+    const b1 = ctrlBar(root);
+    const g1 = group(b1);
+    select(g1, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(g1, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    select(g1, '×', [1, 2, 4, 8].map((n) => ({ value: String(n), label: `${n} GPU${n > 1 ? 's' : ''} (TP)` })), '1', (v) => { nGpu = Number(v); render(); });
+    select(g1, 'Weights', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8 / INT8' }, { value: '0.5', label: 'INT4' }], '2', (v) => { bpp = Number(v); render(); });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'Batch size', min: 0, max: BATCHES.length - 1, value: bi, format: (i) => String(BATCHES[i]), onInput: (i) => { bi = i; render(); } });
+    slider(b2, { label: 'Achieved bandwidth (MBU)', min: 0.4, max: 0.95, step: 0.05, value: mbu, format: (v) => fmt.pct(v), onInput: (v) => { mbu = v; render(); } });
+    slider(b2, { label: 'Achieved FLOPs (MFU)', min: 0.2, max: 0.8, step: 0.05, value: mfu, format: (v) => fmt.pct(v), onInput: (v) => { mfu = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Aggregate decode throughput versus batch size' });
+    const st = stats(root, ['Weights to read', 'Min time / step', 'Single-stream ceiling', `Throughput @ batch`]);
+    legend(root, [['Memory-bound region', C.weight], ['Compute-bound region', C.compute], ['Your batch', C.accent]]);
+
+    // bytes read per step: dense = all weights. MoE: experts touched grows with batch.
+    const bytesRead = (b: number) => {
+      const t = model.params, a = model.activeParams;
+      if (a >= t) return t * bpp;
+      const frac = 1 - Math.pow(1 - a / t, b);
+      return Math.max(a, t * frac) * bpp;
+    };
+    const stepTime = (b: number) => {
+      const peak = (bpp <= 1 && gpu.fp8TF ? gpu.fp8TF : gpu.bf16TF) * 1e12 * nGpu * mfu;
+      const mem = bytesRead(b) / (gpu.bwTBs * 1e12 * nGpu * mbu);
+      const comp = (2 * model.activeParams * b) / peak;
+      return { mem, comp, t: Math.max(mem, comp) };
+    };
+
+    function render() {
+      clear(svg);
+      const PX = 70, PY = 20, PW = W - PX - 30, PH = H - 70;
+      const pts = BATCHES.map((b) => ({ b, ...stepTime(b), tps: b / stepTime(b).t }));
+      const maxT = Math.max(...pts.map((p) => p.tps));
+      const x = (i: number) => PX + (i / (BATCHES.length - 1)) * PW;
+      const minT = Math.min(...pts.map((p) => p.tps));
+      const lo = Math.floor(Math.log10(minT)), hi = Math.ceil(Math.log10(maxT * 1.05));
+      const y = (v: number) => PY + PH - ((Math.log10(v) - lo) / (hi - lo)) * PH;
+      // axes + grid (log scale)
+      for (let k = lo; k <= hi; k++) {
+        const v = Math.pow(10, k);
+        s('line', { x1: PX, y1: y(v), x2: PX + PW, y2: y(v), stroke: C.border }, svg);
+        text(svg, PX - 8, y(v), fmt.num(v, 0), { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+      }
+      BATCHES.forEach((b, i) => text(svg, x(i), PY + PH + 16, String(b), { 'text-anchor': 'middle', class: 't-small t-mono t-faint' }));
+      text(svg, PX + PW / 2, H - 12, 'batch size (concurrent sequences decoding together)', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      text(svg, 14, PY + PH / 2, 'tok/s (log)', { class: 't-small t-dim', transform: `rotate(-90 14 ${PY + PH / 2})`, 'text-anchor': 'middle' });
+
+      // region shading: find first compute-bound index
+      const knee = pts.findIndex((p) => p.comp >= p.mem);
+      const kx = knee < 0 ? PX + PW : knee === 0 ? PX : (x(knee - 1) + x(knee)) / 2;
+      rect(svg, PX, PY, kx - PX, PH, C.weightSoft, { rx: 0, opacity: 0.6 });
+      rect(svg, kx, PY, PX + PW - kx, PH, C.computeSoft, { rx: 0, opacity: 0.6 });
+      if (kx - PX > 120) text(svg, PX + 10, PY + 14, 'memory-bound: more batch ≈ free tokens', { class: 't-small t-bold', ...fillStyle(C.weight) });
+      if (PX + PW - kx > 120) text(svg, PX + PW - 10, PY + 14, 'compute-bound: throughput plateaus', { 'text-anchor': 'end', class: 't-small t-bold', ...fillStyle(C.compute) });
+
+      // line
+      s('path', { d: pts.map((p, i) => `${i ? 'L' : 'M'}${x(i)},${y(p.tps)}`).join(' '), fill: 'none', stroke: C.decode, 'stroke-width': 2.5 }, svg);
+      pts.forEach((p, i) => s('circle', { cx: x(i), cy: y(p.tps), r: i === bi ? 7 : 3.5, fill: i === bi ? C.accent : C.decode, stroke: i === bi ? 'var(--bg)' : 'none', 'stroke-width': 2 }, svg));
+      const cur = pts[bi];
+      text(svg, x(bi) + (bi > 7 ? -12 : 12), y(cur.tps) + (bi > 7 ? 18 : -14), `${fmt.num(cur.tps, 1)} tok/s`, { 'text-anchor': bi > 7 ? 'end' : 'start', class: 't-small t-bold t-mono' });
+
+      const wb = bytesRead(1);
+      const fits = model.params * bpp <= gpu.memGB * 1e9 * nGpu * 0.95;
+      st.set('Weights to read', `${fmt.num(wb / 1e9, 1)} GB`, model.activeParams < model.params ? `MoE: only active experts at batch 1` : `${fmt.num(model.params / 1e9, 1)}B params × ${bpp} B`);
+      st.set('Min time / step', fmt.ms(pts[0].t * 1000), `= bytes ÷ (${nGpu}×${gpu.bwTBs} TB/s × ${fmt.pct(mbu)})`);
+      st.set('Single-stream ceiling', `${fmt.num(1 / pts[0].t, 0)} tok/s`, 'the fastest one user can ever go');
+      st.set('Throughput @ batch', `${fmt.num(cur.tps, 1)} tok/s`, fits ? `batch ${cur.b}: ${cur.comp >= cur.mem ? 'compute-bound' : 'memory-bound'}` : '⚠ weights do not fit in VRAM', fits ? undefined : C.waste);
+    }
+    render();
+  });
+</script>

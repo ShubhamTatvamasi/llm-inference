@@ -1,0 +1,77 @@
+---
+/* Estimate TTFT, ITL and end-to-end latency from model, GPU, prompt/output lengths and batch. */
+---
+<div data-viz="pd-estimator"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, select, slider, stats, legend, C, fmt } from '../../lib/viz';
+  import { MODELS, GPUS, getModel, getGPU, kvBytesPerToken } from '../../data/hardware';
+
+  const W = 940, H = 162;
+  const LENS = [16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+
+  mountAll('pd-estimator', (root) => {
+    let model = getModel('llama3-8b');
+    let gpu = getGPU('h100');
+    let nGpu = 1, pi = 6, oi = 3, batch = 1;
+    const MFU = 0.55, MBU = 0.8;
+
+    const b1 = ctrlBar(root);
+    const g1 = group(b1);
+    select(g1, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(g1, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    select(g1, '×', [1, 2, 4, 8].map((n) => ({ value: String(n), label: `${n} GPU${n > 1 ? 's' : ''}` })), '1', (v) => { nGpu = Number(v); render(); });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'Prompt tokens', min: 0, max: LENS.length - 1, value: pi, format: (i) => fmt.int(LENS[i]), onInput: (i) => { pi = i; render(); } });
+    slider(b2, { label: 'Output tokens', min: 0, max: LENS.length - 1, value: oi, format: (i) => fmt.int(LENS[i]), onInput: (i) => { oi = i; render(); } });
+    slider(b2, { label: 'Others decoding alongside', min: 1, max: 128, value: batch, onInput: (v) => { batch = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'End-to-end latency split into prefill and decode' });
+    const st = stats(root, ['TTFT', 'ITL', 'End-to-end', 'Time spent decoding']);
+    legend(root, [['Prefill (→ TTFT)', C.prefill], ['Decode (→ ITL × output tokens)', C.decode]]);
+
+    function render() {
+      clear(svg);
+      const P = LENS[pi], O = LENS[oi];
+      const bpp = 2;
+      const peak = gpu.bf16TF * 1e12 * nGpu * MFU;
+      const bw = gpu.bwTBs * 1e12 * nGpu * MBU;
+      const wBytes = model.activeParams < model.params ? model.params * bpp * 0.5 : model.params * bpp; // rough MoE middle-ground
+      const kvTok = kvBytesPerToken(model, 2);
+      const attnFlops = 2 * model.layers * P * P * model.heads * model.headDim; // causal QK^T + PV
+      const prefill = Math.max((2 * model.activeParams * P + attnFlops) / peak, wBytes / bw);
+      const ctx = P + O / 2;
+      const itl = Math.max((wBytes + batch * kvTok * ctx) / bw, (2 * model.activeParams * batch) / peak);
+      const decode = itl * Math.max(0, O - 1);
+      const e2e = prefill + decode;
+
+      const X = 20, BW = W - 40, Y = 46, BH = 34;
+      text(svg, X, 16, `${model.name} on ${nGpu} × ${gpu.name}`, { class: 't-bold t-small' });
+      text(svg, X + BW, 16, `end-to-end ≈ ${fmt.ms(e2e * 1000)}`, { 'text-anchor': 'end', class: 't-small t-mono t-bold' });
+      rect(svg, X, Y, BW, BH, C.surface2, { rx: 8, stroke: C.border });
+      const pw = Math.max(3, (prefill / e2e) * BW);
+      rect(svg, X, Y, pw, BH, C.prefill, { rx: 8 });
+      rect(svg, X + pw, Y, Math.max(0, BW - pw), BH, C.decode, { rx: 8, opacity: 0.9 });
+      if (pw > 110) text(svg, X + 10, Y + BH / 2, `prefill ${fmt.ms(prefill * 1000)}`, { class: 't-small t-bold', ...fillStyle('var(--bg)') });
+      else text(svg, X + pw + 8, Y - 10, `◂ prefill ${fmt.ms(prefill * 1000)}`, { class: 't-small t-bold', ...fillStyle(C.prefill) });
+      if (BW - pw > 160) text(svg, X + BW - 10, Y + BH / 2, `decode ${fmt.int(O)} tokens · ${fmt.ms(decode * 1000)}`, { 'text-anchor': 'end', class: 't-small t-bold', ...fillStyle('var(--bg)') });
+      // token ticks on a stream line
+      const sy = Y + BH + 30;
+      s('line', { x1: X, y1: sy, x2: X + BW, y2: sy, stroke: C.border, 'stroke-width': 2 }, svg);
+      const ticks = Math.min(O, 80);
+      for (let i = 0; i < ticks; i++) {
+        const t = prefill + (i * (O - 1) / Math.max(1, ticks - 1)) * itl;
+        s('circle', { cx: X + (t / e2e) * BW, cy: sy, r: 3, fill: C.token }, svg);
+      }
+      text(svg, X, sy + 22, 'tokens arriving at the user →', { class: 't-small t-faint' });
+      if (O > 80) text(svg, X + BW, sy + 22, `(showing 80 of ${fmt.int(O)})`, { 'text-anchor': 'end', class: 't-small t-faint' });
+
+      st.set('TTFT', fmt.ms(prefill * 1000), `${fmt.int(P)} prompt tokens ≈ ${fmt.num(P / prefill, 0)} tok/s prefill`, C.prefill);
+      st.set('ITL', fmt.ms(itl * 1000), `${fmt.num(1 / itl, 0)} tok/s per user`, C.decode);
+      st.set('End-to-end', fmt.ms(e2e * 1000), 'no queueing, ideal kernels');
+      st.set('Time spent decoding', fmt.pct(decode / e2e), decode > prefill ? 'decode dominates' : 'prefill dominates');
+    }
+    render();
+  });
+</script>

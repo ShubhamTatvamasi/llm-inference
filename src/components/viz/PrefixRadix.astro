@@ -1,0 +1,153 @@
+---
+/* Radix-tree prefix cache: insert token sequences, reuse the longest matching
+   prefix, split edges on divergence, evict least-recently-used leaves. */
+---
+<div data-viz="prefix-radix"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, stats, legend, narration, C } from '../../lib/viz';
+
+  interface Node { toks: string[]; children: Node[]; last: number; id: number; parent: Node | null }
+  const CAP = 20;
+  const SYS = ['You', 'are', 'AcmeBot.'];
+  const Q1 = ['Reset', 'password?'];
+  const FS = ['Translate:', 'cat→chat,', 'dog→chien,'];
+  const SEQS: { toks: string[]; label: string }[] = [
+    { toks: [...SYS, ...Q1], label: 'support chat #1' },
+    { toks: [...SYS, 'Where', 'is', 'my', 'order?'], label: 'support chat #2' },
+    { toks: [...SYS, ...Q1, 'Click', '“Forgot”.', 'And', 'email?'], label: 'chat #1, turn 2' },
+    { toks: [...FS, 'bird'], label: 'few-shot translate' },
+    { toks: [...FS, 'fish'], label: 'few-shot translate' },
+    { toks: ['Write', 'a', 'haiku', 'about', 'rain'], label: 'unrelated prompt' },
+  ];
+
+  mountAll('prefix-radix', (root) => {
+    let rootNode: Node; let step = -1; let nid = 0;
+    let matchedIds = new Set<number>(); let newIds = new Set<number>(); let evicted: string[] = [];
+    let lastHit = 0, lastNew = 0;
+
+    const bar = ctrlBar(root);
+    const W = 940, H = 330;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Radix tree of cached token prefixes' });
+    const g = s('g', {}, svg);
+    const say = narration(root);
+    const st = stats(root, ['Matched prefix', 'Newly computed', 'Tree size', 'Evicted']);
+    legend(root, [['Reused this request', C.kv], ['Inserted this request', C.prefill], ['Cached, idle', C.mem]]);
+
+    const size = (n: Node): number => n.toks.length + n.children.reduce((a, c) => a + size(c), 0);
+
+    function reset() { nid = 0; rootNode = { toks: [], children: [], last: 0, id: nid++, parent: null }; step = -1; matchedIds = new Set(); newIds = new Set(); evicted = []; }
+
+    function insert(toks: string[]) {
+      let node = rootNode; let i = 0; let hit = 0;
+      node.last = step;
+      while (i < toks.length) {
+        const child = node.children.find((c) => c.toks[0] === toks[i]);
+        if (!child) {
+          const nn: Node = { toks: toks.slice(i), children: [], last: step, id: nid++, parent: node };
+          node.children.push(nn); newIds.add(nn.id); return { hit, added: toks.length - i };
+        }
+        let k = 0;
+        while (k < child.toks.length && i + k < toks.length && child.toks[k] === toks[i + k]) k++;
+        if (k < child.toks.length) {
+          // split child at k
+          const tail: Node = { toks: child.toks.slice(k), children: child.children, last: child.last, id: nid++, parent: child };
+          tail.children.forEach((c) => (c.parent = tail));
+          child.toks = child.toks.slice(0, k); child.children = [tail];
+        }
+        child.last = step; matchedIds.add(child.id); hit += k; i += k; node = child;
+      }
+      return { hit, added: 0 };
+    }
+
+    function evict() {
+      while (size(rootNode) > CAP) {
+        const leaves: Node[] = [];
+        const walk = (n: Node) => { if (n !== rootNode && !n.children.length) leaves.push(n); n.children.forEach(walk); };
+        walk(rootNode);
+        const victim = leaves.filter((l) => l.last < step).sort((a, b) => a.last - b.last)[0];
+        if (!victim) break;
+        evicted.push(victim.toks.join(' '));
+        victim.parent!.children = victim.parent!.children.filter((c) => c !== victim);
+      }
+    }
+
+    function doStep() {
+      if (step >= SEQS.length - 1) return false;
+      step++;
+      matchedIds = new Set(); newIds = new Set(); evicted = [];
+      const r = insert(SEQS[step].toks);
+      lastHit = r.hit; lastNew = r.added;
+      evict();
+      return step < SEQS.length - 1;
+    }
+
+    function render() {
+      clear(g);
+      // layout: horizontal tree, x by depth, y by leaf order
+      const pos = new Map<number, { x: number; y: number }>();
+      let leafY = 0;
+      const NW = 186, GAPX = 40, ROWH = 46;
+      const place = (n: Node, d: number): number => {
+        let y: number;
+        if (!n.children.length) { y = leafY++; }
+        else { const ys = n.children.map((c) => place(c, d + 1)); y = (ys[0] + ys[ys.length - 1]) / 2; }
+        pos.set(n.id, { x: 20 + d * (NW + GAPX), y });
+        return y;
+      };
+      place(rootNode, 0);
+      const leaves = Math.max(1, leafY);
+      const yOff = 40 + Math.max(0, (H - 70 - leaves * ROWH) / 2);
+      const P = (n: Node) => { const p = pos.get(n.id)!; return { x: p.x, y: yOff + p.y * ROWH }; };
+
+      const drawEdges = (n: Node) => {
+        const a = P(n);
+        n.children.forEach((c) => {
+          const b = P(c);
+          const ax = n === rootNode ? a.x + 60 : a.x + NW;
+          s('path', { d: `M${ax},${a.y + 16} C${ax + 20},${a.y + 16} ${b.x - 20},${b.y + 16} ${b.x},${b.y + 16}`, fill: 'none', stroke: matchedIds.has(c.id) ? C.kv : newIds.has(c.id) ? C.prefill : C.borderStrong, 'stroke-width': matchedIds.has(c.id) || newIds.has(c.id) ? 2.2 : 1.2 }, g);
+          drawEdges(c);
+        });
+      };
+      drawEdges(rootNode);
+      const drawNodes = (n: Node) => {
+        const p = P(n);
+        if (n === rootNode) {
+          rect(g, p.x, p.y, 60, 32, C.surface2, { rx: 16, stroke: C.borderStrong });
+          text(g, p.x + 30, p.y + 16, 'root', { 'text-anchor': 'middle', class: 't-small t-bold t-dim' });
+        } else {
+          const col = matchedIds.has(n.id) ? C.kv : newIds.has(n.id) ? C.prefill : C.mem;
+          const soft = matchedIds.has(n.id) ? C.kvSoft : newIds.has(n.id) ? C.prefillSoft : C.surface2;
+          rect(g, p.x, p.y, NW, 32, soft, { rx: 8, stroke: col, 'stroke-width': 1.5 });
+          const lbl = n.toks.join(' ');
+          text(g, p.x + 9, p.y + 16, lbl.length > 25 ? lbl.slice(0, 24) + '…' : lbl, { class: 't-small t-bold' });
+          text(g, p.x + NW - 4, p.y - 6, `${n.toks.length} tok · t${n.last + 1}`, { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+        }
+        n.children.forEach(drawNodes);
+      };
+      drawNodes(rootNode);
+
+      const used = size(rootNode);
+      text(g, W - 20, 14, `cache: ${used} / ${CAP} tokens`, { 'text-anchor': 'end', class: 't-small t-mono t-bold', fill: used >= CAP ? C.waste : C.dim });
+      if (step >= 0) text(g, 20, 14, `Request ${step + 1}: “${SEQS[step].toks.join(' ')}”`, { class: 't-small t-bold' });
+
+      st.set('Matched prefix', step < 0 ? '–' : `${lastHit} tokens`, 'K/V reused', C.kv);
+      st.set('Newly computed', step < 0 ? '–' : `${lastNew} tokens`, 'prefill + inserted', C.prefill);
+      st.set('Tree size', `${used} / ${CAP}`, 'tokens of KV kept');
+      st.set('Evicted', evicted.length ? evicted.join(' | ').slice(0, 26) : '—', evicted.length ? 'LRU leaf removed' : '', evicted.length ? C.waste : undefined);
+
+      const notes = [
+        'First request: the tree is empty, so the whole prompt becomes one new edge from the root.',
+        'Shares “You are AcmeBot.” with request 1. The edge is <b>split</b> at the divergence point and only the new question is computed.',
+        'Turn 2 of chat #1 walks the entire previous path (system prompt, question) and only appends the new tokens.',
+        'An unrelated few-shot prompt starts a new branch at the root.',
+        'Same few-shot examples, different final word: the shared examples (3 tokens here, often thousands in practice) are reused.',
+        `Capacity is ${CAP} tokens. Inserting this unrelated prompt overflows it, so the <b>least-recently-used leaf</b> is evicted (shown in the Evicted tile). Shared, recently used prefixes stay.`,
+      ];
+      say(step < 0 ? 'Press <b>Play</b>. The cache is a <b>radix tree</b> keyed by tokens: shared prefixes are stored once, and each request walks the tree to find its longest match.' : notes[step]);
+    }
+
+    reset();
+    const pp = player(bar, root, { step: doStep, reset, render, interval: 3000, autoplay: true });
+  });
+</script>

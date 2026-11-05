@@ -1,0 +1,121 @@
+---
+layout: ../layouts/Chapter.astro
+title: Parallelism
+description: When a model, or its traffic, outgrows one GPU. Tensor, pipeline, data and context parallelism, what each one splits, and what it costs in communication.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import ParTensor from '../components/viz/ParTensor.astro';
+import ParPipeline from '../components/viz/ParPipeline.astro';
+import ParCalc from '../components/viz/ParCalc.astro';
+
+Llama 3.1 70B in BF16 is **141 GB** of weights, and an H100 has 80 GB. Even when a model does fit, one GPU may not give you enough [KV cache](../kv-cache/) room or enough tokens per second. The answer is to spread the work over several GPUs, and there are four basic ways to cut it:
+
+| Strategy | What gets split | Communication | Main win |
+|---|---|---|---|
+| **Tensor parallel (TP)** | every weight matrix, inside each layer | all-reduce, **2× per layer**, every step | fits bigger models **and** lowers per-token latency |
+| **Pipeline parallel (PP)** | the stack of layers into contiguous stages | small point-to-point hand-offs between stages | fits bigger models across nodes cheaply |
+| **Data parallel (DP)** | requests: full copies (replicas) of the model | none between replicas | more throughput, isolated failures |
+| **Context / sequence parallel (CP)** | the tokens of one very long sequence | exchange K/V blocks between GPUs | very long prompts (prefill) |
+
+Expert parallelism, which splits the experts of a Mixture-of-Experts model, has its own chapter: [MoE](../moe/).
+
+## Tensor parallelism: split every matrix
+
+A transformer layer is mostly two big matrix multiplications in the MLP and four in attention. TP cuts each matrix into slices, and each GPU computes with its own slice.
+
+The trick is to pair the cuts so that communication happens only **once per block**:
+
+1. **Column-parallel** first matmul: GPU *i* holds columns *i* of $W_1$ and produces slice *i* of the hidden activations. The activation function is element-wise, so it applies to each slice independently, with no communication.
+2. **Row-parallel** second matmul: GPU *i* holds the matching rows of $W_2$. Multiplying slice *i* by rows *i* gives a **full-size partial result**, and the true output is the sum over all GPUs:
+
+$$
+Z = Y W_2 = \sum_{i=1}^{n} Y_i \, W_2^{(i)}
+$$
+
+3. An **all-reduce** sums the partials so that every GPU ends up holding $Z$.
+
+Attention splits the same way: the query and KV **heads** are divided among GPUs (column-parallel), and the output projection is row-parallel, followed by another all-reduce.
+
+<Viz title="Tensor-parallel MLP + ring all-reduce" label="Live">
+  <ParTensor />
+  <Fragment slot="caption">
+    <p>The ring all-reduce runs as <b>reduce-scatter</b> followed by <b>all-gather</b>, with every link busy on every step. Each GPU sends about <code>2·(n−1)/n</code> times the tensor size, nearly independent of how many GPUs there are. The latency of the 2·(n−1) steps still adds up, and it is paid twice per layer for every token.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key" title="Why TP lowers latency">
+Decode is [memory-bandwidth-bound](../roofline/). With TP = 4, each GPU reads only **¼ of the weights** per step, and four GPUs read in parallel. That is roughly 4× the aggregate bandwidth on a single token, minus the all-reduce cost. No other strategy speeds up a single request this way.
+</Callout>
+
+### Why TP stays inside one node
+
+A 70B model has 80 layers, so each decode step performs **160 all-reduces**. Each message is small: batch × hidden × 2 bytes, about 0.5 MB for a batch of 32. So the cost is dominated by **latency per collective**, not bandwidth. Inside a node, NVLink or NVSwitch gives roughly 900 GB/s and microsecond latency. Across nodes, even a fast 400 Gb/s network is about 18× less bandwidth with much higher latency. Hence the standard layout: **TP inside a node, PP (or DP) across nodes.**
+
+There is a second constraint: TP must divide the number of attention heads, and ideally the number of KV heads. Llama 3.1 has 8 KV heads, so with TP = 16 the KV heads would have to be **replicated**, wasting KV memory.
+
+## Pipeline parallelism: split the layer stack
+
+PP gives GPU 0 layers 1–20, GPU 1 layers 21–40, and so on. A token's activations flow from stage to stage, and only one hidden vector per token crosses each boundary. Communication is therefore tiny and point-to-point, which suits the slower links between nodes.
+
+The catch is the **bubble**. With one batch, only one stage is busy at a time. Engines fill the pipeline with several **micro-batches**: while stage 2 works on micro-batch 1, stage 1 starts micro-batch 2.
+
+<Viz title="Pipeline schedule: micro-batches fill the bubbles" label="Live">
+  <ParPipeline />
+  <Fragment slot="caption">
+    <p>Idle fraction = <code>(P − 1) / (M + P − 1)</code>. With continuous batching, a serving engine keeps the pipeline mostly full by always having another batch ready. A single request is never faster under PP: it still visits every stage in order, plus the hand-off hops.</p>
+  </Fragment>
+</Viz>
+
+## Data parallelism: just add replicas
+
+The simplest form of scaling is to run **N independent copies** behind a load balancer. There is no communication between them, a crash takes out only one replica, and throughput scales linearly. The cost is that every replica needs the **full** model plus its own KV room. The load balancer also needs to be smart: see [routing](../routing-autoscaling/).
+
+<Callout type="tip" title="TP = 2 or two replicas?">
+If the model fits on one GPU with little room left, **two replicas** give more total throughput and better fault isolation. **TP = 2** halves the weights per GPU, which frees a lot more KV room for longer contexts or bigger batches, and lowers per-token latency, at the cost of all-reduces. Memory-starved deployments usually benefit from TP. Load-test both.
+</Callout>
+
+## Context parallelism: split one long sequence
+
+A 1M-token prompt is a problem even for TP, because prefill attention is quadratic in length and one sequence's KV can exceed a GPU. **Context (sequence) parallelism** gives each GPU a slice of the *tokens*. GPUs exchange K/V blocks in a ring so every query sees every key ("ring attention"). It is mostly a prefill technique for very long inputs and is combined with TP, not used instead of it.
+
+## Putting numbers on it
+
+Choose a model and GPU, then try TP over NVLink versus TP over Ethernet:
+
+<Viz title="Fit + communication calculator" label="Calculator">
+  <ParCalc />
+  <Fragment slot="caption">
+    <p>A first-order model. Step time ≈ (weights + KV read per GPU) ÷ HBM bandwidth + 2 × layers × all-reduce time. For MoE models, the weights read grow with batch size as more experts are touched. Real kernels overlap some communication with compute, so treat the numbers as directional.</p>
+  </Fragment>
+</Viz>
+
+A good default recipe:
+
+1. Pick the **smallest TP** that fits the weights with healthy KV room. That is usually 1, 2, 4 or 8, within one node.
+2. If even TP = 8 doesn't fit, add **PP across nodes** (or move to a bigger GPU).
+3. Scale throughput with **DP replicas**.
+4. For extreme context, add **CP**. For large MoE, add **EP**.
+
+<Interview>
+  <Q q="Explain column-parallel vs row-parallel linear layers and why they are paired." level="core">
+    Column-parallel splits the output dimension, so each GPU produces an independent slice of the output. Row-parallel splits the input dimension, so each GPU produces a full-size partial sum. A column-parallel layer followed by a row-parallel one needs **no communication in between**, because the slices line up. A single all-reduce at the end sums the partials. Megatron-style TP uses this pattern in both the MLP and attention.
+  </Q>
+  <Q q="How many all-reduces does a TP decode step need for an 80-layer model?" level="core">
+    Two per layer (after attention and after the MLP), so **160** per step, for every generated token. Because each message is small, per-collective latency matters more than bandwidth.
+  </Q>
+  <Q q="Why is tensor parallelism usually kept within a single node?" level="mid">
+    It communicates very frequently with small messages. NVLink or NVSwitch gives hundreds of GB/s and low latency inside a node. Inter-node networks have far less bandwidth and much higher latency, so the all-reduces would dominate step time. PP (rare, small hand-offs) or DP (no communication) are used across nodes instead.
+  </Q>
+  <Q q="Does pipeline parallelism reduce latency for a single request?" level="mid">
+    No. The request still passes through every layer in sequence, now with extra hops. PP increases **capacity** (memory) and, with enough micro-batches in flight, throughput. Bubbles of size (P − 1)/(M + P − 1) waste time when there aren't enough batches to keep stages busy.
+  </Q>
+  <Q q="A model barely fits on one GPU. TP = 2 or two replicas? What would you measure?" level="senior">
+    Two replicas give more aggregate throughput, no all-reduce cost and isolated failures, but little KV room, so they risk small batches, preemption and short context limits. TP = 2 halves the weights per GPU, gives much more KV room and lower per-token latency, but adds all-reduces and a shared failure domain. Measure goodput at your SLO, preemption rates and KV usage under realistic traffic with both layouts.
+  </Q>
+  <Q q="What happens if TP exceeds the number of KV heads?" level="senior">
+    The KV heads can't be split further, so they are **replicated** across ranks. Each GPU then stores redundant K/V, wasting KV memory and capping the benefit of higher TP. Engines warn about this, and it is one reason TP above 8 is rare for GQA models with 8 KV heads.
+  </Q>
+</Interview>

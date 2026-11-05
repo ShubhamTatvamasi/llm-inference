@@ -1,0 +1,151 @@
+---
+/* Tensor parallelism of one MLP block: column-parallel W1, row-parallel W2,
+   then a ring all-reduce (reduce-scatter + all-gather) to sum the partial outputs. */
+---
+<div data-viz="par-tensor"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, segmented, stats, legend, narration, arrowDefs, uniq, C } from '../../lib/viz';
+
+  const W = 940;
+
+  mountAll('par-tensor', (root) => {
+    const bar = ctrlBar(root);
+    let n = 4;
+    let step = 0;
+    // contributors[g][c] = set of GPU ids whose partial for chunk c is summed into GPU g's copy
+    let contrib: Set<number>[][] = [];
+    let lastSends: { from: number; to: number; chunk: number; kind: 'rs' | 'ag' }[] = [];
+
+    const totalSteps = () => 4 + 2 * (n - 1); // 0 idle,1 bcast,2 gemm1,3 gemm2, then ring
+
+    const svg = svgRoot(root, W, 430, { 'aria-label': 'Tensor-parallel MLP with ring all-reduce' });
+    const say = narration(root);
+    const st = stats(root, ['Phase', 'Weights per GPU', 'Bytes sent per GPU', 'Comm steps']);
+    legend(root, [['Activations (replicated)', C.token], ['Weight shard', C.weight], ['Partial sum', C.compute], ['Fully reduced', C.kv], ['Ring transfer', C.comm]]);
+
+    function reset() {
+      step = 0; lastSends = [];
+      contrib = Array.from({ length: n }, (_, g) => Array.from({ length: n }, () => new Set<number>([g])));
+    }
+
+    function stepFn() {
+      if (step >= totalSteps()) return false;
+      step++;
+      lastSends = [];
+      const ringStep = step - 4; // 0-based ring step index once >= 0
+      if (ringStep >= 0) {
+        const snap = contrib.map((row) => row.map((st) => new Set(st)));
+        if (ringStep < n - 1) {
+          // reduce-scatter: GPU g sends chunk (g - ringStep) mod n to g+1, which accumulates
+          for (let g = 0; g < n; g++) {
+            const c = (((g - ringStep) % n) + n) % n; const to = (g + 1) % n;
+            snap[g][c].forEach((x) => contrib[to][c].add(x));
+            lastSends.push({ from: g, to, chunk: c, kind: 'rs' });
+          }
+        } else {
+          const k = ringStep - (n - 1);
+          // all-gather: GPU g sends its complete chunk (g + 1 - k) mod n to g+1, which overwrites
+          for (let g = 0; g < n; g++) {
+            const c = (((g + 1 - k) % n) + n) % n; const to = (g + 1) % n;
+            contrib[to][c] = new Set(snap[g][c]);
+            lastSends.push({ from: g, to, chunk: c, kind: 'ag' });
+          }
+        }
+      }
+      return step < totalSteps();
+    }
+
+    function render() {
+      clear(svg);
+      const arrow = arrowDefs(svg, uniq('pt'), C.comm);
+      const X0 = 120, laneGap = 14;
+      const laneW = (W - X0 - 10 - laneGap * (n - 1)) / n;
+      const rows = { head: 22, x: 62, w1: 112, y: 168, w2: 218, z: 278 };
+      const active = (phase: number) => (step === phase ? 1 : step > phase ? 0.85 : 0.28);
+
+      const labels: [number, string, string][] = [
+        [rows.x, 'X', 'input (all GPUs)'], [rows.w1, 'W₁ shard', 'column split'], [rows.y, 'Yᵢ = act(X·W₁ᵢ)', 'local, no comm'],
+        [rows.w2, 'W₂ shard', 'row split'], [rows.z, 'Zᵢ = Yᵢ·W₂ᵢ', 'partial → all-reduce'],
+      ];
+      for (const [y, a, b] of labels) {
+        text(svg, 6, y, a, { class: 't-small t-bold' });
+        text(svg, 6, y + 14, b, { class: 't-small t-faint' });
+      }
+
+      const reduceDone = step >= totalSteps();
+      for (let g = 0; g < n; g++) {
+        const lx = X0 + g * (laneW + laneGap);
+        rect(svg, lx, 6, laneW, 312, C.surface2, { rx: 10, stroke: C.border });
+        text(svg, lx + laneW / 2, rows.head, `GPU ${g}`, { 'text-anchor': 'middle', class: 't-bold' });
+        // X replicated
+        rect(svg, lx + 10, rows.x - 9, laneW - 20, 18, C.token, { opacity: active(1), rx: 4 });
+        if (laneW > 90) text(svg, lx + laneW / 2, rows.x, 'X  [tokens × d]', { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)', opacity: active(1) });
+        // W1 column shard: full height d, width = ffn/n
+        const full = laneW - 20;
+        rect(svg, lx + 10, rows.w1 - 18, full, 36, C.surface3, { rx: 4 });
+        const sw = full / n;
+        rect(svg, lx + 10 + g * sw, rows.w1 - 18, sw, 36, C.weight, { opacity: active(2), rx: 3 });
+        // Y_i slice
+        rect(svg, lx + 10 + g * sw, rows.y - 9, sw, 18, C.compute, { opacity: active(2), rx: 3 });
+        rect(svg, lx + 10, rows.y - 9, full, 18, 'none', { stroke: C.border, 'stroke-dasharray': '3 3', rx: 3 });
+        // W2 row shard
+        rect(svg, lx + 10, rows.w2 - 20, full, 40, C.surface3, { rx: 4 });
+        rect(svg, lx + 10, rows.w2 - 20 + (g * 40) / n, full, 40 / n, C.weight, { opacity: active(3), rx: 2 });
+        // Z chunks
+        const cw = (full - (n - 1) * 3) / n;
+        for (let c = 0; c < n; c++) {
+          const cnt = contrib[g]?.[c]?.size ?? 1;
+          const done = cnt === n;
+          const cx = lx + 10 + c * (cw + 3);
+          const fill = step < 3 ? C.surface3 : done ? C.kv : C.compute;
+          const op = step < 3 ? 1 : done ? 1 : 0.35 + (0.55 * cnt) / n;
+          rect(svg, cx, rows.z - 12, cw, 24, fill, { opacity: op, rx: 4 });
+          if (step >= 3 && cw > 24) text(svg, cx + cw / 2, rows.z, `${cnt}/${n}`, { 'text-anchor': 'middle', class: 't-small t-mono t-bold', fill: 'var(--bg)' });
+        }
+        text(svg, lx + laneW / 2, rows.z + 26, `chunks of Z`, { 'text-anchor': 'middle', class: 't-small t-faint' });
+      }
+
+      // ring arrows
+      const ringY = 352;
+      for (let g = 0; g < n; g++) {
+        const lx = X0 + g * (laneW + laneGap) + laneW / 2;
+        s('circle', { cx: lx, cy: ringY, r: 6, fill: C.surface3, stroke: C.comm, 'stroke-width': 1.5 }, svg);
+      }
+      text(svg, 6, ringY, 'Ring', { class: 't-small t-bold' });
+      text(svg, 6, ringY + 14, 'NVLink', { class: 't-small t-faint' });
+      for (const snd of lastSends) {
+        const fx = X0 + snd.from * (laneW + laneGap) + laneW / 2;
+        const tx = X0 + snd.to * (laneW + laneGap) + laneW / 2;
+        const wrap = snd.to < snd.from;
+        const d = wrap
+          ? `M${fx},${ringY + 8} C${fx},${ringY + 52} ${tx},${ringY + 52} ${tx},${ringY + 9}`
+          : `M${fx + 8},${ringY} C${(fx + tx) / 2},${ringY - 26} ${(fx + tx) / 2},${ringY - 26} ${tx - 9},${ringY}`;
+        s('path', { d, fill: 'none', stroke: C.comm, 'stroke-width': 2, 'marker-end': arrow }, svg);
+        const mx = wrap ? (fx + tx) / 2 : (fx + tx) / 2;
+        const my = wrap ? ringY + 46 : ringY - 22;
+        rect(svg, mx - 30, my - 9, 60, 18, C.surface, { rx: 9, stroke: C.comm });
+        text(svg, mx, my, `chunk ${snd.chunk}`, { 'text-anchor': 'middle', class: 't-small t-mono', fill: C.comm });
+      }
+
+      // stats
+      const ring = step - 4;
+      const phase = step === 0 ? 'idle' : step === 1 ? 'broadcast X' : step === 2 ? 'GEMM 1 (local)' : step === 3 ? 'GEMM 2 (local)' : ring < n - 1 ? `reduce-scatter ${ring + 1}/${n - 1}` : reduceDone ? 'done' : `all-gather ${ring - (n - 1) + 1}/${n - 1}`;
+      st.set('Phase', phase);
+      st.set('Weights per GPU', `1/${n}`, 'of each MLP matrix');
+      st.set('Bytes sent per GPU', `2·(${n}−1)/${n} = ${((2 * (n - 1)) / n).toFixed(2)}×`, 'size of Z, ring all-reduce');
+      st.set('Comm steps', `${2 * (n - 1)}`, `${n - 1} reduce-scatter + ${n - 1} all-gather`);
+
+      if (step === 0) say('Each GPU holds <b>1/' + n + '</b> of the MLP weights. Press <b>Play</b> to run one forward pass of the block.');
+      else if (step === 1) say('The input activations <b>X</b> are present on every GPU (they came out of the previous all-reduce).');
+      else if (step === 2) say('<b>Column-parallel GEMM:</b> each GPU multiplies X by its own <i>columns</i> of W₁ and applies the activation. No communication needed: each slice of the hidden layer is independent.');
+      else if (step === 3) say('<b>Row-parallel GEMM:</b> each GPU multiplies its slice Yᵢ by its <i>rows</i> of W₂. Each result Zᵢ is full-size but only a <b>partial sum</b>. The true output is Z = Σ Zᵢ.');
+      else if (ring < n - 1) say(`<b>Reduce-scatter step ${ring + 1}:</b> every GPU passes one chunk to its neighbour, which adds its own partial. All links are busy at once.`);
+      else if (!reduceDone) say(`<b>All-gather step ${ring - (n - 1) + 1}:</b> fully-summed chunks (green) are passed around the ring until every GPU has all of them.`);
+      else say('<b>Done.</b> Every GPU now holds the full output Z, ready for the next layer. This happens <b>twice per layer</b> (after attention and after the MLP), for every forward pass.');
+    }
+
+    player(bar, root, { step: stepFn, reset, render, interval: 1300, autoplay: true });
+    segmented(bar, [{ value: '2', label: 'TP = 2' }, { value: '4', label: 'TP = 4' }], '4', (v) => { n = Number(v); reset(); render(); });
+  });
+</script>

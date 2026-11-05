@@ -1,0 +1,87 @@
+---
+/* Full capacity planner: model + GPU + precision + traffic + SLOs → memory, concurrency,
+   speed, per-replica throughput, fleet size and cost. First-order estimates. */
+---
+<div data-viz="cap-planner"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, select, slider, stats, narration, C, fmt, arrowDefs, uniq } from '../../lib/viz';
+  import { MODELS, GPUS, getModel, getGPU } from '../../data/hardware';
+  import { plan, money } from './capacityModel';
+
+  const PROMPTS = [128, 256, 512, 1000, 2000, 4000, 8000, 16000, 32000];
+  const OUTPUTS = [32, 64, 128, 250, 500, 1000, 2000, 4000];
+  const W = 940, H = 196;
+
+  mountAll('cap-planner', (root) => {
+    const S = { model: getModel('llama3-8b'), gpu: getGPU('h100'), tp: 1, wBytes: 2, kvBytes: 2, pI: 3, oI: 3, rps: 10, tpotSlo: 40, ttftSlo: 1, util: 0.7 };
+    const b1 = ctrlBar(root); const g1 = group(b1);
+    select(g1, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), S.model.id, (v) => { S.model = getModel(v); render(); });
+    select(g1, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), S.gpu.id, (v) => { S.gpu = getGPU(v); render(); });
+    select(g1, 'TP', [1, 2, 4, 8].map((n) => ({ value: String(n), label: `TP=${n}` })), '1', (v) => { S.tp = Number(v); render(); });
+    const b2 = ctrlBar(root);
+    select(b2, 'Weights', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8 / INT8' }, { value: '0.5', label: 'INT4 / FP4' }], '2', (v) => { S.wBytes = Number(v); render(); });
+    select(b2, 'KV cache', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }], '2', (v) => { S.kvBytes = Number(v); render(); });
+    const b3 = ctrlBar(root);
+    slider(b3, { label: 'Avg prompt', min: 0, max: PROMPTS.length - 1, value: S.pI, format: (i) => `${fmt.num(PROMPTS[i], 0)} tok`, onInput: (i) => { S.pI = i; render(); } });
+    slider(b3, { label: 'Avg output', min: 0, max: OUTPUTS.length - 1, value: S.oI, format: (i) => `${fmt.num(OUTPUTS[i], 0)} tok`, onInput: (i) => { S.oI = i; render(); } });
+    slider(b3, { label: 'Traffic', min: 0.5, max: 100, step: 0.5, value: S.rps, format: (v) => `${v} req/s`, onInput: (v) => { S.rps = v; render(); } });
+    const b4 = ctrlBar(root);
+    slider(b4, { label: 'SLO: TPOT ≤', min: 15, max: 100, value: S.tpotSlo, format: (v) => `${v} ms`, onInput: (v) => { S.tpotSlo = v; render(); } });
+    slider(b4, { label: 'SLO: TTFT ≤', min: 0.2, max: 5, step: 0.1, value: S.ttftSlo, format: (v) => `${v.toFixed(1)} s`, onInput: (v) => { S.ttftSlo = v; render(); } });
+    slider(b4, { label: 'Target utilisation', min: 0.4, max: 0.95, step: 0.05, value: S.util, format: (v) => `${Math.round(v * 100)}%`, onInput: (v) => { S.util = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Chain of capacity calculations from memory to cost' });
+    const st = stats(root, ['TTFT floor (no queue)', 'E2E per request', 'In flight (Little’s law)', 'GPU spend / month']);
+    const say = narration(root);
+    const arrowId = uniq('cp-arr');
+
+    function card(i: number, title: string, value: string, sub1: string, sub2: string, color: string, bad = false) {
+      const x = 10 + i * 156, y = 30, w = 140, hh = 150;
+      rect(svg, x, y, w, hh, C.surface2, { rx: 12, stroke: bad ? C.waste : C.border, 'stroke-width': bad ? 1.6 : 1 });
+      rect(svg, x, y, w, 4, color, { rx: 2 });
+      text(svg, x + 12, y + 24, title, { class: 't-small t-bold', fill: color });
+      text(svg, x + 12, y + 58, value, { class: 't-mono t-bold', 'font-size': value.length > 9 ? 15 : 19, fill: bad ? C.waste : C.text });
+      text(svg, x + 12, y + 92, sub1, { class: 't-small t-dim' });
+      text(svg, x + 12, y + 112, sub2, { class: 't-small t-dim' });
+      if (i < 5) s('line', { x1: x + w + 2, y1: y + hh / 2, x2: x + w + 14, y2: y + hh / 2, stroke: C.faint, 'stroke-width': 1.5, 'marker-end': `url(#${arrowId})` }, svg);
+    }
+
+    function render() {
+      clear(svg);
+      arrowDefs(svg, arrowId, C.faint);
+      const prompt = PROMPTS[S.pI], output = OUTPUTS[S.oI];
+      const r = plan({ ...S, prompt, output });
+      text(svg, 10, 12, `${S.model.name} · ${S.tp} × ${S.gpu.name} per replica`, { class: 't-small t-bold' });
+      text(svg, W - 10, 12, 'estimates — confirm with a load test', { 'text-anchor': 'end', class: 't-small t-faint' });
+
+      if (!r.fits) {
+        card(0, '1 · Memory', 'won’t fit', `weights ${fmt.num(r.weights / 1e9, 0)} GB`, `budget ${fmt.num(r.budget / 1e9, 0)} GB`, C.weight, true);
+        for (let i = 1; i < 6; i++) card(i, ['2 · Batch', '3 · Speed', '4 · Per replica', '5 · Fleet', '6 · Cost'][i - 1], '—', '', '', C.mem);
+        st.set('TTFT floor (no queue)', '—'); st.set('E2E per request', '—'); st.set('In flight (Little’s law)', '—'); st.set('GPU spend / month', '—');
+        say(`<b>The weights alone (${fmt.num(r.weights / 1e9, 0)} GB) don’t fit</b> in ${S.tp} × ${S.gpu.memGB} GB at 90% utilisation. Raise TP, pick a bigger GPU, or quantize the weights.`);
+        return;
+      }
+      card(0, '1 · Memory', `${fmt.num(r.kvAvail / 1e9, 1)} GB`, `KV room after weights`, `${fmt.bytes(r.kvSeq)} / request`, C.weight);
+      card(1, '2 · Batch', `${r.C} seqs`, `max by memory: ${r.maxSeqMem}`, r.limitedBy === 'memory' ? 'limit: KV memory' : 'limit: TPOT SLO', C.kv, r.C === 0);
+      card(2, '3 · Speed', `${(r.tpot * 1000).toFixed(1)} ms`, `TPOT at batch ${r.C}`, `prefill ${fmt.ms(r.pT * 1000)}`, C.decode);
+      card(3, '4 · Per replica', `${r.rpsRep.toFixed(2)} r/s`, `${fmt.num(r.outTokS, 1)} out tok/s`, 'at SLO, fully loaded', C.compute);
+      card(4, '5 · Fleet', `${isFinite(r.replicas) ? r.replicas : '—'} × TP${S.tp}`, `= ${isFinite(r.gpus) ? r.gpus : '—'} GPUs`, `${S.rps} r/s at ${Math.round(S.util * 100)}% util`, C.comm);
+      card(5, '6 · Cost', `${money(r.costPerM)}`, 'per M output tokens', `${money(r.costHr)} / hour`, C.prefill);
+
+      st.set('TTFT floor (no queue)', fmt.ms(r.ttft * 1000), r.ttftOk ? `within ${S.ttftSlo}s SLO` : `breaks ${S.ttftSlo}s SLO`, r.ttftOk ? C.good : C.waste);
+      st.set('E2E per request', `${r.e2e.toFixed(1)} s`, `TTFT + ${output - 1} × TPOT`);
+      st.set('In flight (Little’s law)', `${Math.round(r.inflight)}`, `${S.rps}/s × ${r.e2e.toFixed(1)} s`);
+      st.set('GPU spend / month', money(r.costHr * 730), `${isFinite(r.gpus) ? r.gpus : '—'} GPUs × $${S.gpu.pricePerHr}/h × 730 h`);
+
+      const notes: string[] = [];
+      if (r.C === 0) notes.push(`<b>Even batch 1 misses the ${S.tpotSlo} ms TPOT SLO.</b> Use faster memory, more TP, or smaller/quantized weights.`);
+      else if (r.limitedBy === 'memory') notes.push(`Concurrency is capped by <b>KV memory</b> (${r.maxSeqMem} sequences). FP8 KV, more TP, or shorter contexts raise it.`);
+      else notes.push(`Concurrency is capped by the <b>TPOT SLO</b>: bigger batches would make each step slower than ${S.tpotSlo} ms. Memory would allow ${r.maxSeqMem}.`);
+      if (!r.ttftOk) notes.push(`Prefilling ${fmt.num(prompt, 0)} tokens alone takes ${fmt.ms(r.pT * 1000)}, more than the TTFT SLO, before any queueing.`);
+      if (isFinite(r.replicas) && r.replicas > 1) notes.push(`Add at least one spare replica (N+1) for failures and rollouts.`);
+      say(notes.join(' '));
+    }
+    render();
+  });
+</script>

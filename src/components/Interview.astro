@@ -1,0 +1,22 @@
+---
+/**
+ * "Interview check" block at the end of each chapter.
+ * <Interview>
+ *   <Q q="Why is decode memory-bound?">answer markdown…</Q>
+ * </Interview>
+ */
+---
+<section class="interview">
+  <div class="ih">
+    <span class="ib">Interview check</span>
+    <span class="is">Try answering before you expand.</span>
+  </div>
+  <div class="iq"><slot /></div>
+</section>
+<style>
+  .interview { margin: 3.5rem 0 1rem; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); padding: 18px 18px 8px; position: relative; overflow: hidden; }
+  .interview::before { content: ''; position: absolute; inset: 0 0 auto 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(167,139,250,0.7), transparent); }
+  .ih { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .ib { font-weight: 700; font-size: 1.1rem; letter-spacing: -0.01em; }
+  .is { color: var(--text-faint); font-size: 0.85rem; }
+</style>

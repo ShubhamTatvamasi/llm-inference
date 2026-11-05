@@ -1,0 +1,69 @@
+---
+/* How much of a decode step is launch overhead? Compare eager / fused / CUDA-graph
+   for a chosen model, GPU and batch size. */
+---
+<div data-viz="kernel-overhead"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, group, select, slider, stats, legend, C, fmt } from '../../lib/viz';
+  import { MODELS, GPUS, getModel, getGPU } from '../../data/hardware';
+
+  const W = 940, H = 170;
+  const BATCHES = [1, 4, 16, 64, 256];
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+
+  // small model preset (local to this diagram) — where launch overhead hurts the most
+  const SMALL = { ...getModel('llama3-8b'), id: 'llama32-1b', name: 'Llama 3.2 1B', params: 1.24e9, activeParams: 1.24e9, layers: 16, hidden: 2048 };
+  const LIST = [SMALL, ...MODELS.filter((m) => m.params < 100e9)];
+  const pick = (id: string) => LIST.find((m) => m.id === id) ?? getModel(id);
+
+  mountAll('kernel-overhead', (root) => {
+    let model = SMALL;
+    let gpu = getGPU('h100');
+    let bi = 0, launchUs = 8;
+    const b1 = ctrlBar(root);
+    const g = group(b1);
+    select(g, 'Model', LIST.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = pick(v); render(); });
+    select(g, 'GPU', GPUS.map((x) => ({ value: x.id, label: x.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'Batch', min: 0, max: BATCHES.length - 1, value: bi, format: (i) => String(BATCHES[i]), onInput: (i) => { bi = i; render(); } });
+    slider(b2, { label: 'CPU cost per launch', min: 2, max: 30, value: launchUs, format: (v) => `${v} µs`, onInput: (v) => { launchUs = v; render(); } });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Decode step time split into GPU work and launch overhead' });
+    const st = stats(root, ['GPU work / step', 'Eager step', 'CUDA-graph step', 'Graph speed-up']);
+    legend(root, [['GPU doing useful work', C.weight], ['GPU idle, waiting for CPU launches', C.mem]]);
+
+    function render() {
+      clear(svg);
+      const batch = BATCHES[bi];
+      const bytes = model.params * 2;
+      const gpuWork = Math.max(bytes / (gpu.bwTBs * 1e12 * 0.8), (2 * model.activeParams * batch) / (gpu.bf16TF * 1e12 * 0.6)) * 1e6; // µs
+      const modes = [
+        { name: 'Eager (≈15 kernels/layer)', k: 15 },
+        { name: 'Fused (≈9 kernels/layer)', k: 9 },
+        { name: 'CUDA graph (1 launch/step)', k: 0 },
+      ].map((m) => {
+        const cpu = m.k === 0 ? 15 : m.k * model.layers * launchUs; // µs
+        const gaps = m.k === 0 ? 9 * model.layers * 0.6 : 0;
+        const total = Math.max(gpuWork + gaps, cpu + 1) + (m.k === 0 ? 15 : 0);
+        return { ...m, total, idle: total - gpuWork };
+      });
+      const maxT = Math.max(...modes.map((m) => m.total));
+      const LX = 230, BW = W - LX - 120;
+      modes.forEach((m, i) => {
+        const y = 14 + i * 50;
+        text(svg, 10, y + 14, m.name, { class: 't-small t-bold' });
+        const wW = (gpuWork / maxT) * BW, iW = (m.idle / maxT) * BW;
+        rect(svg, LX, y, wW, 28, C.weight, { rx: 5 });
+        if (iW > 1) rect(svg, LX + wW, y, iW, 28, C.mem, { rx: 5, opacity: 0.55 });
+        text(svg, LX + wW + iW + 8, y + 14, fmt.ms(m.total / 1000), { class: 't-small t-mono t-bold' });
+        if (iW > 70) text(svg, LX + wW + iW / 2, y + 14, `${fmt.pct(m.idle / m.total)} idle`, { 'text-anchor': 'middle', class: 't-small t-bold', ...fillStyle('var(--bg)') });
+      });
+
+      st.set('GPU work / step', fmt.ms(gpuWork / 1000), `${model.layers} layers, batch ${batch}`);
+      st.set('Eager step', fmt.ms(modes[0].total / 1000), `${fmt.pct(modes[0].idle / modes[0].total)} launch-bound`, modes[0].idle / modes[0].total > 0.3 ? C.waste : undefined);
+      st.set('CUDA-graph step', fmt.ms(modes[2].total / 1000), `${fmt.num(batch * 1e6 / modes[2].total, 0)} tok/s`);
+      st.set('Graph speed-up', `${(modes[0].total / modes[2].total).toFixed(2)}×`, 'vs eager', C.good);
+    }
+    render();
+  });
+</script>

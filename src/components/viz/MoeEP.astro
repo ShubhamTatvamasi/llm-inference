@@ -1,0 +1,115 @@
+---
+/* Expert parallelism: experts sharded over GPUs; tokens travel via all-to-all dispatch,
+   get processed by their expert, then return via all-to-all combine. */
+---
+<div data-viz="moe-ep"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, button, narration, stats, legend, rafLoop, rng, ease, lerp, C, SERIES } from '../../lib/viz';
+
+  const G = 4, PER = 2, TOK = 6;
+  const W = 940, H = 330;
+  const CYCLE = 7.5;
+
+  mountAll('moe-ep', (root) => {
+    const bar = ctrlBar(root);
+    let seed = 3;
+    let dest: number[][] = [];
+    function route() {
+      const r = rng(seed);
+      // skew a bit toward expert 2 to show a hot GPU
+      dest = Array.from({ length: G }, () => Array.from({ length: TOK }, () => (r() < 0.22 ? 2 : Math.floor(r() * G * PER))));
+    }
+    route();
+    const pb = button(bar, 'Pause', () => { if (loop.running) { loop.pause(); pb.querySelector('span')!.textContent = 'Play'; } else { loop.resume(); pb.querySelector('span')!.textContent = 'Pause'; } });
+    button(bar, 'New batch', () => { seed++; route(); t = 0; }, { icon: 'reset' });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'All-to-all dispatch and combine between GPUs in expert parallelism' });
+    const say = narration(root);
+    const st = stats(root, ['Tokens crossing GPUs', 'Busiest GPU', 'Phase']);
+    legend(root, [['Token (colour = home GPU)', SERIES[0]], ['Expert computing', C.compute], ['Processed by expert', C.kv], ['All-to-all network traffic', C.comm]]);
+
+    const gx = (g: number) => 14 + g * (W - 28) / G;
+    const gw = (W - 28) / G - 14;
+    const home = (g: number, i: number) => ({ x: gx(g) + 16 + i * ((gw - 32) / TOK) + 4, y: 70 });
+    function inboxPos(e: number, slot: number) {
+      const g = Math.floor(e / PER), j = e % PER;
+      const ew = (gw - 30) / PER;
+      const x0 = gx(g) + 10 + j * (ew + 10);
+      return { x: x0 + 6 + (slot % 5) * ((ew - 12) / 5), y: 168 - Math.floor(slot / 5) * 22 };
+    }
+
+    let t = 0; let lastPhase = -1;
+    const PH = [
+      [0, 1.2, 'Route', 'Each token’s router picks its expert (top-1 here; top-k sends k copies). Most chosen experts live on <b>other</b> GPUs.'],
+      [1.2, 2.8, 'Dispatch (all-to-all)', '<b>All-to-all dispatch:</b> every GPU sends each token to the GPU that owns its expert, all at once.'],
+      [2.8, 4.1, 'Expert compute', 'Each GPU runs only <b>its own experts</b> on whatever arrived. The GPU with the hot expert has the most work, and the others wait for it.'],
+      [4.1, 5.7, 'Combine (all-to-all)', '<b>All-to-all combine:</b> results travel back to each token’s home GPU and are weighted by the gate.'],
+      [5.7, CYCLE, 'Next layer', 'The tokens are home again and continue to attention. This round trip happens in <b>every MoE layer</b>.'],
+    ] as const;
+
+    function draw() {
+      clear(svg);
+      const tt = t % CYCLE;
+      const ph = PH.findIndex((p) => tt >= p[0] && tt < p[1]);
+      // inbox slot assignment
+      const slots = new Map<string, number>();
+      const fill = new Array(G * PER).fill(0);
+      for (let g = 0; g < G; g++) for (let i = 0; i < TOK; i++) { const e = dest[g][i]; slots.set(`${g}-${i}`, fill[e]++); }
+      const gpuLoad = Array.from({ length: G }, (_, g) => fill[g * PER] + fill[g * PER + 1]);
+      const maxLoad = Math.max(...gpuLoad);
+
+      // GPU boxes
+      for (let g = 0; g < G; g++) {
+        rect(svg, gx(g), 24, gw, 270, C.surface2, { rx: 12, stroke: C.border });
+        text(svg, gx(g) + 12, 40, `GPU ${g}`, { class: 't-bold t-small' });
+        text(svg, gx(g) + gw - 10, 40, `load ${gpuLoad[g]}`, { 'text-anchor': 'end', class: 't-small t-mono', fill: gpuLoad[g] === maxLoad ? C.waste : C.faint });
+        const ew = (gw - 30) / PER;
+        for (let j = 0; j < PER; j++) {
+          const e = g * PER + j;
+          const x0 = gx(g) + 10 + j * (ew + 10);
+          const busy = ph === 2 && fill[e] > 0;
+          const prog = ph === 2 ? Math.min(1, (tt - PH[2][0]) / ((PH[2][1] - PH[2][0]) * (fill[e] / Math.max(1, ...fill)))) : 0;
+          rect(svg, x0, 196, ew, 70, busy ? C.computeSoft : C.surface3, { rx: 9, stroke: busy ? C.compute : C.border });
+          if (busy) rect(svg, x0, 262, ew * Math.min(1, prog), 4, C.compute, { rx: 2 });
+          text(svg, x0 + ew / 2, 222, `Expert ${e}`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: busy ? C.compute : C.text });
+          text(svg, x0 + ew / 2, 242, `${fill[e]} token${fill[e] === 1 ? '' : 's'}`, { 'text-anchor': 'middle', class: 't-small t-faint' });
+        }
+        text(svg, gx(g) + 12, 56, 'home tokens', { class: 't-small t-faint' });
+      }
+      // interconnect bar
+      const active = ph === 1 || ph === 3;
+      rect(svg, 14, 306, W - 28, 8, active ? C.comm : C.surface3, { rx: 4, opacity: active ? 0.9 : 1 });
+      text(svg, W / 2, 322, 'NVLink / network fabric', { 'text-anchor': 'middle', class: 't-small t-faint' });
+
+      // tokens
+      for (let g = 0; g < G; g++) for (let i = 0; i < TOK; i++) {
+        const e = dest[g][i];
+        const a = home(g, i), b = inboxPos(e, slots.get(`${g}-${i}`)!);
+        let p = 0;
+        if (ph === 1) p = ease((tt - PH[1][0]) / (PH[1][1] - PH[1][0]));
+        else if (ph === 2) p = 1;
+        else if (ph === 3) p = 1 - ease((tt - PH[3][0]) / (PH[3][1] - PH[3][0]));
+        const x = lerp(a.x, b.x, p), y = lerp(a.y, b.y, p) - Math.sin(p * Math.PI) * 30;
+        const done = ph >= 3 || (ph === 2 && tt - PH[2][0] > 0.6);
+        const sz = 14;
+        const remote = Math.floor(e / PER) !== g;
+        if (active && remote) s('line', { x1: a.x + sz / 2, y1: a.y + sz / 2, x2: x + sz / 2, y2: y + sz / 2, stroke: C.comm, 'stroke-width': 1, opacity: 0.35 }, svg);
+        rect(svg, x, y, sz, sz, SERIES[g], { rx: 4, stroke: done ? C.kv : 'none', 'stroke-width': 2.5 });
+        if (ph === 0) text(svg, a.x + sz / 2, a.y + sz + 10, `E${e}`, { 'text-anchor': 'middle', class: 't-small t-mono', fill: remote ? C.comm : C.dim });
+      }
+
+      if (ph !== lastPhase) {
+        lastPhase = ph;
+        say(PH[ph][3]);
+        let cross = 0;
+        for (let g = 0; g < G; g++) for (let i = 0; i < TOK; i++) if (Math.floor(dest[g][i] / PER) !== g) cross++;
+        st.set('Tokens crossing GPUs', `${cross} / ${G * TOK}`, 'sent over the fabric, twice', C.comm);
+        st.set('Busiest GPU', `${maxLoad} tokens`, `ideal ${(G * TOK) / G}`, maxLoad > 1.5 * TOK ? C.waste : undefined);
+        st.set('Phase', PH[ph][2]);
+      }
+    }
+    const loop = rafLoop(root, (dt) => { t += dt; draw(); });
+    draw();
+  });
+</script>

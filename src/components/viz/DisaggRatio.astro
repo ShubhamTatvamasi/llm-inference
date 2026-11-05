@@ -1,0 +1,88 @@
+---
+/* Pool sizing for P/D disaggregation: arrival rate, prompt/output lengths, #prefill vs #decode GPUs
+   → prefill utilisation & TTFT (queueing), decode batch & ITL (bandwidth model), vs colocated worst-case ITL. */
+---
+<div data-viz="disagg-ratio"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, slider, stats, narration, C, fmt } from '../../lib/viz';
+  import { getModel, getGPU, kvBytesPerToken } from '../../data/hardware';
+
+  const W = 940, H = 230;
+
+  mountAll('disagg-ratio', (root) => {
+    const model = getModel('llama3-8b');
+    const gpu = getGPU('h100');
+    let lam = 8, prompt = 4096, out = 256, xP = 2, yD = 1;
+    const b1 = ctrlBar(root);
+    slider(b1, { label: 'Requests / s', min: 1, max: 60, value: lam, onInput: (v) => { lam = v; render(); } });
+    slider(b1, { label: 'Prompt tokens', min: 256, max: 32768, step: 256, value: prompt, format: (v) => fmt.num(v, 1), onInput: (v) => { prompt = v; render(); } });
+    slider(b1, { label: 'Output tokens', min: 16, max: 2048, step: 16, value: out, onInput: (v) => { out = v; render(); } });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'Prefill GPUs (xP)', min: 1, max: 8, value: xP, onInput: (v) => { xP = v; render(); } });
+    slider(b2, { label: 'Decode GPUs (yD)', min: 1, max: 8, value: yD, onInput: (v) => { yD = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Prefill and decode pools with utilisation gauges' });
+    const st = stats(root, ['TTFT (disagg)', 'ITL (disagg)', 'Seqs per decode GPU', 'Colocated worst ITL']);
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      const flops = gpu.bf16TF * 1e12 * 0.5; // assume 50% MFU in prefill
+      const Sp = (2 * model.params * prompt + 2 * model.layers * prompt * prompt * model.hidden) / flops; // seconds (GEMMs + attention)
+      const rhoP = (lam * Sp) / xP;
+      const ttft = rhoP < 1 ? Sp + (rhoP * Sp) / (2 * (1 - rhoP)) : Infinity; // M/D/1 waiting
+      // decode fixed point: N = λ·out·ITL / yD ; ITL = (W + N·ctx·kv)/bw + 2ms
+      const bw = gpu.bwTBs * 1e12;
+      const kvTok = kvBytesPerToken(model, 2);
+      const ctx = prompt + out / 2;
+      const wB = model.params * 2;
+      const kvRoom = gpu.memGB * 1e9 * 0.9 - wB - 2e9;
+      let itl = 0.01; let N = 0;
+      for (let i = 0; i < 60; i++) { N = (lam * out * itl) / yD; itl = (wB + N * ctx * kvTok) / bw + 0.002; }
+      const kvNeed = N * ctx * kvTok;
+      const kvOk = kvNeed <= kvRoom && isFinite(itl) && itl < 1;
+      // colocated with same GPUs: steady ITL similar but a full prefill can land between two tokens
+      const nAll = xP + yD;
+      const Ncol = (lam * out * itl) / nAll;
+      const itlCol = (wB + Ncol * ctx * kvTok) / bw + 0.002;
+      const worstCol = itlCol + Sp;
+
+      // drawing: two pools
+      const pool = (x: number, w: number, n: number, label: string, col: string, soft: string, util: number, sub: string, ul: string) => {
+        rect(svg, x, 24, w, 150, C.surface2, { rx: 12, stroke: C.border });
+        text(svg, x + 14, 44, label, { class: 't-bold' });
+        text(svg, x + 14, 62, sub, { class: 't-small t-dim' });
+        const gw = Math.min(44, (w - 28 - (n - 1) * 6) / n);
+        for (let i = 0; i < n; i++) {
+          rect(svg, x + 14 + i * (gw + 6), 78, gw, 40, soft, { rx: 6, stroke: col });
+          text(svg, x + 14 + i * (gw + 6) + gw / 2, 98, 'GPU', { 'text-anchor': 'middle', class: 't-small t-bold', fill: col });
+        }
+        const u = Math.min(1, util);
+        rect(svg, x + 14, 136, w - 28, 12, C.surface3, { rx: 6 });
+        rect(svg, x + 14, 136, (w - 28) * u, 12, util >= 1 ? C.waste : util > 0.8 ? C.prefill : col, { rx: 6 });
+        text(svg, x + 14, 162, util >= 1 ? `${ul} ≥ 100%: overloaded` : `${ul} ${(util * 100).toFixed(0)}%`, { class: 't-small', fill: util >= 1 ? C.waste : C.dim });
+      };
+      pool(14, 380, xP, `Prefill pool × ${xP}`, C.prefill, C.prefillSoft, rhoP, `${fmt.ms(Sp * 1e3)} per ${fmt.num(prompt, 1)}-token prompt`, 'compute busy');
+      const decUtil = kvOk ? kvNeed / kvRoom : 1.01;
+      pool(546, 380, yD, `Decode pool × ${yD}`, C.decode, C.decodeSoft, decUtil, `KV in use per GPU: ${fmt.num(kvNeed / 1e9, 1)} / ${fmt.num(kvRoom / 1e9, 0)} GB`, 'KV memory used');
+      // transfer arrow
+      s('path', { d: 'M400,98 L540,98', stroke: C.comm, 'stroke-width': 3, fill: 'none', 'stroke-dasharray': '6 5' }, svg);
+      s('path', { d: 'M532,91 L542,98 L532,105', stroke: C.comm, 'stroke-width': 3, fill: 'none' }, svg);
+      text(svg, 470, 84, `KV ${fmt.bytes(kvTok * prompt)}`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: C.comm });
+      text(svg, 470, 116, 'per request', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      text(svg, 14, 200, `${model.name} on ${gpu.name}, BF16. Prefill at ~50% MFU; decode bandwidth-bound. Request rate ${lam}/s → ${fmt.num(lam * prompt, 1)} prompt tok/s, ${fmt.num(lam * out, 1)} output tok/s.`, { class: 't-small t-faint' });
+
+      st.set('TTFT (disagg)', isFinite(ttft) ? fmt.ms(ttft * 1e3) : '∞', 'prefill + queueing', !isFinite(ttft) ? C.waste : undefined);
+      st.set('ITL (disagg)', kvOk ? fmt.ms(itl * 1e3) : 'overloaded', 'steady, no prefill interference', kvOk ? C.good : C.waste);
+      st.set('Seqs per decode GPU', kvOk ? fmt.num(N, 1) : '—', 'by Little’s law');
+      st.set('Colocated worst ITL', fmt.ms(worstCol * 1e3), `same ${nAll} GPUs, when a full prefill lands`, worstCol > 3 * itl ? C.waste : undefined);
+
+      if (!isFinite(ttft)) say('<b>Prefill-bound:</b> prompts arrive faster than the prefill pool can process them. Add prefill GPUs (raise xP).');
+      else if (!kvOk) say('<b>Decode-bound:</b> the decode pool runs out of KV memory or bandwidth for this many concurrent streams. Add decode GPUs (raise yD).');
+      else if (rhoP < 0.3 && decUtil < 0.3) say('Both pools are mostly idle. At this traffic level a single colocated pool with <b>chunked prefill</b> is cheaper and simpler.');
+      else say(`Balanced. Disaggregation keeps ITL at a steady <b>${fmt.ms(itl * 1e3)}</b>. Colocated, a user could see a <b>${fmt.ms(worstCol * 1e3)}</b> stall whenever someone else's ${fmt.num(prompt, 1)}-token prefill runs (less with chunked prefill).`);
+    }
+    render();
+  });
+</script>

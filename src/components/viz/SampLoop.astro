@@ -1,0 +1,107 @@
+---
+/* The autoregressive decode loop, including the stop checks that end a request. */
+---
+<div data-viz="samp-loop"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, slider, segmented, narration, stats, C, arrowDefs, uniq } from '../../lib/viz';
+
+  const GEN = ['Paris', '␣is', '␣the', '␣capital', '␣and', '␣largest', '␣city', '␣of', '␣France', '.', '␣It', '␣is', '<eos>'];
+  const STATIONS = [
+    { k: 'Forward pass', s: 'all L layers, 1 new token', c: C.weight },
+    { k: 'Logits', s: '[vocab] scores', c: C.compute },
+    { k: 'Sample', s: 'temperature, top-p…', c: C.token },
+    { k: 'Append', s: 'token + its K/V', c: C.kv },
+    { k: 'Stop check', s: 'EOS? stop? max_tokens?', c: C.prefill },
+  ];
+  const W = 940, H = 330, CX = 262, CY = 170, RX = 178, RY = 118;
+
+  mountAll('samp-loop', (root) => {
+    let maxTok = 16; let stopMode: 'eos' | 'period' = 'eos';
+    let station = -1; let out: string[] = []; let finish = ''; let streamed = '';
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Decode loop: forward, logits, sample, append, stop check' });
+    const aid = uniq('sla');
+    const say = narration(root);
+    const st = stats(root, ['Generated tokens', 'Forward passes', 'finish_reason']);
+
+    function reset() { station = -1; out = []; finish = ''; streamed = ''; }
+    function step() {
+      if (finish) return false;
+      station = (station + 1) % STATIONS.length;
+      if (station === 2) { /* sampled token chosen */ }
+      if (station === 3) { out.push(GEN[Math.min(out.length, GEN.length - 1)]); }
+      if (station === 4) {
+        const t = out[out.length - 1];
+        if (t === '<eos>') finish = 'stop (EOS token)';
+        else if (stopMode === 'period' && t === '.') finish = 'stop (stop string ".")';
+        else if (out.length >= maxTok) finish = 'length (max_tokens)';
+        if (t !== '<eos>') streamed += t.replace(/␣/g, ' ');
+      }
+      return !finish;
+    }
+    function pos(i: number) { const a = -Math.PI / 2 + (i / STATIONS.length) * Math.PI * 2; return [CX + RX * Math.cos(a), CY + RY * Math.sin(a)]; }
+
+    function render() {
+      clear(svg);
+      const arrow = arrowDefs(svg, aid, C.faint);
+      s('ellipse', { cx: CX, cy: CY, rx: RX, ry: RY, fill: 'none', stroke: C.border, 'stroke-width': 2, 'stroke-dasharray': '6 6' }, svg);
+      // arrows between stations
+      for (let i = 0; i < STATIONS.length; i++) {
+        const a0 = -Math.PI / 2 + ((i + 0.32) / STATIONS.length) * Math.PI * 2, a1 = -Math.PI / 2 + ((i + 0.68) / STATIONS.length) * Math.PI * 2;
+        s('path', { d: `M${CX + RX * Math.cos(a0)},${CY + RY * Math.sin(a0)} A${RX},${RY} 0 0 1 ${CX + RX * Math.cos(a1)},${CY + RY * Math.sin(a1)}`, fill: 'none', stroke: C.faint, 'stroke-width': 2, 'marker-end': arrow }, svg);
+      }
+      STATIONS.forEach((stn, i) => {
+        const [x, y] = pos(i);
+        const on = i === station;
+        rect(svg, x - 74, y - 24, 148, 48, on ? stn.c : C.surface2, { rx: 12, stroke: stn.c, 'stroke-width': on ? 2.5 : 1.2 });
+        text(svg, x, y - 7, stn.k, { 'text-anchor': 'middle', class: 't-bold', style: on ? 'fill:var(--bg)' : '' });
+        text(svg, x, y + 11, stn.s, { 'text-anchor': 'middle', class: 't-small', style: on ? 'fill:var(--bg)' : 'fill:var(--text-dim)' });
+      });
+      text(svg, CX, CY - 8, `step ${out.length + (station >= 0 && station < 3 && !finish ? 1 : 0)}`, { 'text-anchor': 'middle', class: 't-big' });
+      text(svg, CX, CY + 14, 'one loop = one output token', { 'text-anchor': 'middle', class: 't-small t-dim' });
+
+      // right panel: sequence
+      const PX = 540;
+      text(svg, PX, 24, 'Context (prompt + generated)', { class: 't-small t-faint t-bold' });
+      let x = PX, y = 52;
+      const chip = (t: string, kind: 'p' | 'g' | 'new' | 'eos') => {
+        const w = Math.max(28, t.length * 7.4 + 14);
+        if (x + w > W - 12) { x = PX; y += 32; }
+        const fill = kind === 'p' ? C.prefillSoft : kind === 'eos' ? C.wasteSoft : C.decodeSoft;
+        const stroke = kind === 'p' ? C.prefill : kind === 'eos' ? C.waste : kind === 'new' ? C.kv : C.decode;
+        rect(svg, x, y - 12, w, 24, fill, { rx: 6, stroke, 'stroke-width': kind === 'new' ? 2.5 : 1 });
+        text(svg, x + w / 2, y, t, { 'text-anchor': 'middle', class: 't-mono t-small' });
+        x += w + 5;
+      };
+      ['The', '␣capital', '␣of', '␣France', '␣is', ':'].forEach((t) => chip(t, 'p'));
+      out.forEach((t, i) => chip(t, t === '<eos>' ? 'eos' : i === out.length - 1 && station === 3 ? 'new' : 'g'));
+      const sy = Math.max(y + 46, 200);
+      text(svg, PX, sy, 'Streamed to the client', { class: 't-small t-faint t-bold' });
+      rect(svg, PX, sy + 12, W - PX - 12, 40, C.surface2, { rx: 8, stroke: C.border });
+      text(svg, PX + 12, sy + 32, (streamed || '…').slice(-46), { class: 't-mono', 'font-size': 12.5 });
+      if (finish) {
+        rect(svg, PX, sy + 62, W - PX - 12, 30, finish.startsWith('length') ? C.prefillSoft : C.kvSoft, { rx: 8, stroke: finish.startsWith('length') ? C.prefill : C.kv });
+        text(svg, PX + 12, sy + 77, `finish_reason: "${finish.split(' ')[0]}"  ·  ${finish.slice(finish.indexOf('(') + 1, -1)}`, { class: 't-mono t-small t-bold' });
+      }
+
+      const msgs = [
+        'Run every layer for the <b>one</b> newest token, reading all weights and the KV cache. This is the expensive part (~ms).',
+        'The LM head produces a <b>logit for every vocabulary entry</b> (~128K numbers).',
+        'Apply penalties, temperature, top-k/top-p/min-p, then <b>draw one token</b>. This happens on the GPU, batched across requests.',
+        'The token joins the context. Its K/V were written to the cache during the forward pass, and the text is <b>detokenized and streamed</b>.',
+        'Check stop conditions: <b>EOS</b> token, a <b>stop string</b>, or <b>max_tokens</b>. Otherwise loop again.',
+      ];
+      if (station < 0) say('Prefill has already processed the prompt and produced the first token\'s logits. Press <b>Play</b> to walk the per-token loop.');
+      else if (finish) say(`Request finished: <b>${finish}</b>. Its KV-cache blocks are freed immediately, and the scheduler can admit a waiting request in the very next step.`);
+      else say(msgs[station]);
+      st.set('Generated tokens', String(out.length), `max_tokens = ${maxTok}`);
+      st.set('Forward passes', String(out.length + (station >= 0 && station < 3 && !finish ? 1 : 0)), 'one per output token');
+      st.set('finish_reason', finish ? finish.split(' ')[0] : '–', finish ? finish.slice(finish.indexOf('(') + 1, -1) : 'still generating', finish.startsWith('length') ? C.prefill : C.kv);
+    }
+
+    const p = player(bar, root, { step, reset, render, interval: 650, autoplay: true });
+    slider(bar, { label: 'max_tokens', min: 3, max: 16, value: maxTok, onInput: (v) => { maxTok = v; p.reset(); } });
+    segmented(bar, [{ value: 'eos', label: 'Stop on EOS' }, { value: 'period', label: 'stop=["."]' }], 'eos', (v) => { stopMode = v as typeof stopMode; p.reset(); });
+  });
+</script>

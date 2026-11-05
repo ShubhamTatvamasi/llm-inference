@@ -1,0 +1,27 @@
+---
+interface Props { type?: 'note' | 'tip' | 'warn' | 'key'; title?: string }
+const { type = 'note', title } = Astro.props;
+const icons = { note: 'i', tip: '✦', warn: '!', key: '★' };
+const defaults = { note: 'Note', tip: 'Intuition', warn: 'Watch out', key: 'Key idea' };
+---
+<aside class={`callout ${type}`}>
+  <div class="ci">{icons[type]}</div>
+  <div class="cb">
+    <div class="ct">{title ?? defaults[type]}</div>
+    <div class="cc"><slot /></div>
+  </div>
+</aside>
+<style>
+  .callout { display: flex; gap: 14px; margin: 1.6rem 0; padding: 14px 16px; border-radius: 14px; border: 1px solid var(--border); background: var(--surface); position: relative; overflow: hidden; }
+  .callout::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--cc); }
+  .note { --cc: var(--c-decode); --cs: var(--c-decode-soft); }
+  .tip { --cc: var(--c-token); --cs: var(--c-token-soft); }
+  .warn { --cc: var(--c-prefill); --cs: var(--c-prefill-soft); }
+  .key { --cc: var(--c-kv); --cs: var(--c-kv-soft); }
+  .ci { flex: none; width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; font-weight: 700; font-size: 0.85rem; color: var(--cc); background: var(--cs); }
+  .ct { font-weight: 650; font-size: 0.86rem; color: var(--cc); margin-bottom: 2px; letter-spacing: 0.01em; }
+  .cc { font-size: 0.95rem; }
+  .cc :global(p) { margin: 0 0 0.5rem; }
+  .cc :global(p:last-child) { margin: 0; }
+  .cb { min-width: 0; }
+</style>

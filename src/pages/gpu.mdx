@@ -1,0 +1,114 @@
+---
+layout: ../layouts/Chapter.astro
+title: Anatomy of a GPU
+description: Thousands of math units, a ladder of memories from tiny-and-fast to huge-and-slow, and why LLM inference is mostly a fight over memory bandwidth.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import GpuAnatomy from '../components/viz/GpuAnatomy.astro';
+import GpuWeightStream from '../components/viz/GpuWeightStream.astro';
+import GpuWeightCalc from '../components/viz/GpuWeightCalc.astro';
+
+A GPU is a machine for doing the same multiply-add on huge arrays at once. For LLM serving, two of its numbers matter more than all the others: how many **FLOPs** it can do per second, and how many **bytes** it can move out of memory per second. Almost every optimisation in the rest of this guide is a way of balancing those two.
+
+## The chip, top to bottom
+
+A modern data-centre GPU contains:
+
+- **Streaming Multiprocessors (SMs)**: 100+ independent cores. Each SM holds <span class="chip compute">tensor cores</span> (hardware for small matrix multiplies), a large **register file**, and a block of fast on-chip **shared memory** (SMEM, also used as L1 cache).
+- **L2 cache**: tens of MB, shared by every SM.
+- **HBM** (High Bandwidth Memory): stacks of DRAM packaged next to the die. This is the "80 GB" on the spec sheet, and it is where the <span class="chip weight">weights</span> and the <span class="chip kv">KV cache</span> live.
+- **Interconnects**: NVLink (or AMD Infinity Fabric) to other GPUs in the same server, and PCIe to the host CPU, its RAM and storage.
+
+<Viz title="Where the bytes live" label="Explore">
+  <GpuAnatomy />
+  <Fragment slot="caption">
+    <p>Pick a GPU and click a level to highlight where it sits on the chip. Each level going down is roughly <b>10–1000× bigger</b> and <b>several times slower</b> than the one above it. Values marked ≈ are rough estimates derived from SM counts; HBM and link figures are spec-sheet peaks.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key">
+Memory on a GPU is a ladder. **Registers and SMEM** are tiny but extremely fast; **HBM** is large but, by comparison, slow. A kernel runs fast when it loads data from HBM **once**, keeps it in SMEM and registers, and does as much math on it as possible before discarding it.
+</Callout>
+
+## The famous imbalance
+
+Take an H100 SXM. It can do about **989 trillion** BF16 FLOPs per second, but it can read only about **3.35 trillion bytes** per second from HBM. Divide one by the other:
+
+$$
+\frac{989 \times 10^{12}\ \text{FLOP/s}}{3.35 \times 10^{12}\ \text{B/s}} \approx 295\ \text{FLOPs per byte}
+$$
+
+To keep the tensor cores busy, every byte fetched from HBM has to be used in roughly **300 floating-point operations**. If a workload does less math per byte than that, the tensor cores sit idle waiting for data. That workload is <span class="chip mem">memory-bound</span>. This ratio becomes the "ridge point" in [the roofline chapter](../roofline/).
+
+## A decode step, seen from the chip
+
+To generate one token, the model has to multiply the current hidden state by **every weight matrix in every layer**. For an 8B-parameter model in BF16 that is **16 GB of weights** crossing the HBM bus for a single token. Each weight is used for only **2 FLOPs** (one multiply, one add) per token in the batch.
+
+<Viz title="One decode step: stream all the weights, do a little math" label="Live">
+  <GpuWeightStream />
+  <Fragment slot="caption">
+    <p>The top lane shows HBM moving <span class="chip weight">weights</span>; the bottom lane shows <span class="chip compute">tensor cores</span> doing math. At <b>batch 1</b> the tensor cores are idle more than 99% of the time. Raise the batch: every weight read is now shared by many sequences, so throughput climbs almost for free until compute finally catches up.</p>
+  </Fragment>
+</Viz>
+
+The animation shows the central fact of LLM inference: **single-stream decode speed is set by memory bandwidth**, not by FLOPs. A GPU with twice the TFLOPS but the same bandwidth would produce a single user's tokens no faster.
+
+## Your speed limit, calculated
+
+Because decode must read every weight once per step, there is a hard lower bound on step time:
+
+$$
+t_\text{step} \;\ge\; \frac{\text{bytes of weights read}}{\text{memory bandwidth}}
+\qquad\Rightarrow\qquad
+\text{tok/s per sequence} \;\le\; \frac{\text{bandwidth}}{\text{weight bytes}}
+$$
+
+Real kernels reach about 70–90% of peak bandwidth; this fraction is called **MBU**, memory-bandwidth utilisation. Compute-bound work typically reaches 40–70% of peak FLOPs, called **MFU**.
+
+<Viz title="Decode throughput vs batch size" label="Calculator">
+  <GpuWeightCalc />
+  <Fragment slot="caption">
+    <p>In the shaded <span class="chip weight">memory-bound</span> region, doubling the batch nearly doubles throughput, because the weight read is shared. Past the knee the step becomes <span class="chip compute">compute-bound</span> and throughput flattens. To keep the model simple, this ignores KV-cache reads, which also grow with batch and context; see <a href="../kv-cache/">the KV cache</a>. For MoE models only the experts actually routed to are read, so small batches are cheaper than the total parameter count suggests.</p>
+  </Fragment>
+</Viz>
+
+Things to try in the calculator:
+
+- **Llama 3.1 70B on one H100**: the weights do not fit. Switch to 2 or 4 GPUs. With tensor parallelism, each GPU reads only its own shard, so bandwidth adds up across GPUs.
+- **INT4 weights**: the single-stream ceiling roughly quadruples, because there are 4× fewer bytes to read. This is why weight-only [quantization](../quantization/) is so popular for low-batch serving.
+- **H100 vs H200**: identical FLOPs but 43% more bandwidth. Decode gets faster; compute-bound prefill does not.
+
+## What this means for serving
+
+| Fact about the hardware | Consequence for serving |
+|---|---|
+| FLOPs ≫ bandwidth (≈300 FLOP/byte) | Small-batch decode wastes almost all compute |
+| Weights are read once per step regardless of batch | [Batching](../batching/) is the main throughput lever |
+| HBM capacity is finite | Weights + [KV cache](../kv-cache/) must fit, and KV caps concurrency |
+| SMEM is tiny but fast | Kernels like [FlashAttention](../flash-attention/) tile work to stay on-chip |
+| Kernel launches cost microseconds | Tiny decode steps need [fusion and CUDA graphs](../kernels/) |
+| NVLink ≫ PCIe | [Tensor parallelism](../parallelism/) stays inside one NVLink domain |
+
+<Interview>
+  <Q q="An H100 has ~1,000 TFLOPS of BF16 compute. Why can't it generate 1,000 tokens/s for one user on an 8B model?" level="core">
+    Each token needs the whole 16 GB of BF16 weights read from HBM. At 3.35 TB/s that takes at least ≈4.8 ms, which caps a single stream at about **200 tok/s**, and nearer 160 at realistic bandwidth utilisation. The math itself takes microseconds. Decode is **bandwidth-bound**, not compute-bound.
+  </Q>
+  <Q q="What is the difference between HBM, L2 and shared memory?" level="core">
+    **HBM** is the large off-chip DRAM (tens to hundreds of GB) that holds weights and KV cache, at a few TB/s. **L2** is a tens-of-MB on-chip cache shared by all SMs. **Shared memory** is a small (around 100–228 KB) per-SM scratchpad that kernels manage explicitly, with tens of TB/s of aggregate bandwidth. Fast kernels move data from HBM into SMEM once and reuse it there.
+  </Q>
+  <Q q="Define MBU and MFU. Which one should you watch for decode, and which for prefill?" level="mid">
+    **MBU** = achieved bytes/s ÷ peak bandwidth. **MFU** = achieved FLOPs/s ÷ peak FLOPs. Decode is memory-bound, so judge it by **MBU** (good kernels reach about 80%). Prefill and large-batch work are compute-bound, so judge them by **MFU**. A decode MFU of 1% is expected, not a bug.
+  </Q>
+  <Q q="H100 → H200 upgrade: which workloads get faster, and roughly by how much?" level="mid">
+    The H200 has the same compute but about 1.43× the bandwidth (4.8 vs 3.35 TB/s) and 141 GB of memory. **Memory-bound decode** gets up to about 1.4× faster per step. The extra capacity also means more KV cache, so larger batches fit. **Compute-bound prefill** barely changes.
+  </Q>
+  <Q q="GPU utilisation shows 100% in nvidia-smi but throughput is poor. How can both be true?" level="senior">
+    That "utilisation" figure only means *some kernel was running* during each sample window. It says nothing about how many SMs were busy or how close they were to peak FLOPs or bandwidth. Look at **SM activity / occupancy** and **DRAM bandwidth utilisation** (for example via DCGM profiling metrics). Also check the achieved batch size, preemptions, and time spent in communication.
+  </Q>
+  <Q q="Why does a MoE model with 37B active parameters decode faster than a dense 70B model, but need far more memory?" level="senior">
+    Per token, decode reads only the **active** experts' weights: about 37B parameters versus 70B, so fewer bytes per step. But **all** experts must stay resident in memory (671B parameters for DeepSeek-V3), so capacity, not bandwidth, becomes the constraint. As the batch grows, more distinct experts are touched each step, and the per-step byte count climbs back toward the full model.
+  </Q>
+</Interview>

@@ -1,0 +1,122 @@
+---
+/* "Does it fit, and what does TP cost?" — per-GPU memory and per-decode-step time
+   (weight reads vs all-reduce communication) for a TP × PP layout. */
+---
+<div data-viz="par-calc"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, group, select, slider, stats, legend, narration, C, fmt } from '../../lib/viz';
+  import { MODELS, GPUS, getModel, getGPU } from '../../data/hardware';
+
+  const W = 940, H = 200;
+
+  mountAll('par-calc', (root) => {
+    let model = getModel('llama3-70b');
+    let gpu = getGPU('h100');
+    let tp = 4, pp = 1, wBytes = 2, batch = 32, ctx = 4096, link = 'auto';
+
+    const b1 = ctrlBar(root);
+    const g1 = group(b1);
+    select(g1, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(g1, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    select(b1, 'Weights', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }, { value: '0.5', label: 'INT4' }], '2', (v) => { wBytes = Number(v); render(); });
+    const b2 = ctrlBar(root);
+    select(b2, 'TP', [1, 2, 4, 8].map((n) => ({ value: String(n), label: String(n) })), String(tp), (v) => { tp = Number(v); render(); });
+    select(b2, 'PP', [1, 2, 4, 8].map((n) => ({ value: String(n), label: String(n) })), String(pp), (v) => { pp = Number(v); render(); });
+    select(b2, 'TP link', [
+      { value: 'auto', label: 'GPU interconnect (NVLink / IF)' },
+      { value: 'pcie', label: 'PCIe Gen5 (~50 GB/s)' },
+      { value: 'ib', label: 'Network 400 Gb/s (~50 GB/s)' },
+      { value: 'eth', label: 'Ethernet 100 Gb/s (~12 GB/s)' },
+    ], 'auto', (v) => { link = v; render(); });
+    const b3 = ctrlBar(root);
+    slider(b3, { label: 'Decode batch', min: 1, max: 256, value: batch, onInput: (v) => { batch = v; render(); } });
+    slider(b3, { label: 'Avg context', min: 512, max: 32768, step: 512, value: ctx, format: (v) => fmt.num(v, 1), onInput: (v) => { ctx = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Per-GPU memory and per-step time breakdown' });
+    const st = stats(root, ['GPUs', 'Weights / GPU', 'KV room / GPU', 'Decode step (est.)', 'Comm share']);
+    legend(root, [['Weights', C.weight], ['Runtime', C.mem], ['KV cache room', C.kvSoft], ['Read weights + KV (memory-bound)', C.decode], ['All-reduce communication', C.comm]]);
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      const n = tp * pp;
+      const mem = gpu.memGB * 1e9;
+      const budget = mem * 0.9;
+      const wPer = (model.params * wBytes) / n;
+      const overhead = 2e9;
+      const kvRoom = budget - wPer - overhead;
+      const kvHeadsPer = Math.max(1, model.kvHeads / tp);
+      const kvTokPer = model.attn === 'MLA' && model.mlaDim
+        ? (model.layers / pp) * model.mlaDim * 2 // MLA latent is replicated across TP ranks
+        : 2 * (model.layers / pp) * kvHeadsPer * model.headDim * 2;
+      const fits = kvRoom > 0;
+      const maxTok = fits ? kvRoom / kvTokPer : 0;
+
+      // decode step: every stage reads its weight share once + KV for its sequences; stages run one after another for a token
+      const bw = gpu.bwTBs * 1e12;
+      // MoE: a batch touches more experts as it grows: fraction ≈ 1 − (1 − k/E)^batch
+      const wTotal = model.params * wBytes;
+      const activeW = model.activeParams * wBytes;
+      const touched = model.experts ? 1 - Math.pow(1 - model.experts.active / model.experts.total, batch) : 1;
+      const wRead = activeW + (wTotal - activeW) * touched;
+      const kvRead = batch * ctx * (model.attn === 'MLA' && model.mlaDim ? model.layers * model.mlaDim * 2 : 2 * model.layers * model.kvHeads * model.headDim * 2);
+      const tMem = (wRead / tp + kvRead / tp) / bw;
+      // comm: 2 all-reduces / layer, message = batch × hidden × 2 bytes; ring sends 2(n-1)/n × msg; plus per-hop latency
+      const linkGBs = link === 'auto' ? gpu.linkGBs : link === 'pcie' ? 50 : link === 'ib' ? 50 : 12.5;
+      // fixed latency per collective (kernel launch + sync + hops), rough
+      const alpha = link === 'auto' ? 6e-6 : link === 'pcie' ? 20e-6 : link === 'ib' ? 30e-6 : 50e-6;
+      const msg = batch * model.hidden * 2;
+      const perAR = tp > 1 ? (2 * (tp - 1) / tp) * msg / (linkGBs * 1e9) + alpha : 0;
+      const tComm = 2 * model.layers * perAR;
+      const tPP = pp > 1 ? (pp - 1) * (batch * model.hidden * 2 / (linkGBs * 1e9) + alpha) : 0;
+      const tStep = tMem + tComm + tPP;
+      const share = (tComm + tPP) / tStep;
+
+      // per-GPU memory bar
+      const X = 150, BW = W - X - 20;
+      text(svg, 6, 30, 'Per-GPU memory', { class: 't-small t-bold' });
+      text(svg, 6, 44, `${gpu.name}`, { class: 't-small t-faint' });
+      rect(svg, X, 18, BW, 34, C.surface2, { rx: 7, stroke: C.border });
+      const sx = (b: number) => Math.max(0, (b / mem) * BW);
+      let x = X;
+      const seg = (b: number, fill: string, label: string, lf = 'var(--bg)') => {
+        const w = Math.min(sx(b), X + BW - x);
+        if (w <= 0) return;
+        rect(svg, x, 18, w, 34, fill, { rx: 0 });
+        if (w > 80) text(svg, x + 8, 35, label, { class: 't-small t-bold', fill: lf });
+        x += w;
+      };
+      seg(wPer, C.weight, `weights ${fmt.num(wPer / 1e9, 1)} GB`);
+      seg(overhead, C.mem, 'runtime');
+      if (fits) seg(kvRoom, C.kvSoft, `KV room ${fmt.num(kvRoom / 1e9, 1)} GB`, C.kv);
+      if (!fits) text(svg, X + BW, 66, `✗ weights alone need ${fmt.num((wPer + overhead) / 1e9, 0)} GB of a ${fmt.num(budget / 1e9, 0)} GB budget, so increase TP/PP or quantize`, { 'text-anchor': 'end', class: 't-small t-bold', fill: C.waste });
+      else text(svg, X + BW, 66, `✓ fits · room for ≈ ${fmt.num(maxTok, 1)} tokens of KV (≈ ${fmt.int(maxTok / ctx)} seqs at ${fmt.num(ctx, 0)})`, { 'text-anchor': 'end', class: 't-small t-bold', fill: C.good });
+
+      // step time bar
+      text(svg, 6, 112, 'One decode step', { class: 't-small t-bold' });
+      text(svg, 6, 126, `batch ${batch}, est.`, { class: 't-small t-faint' });
+      rect(svg, X, 100, BW, 34, C.surface2, { rx: 7, stroke: C.border });
+      const scale = BW / Math.max(tStep, 1e-9);
+      const wm = tMem * scale, wc = (tComm + tPP) * scale;
+      rect(svg, X, 100, wm, 34, C.decode, { rx: 0 });
+      if (wm > 110) text(svg, X + 8, 117, `memory ${fmt.ms(tMem * 1e3)}`, { class: 't-small t-bold', fill: 'var(--bg)' });
+      rect(svg, X + wm, 100, wc, 34, C.comm, { rx: 0 });
+      if (wc > 110) text(svg, X + wm + 8, 117, `comm ${fmt.ms((tComm + tPP) * 1e3)}`, { class: 't-small t-bold', fill: 'var(--bg)' });
+      text(svg, X, 156, `${2 * model.layers} all-reduces per step × ${fmt.bytes(msg)} each over ${fmt.num(linkGBs, 0)} GB/s${pp > 1 ? ` · ${pp - 1} pipeline hops` : ''}`, { class: 't-small t-dim' });
+      text(svg, X, 178, `≈ ${fmt.num(1 / tStep, 0)} tokens/s per sequence · ≈ ${fmt.num(batch / tStep, 1)} tokens/s total`, { class: 't-small t-dim' });
+
+      st.set('GPUs', `${n}`, `TP ${tp} × PP ${pp}`);
+      st.set('Weights / GPU', `${fmt.num(wPer / 1e9, 1)} GB`, `of ${gpu.memGB} GB`, fits ? undefined : C.waste);
+      st.set('KV room / GPU', fits ? `${fmt.num(kvRoom / 1e9, 1)} GB` : '—', `${fmt.bytes(kvTokPer)} per token here`);
+      st.set('Decode step (est.)', fmt.ms(tStep * 1e3), 'memory + comm');
+      st.set('Comm share', `${(share * 100).toFixed(0)}%`, 'of step time', share > 0.35 ? C.waste : share > 0.15 ? C.prefill : C.good);
+
+      if (!fits) say('<b>Doesn’t fit.</b> Split the model across more GPUs (TP within a node, PP across nodes) or quantize the weights.');
+      else if (link !== 'auto' && tp > 1 && share > 0.3) say(`<b>TP over a slow link:</b> ${fmt.num(2 * model.layers, 0)} small all-reduces per token, each paying latency + bandwidth, eat <b>${(share * 100).toFixed(0)}%</b> of every step. That's why TP stays inside one NVLink node and PP or DP spans nodes.`);
+      else if (tp === 1 && pp === 1) say('One GPU: no communication at all. Raise TP to cut per-GPU weights and step time. Each extra rank reads fewer bytes but adds all-reduce cost.');
+      else say(`TP ${tp} splits every weight matrix, so each GPU reads <b>1/${tp}</b> of the weights per step. That's why TP <b>lowers latency</b>. Its cost is ${2 * model.layers} all-reduces per step, currently <b>${(share * 100).toFixed(0)}%</b> of step time.`);
+    }
+    render();
+  });
+</script>

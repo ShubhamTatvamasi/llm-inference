@@ -1,0 +1,81 @@
+---
+/* max_num_batched_tokens trade-off: smaller budget → smoother streams (lower ITL),
+   larger budget → faster prefill (lower TTFT) and less per-iteration overhead. */
+---
+<div data-viz="chunked-budget"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, slider, stats, legend, C, fmt } from '../../lib/viz';
+
+  const BUDGETS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+  const BASE = 8, PER_TOK = 0.07;
+
+  mountAll('chunked-budget', (root) => {
+    let bi = 3, prompt = 8000, dec = 32;
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'max_num_batched_tokens', min: 0, max: BUDGETS.length - 1, value: bi, format: (i) => fmt.int(BUDGETS[i]), onInput: (i) => { bi = i; render(); } });
+    slider(bar, { label: 'Prompt length', min: 1000, max: 32000, step: 1000, value: prompt, format: (v) => fmt.num(v, 0), onInput: (v) => { prompt = v; render(); } });
+    slider(bar, { label: 'Decoding seqs', min: 1, max: 200, value: dec, onInput: (v) => { dec = v; render(); } });
+
+    const W = 940, H = 280;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Inter-token latency and TTFT versus token budget' });
+    const g = s('g', {}, svg);
+    const st = stats(root, ['Prefill chunk / step', 'ITL while prefilling', 'TTFT of the prompt', 'Time on useful prefill']);
+    legend(root, [['Worst inter-token latency for streaming users', C.decode], ['TTFT of the long prompt', C.prefill], ['No chunking (whole prompt in one step)', C.waste]]);
+
+    function calc(B: number) {
+      const chunk = Math.max(0, B - dec);
+      if (chunk <= 0) return { chunk: 0, itl: BASE + PER_TOK * B, ttft: Infinity, eff: 0 };
+      const steps = Math.ceil(prompt / chunk);
+      const full = BASE + PER_TOK * (dec + chunk);
+      const last = BASE + PER_TOK * (dec + (prompt - (steps - 1) * chunk));
+      const itl = steps > 1 ? full : last;
+      const ttft = (steps - 1) * full + last;
+      return { chunk, itl, ttft, eff: (PER_TOK * prompt) / ttft };
+    }
+
+    function render() {
+      clear(g);
+      const res = BUDGETS.map(calc);
+      const noChunk = { itl: BASE + PER_TOK * (dec + prompt), ttft: BASE + PER_TOK * (dec + prompt) };
+      const X0 = 70, X1 = W - 30, PT = 20, PB = H - 40;
+      const xs = (i: number) => X0 + (i / (BUDGETS.length - 1)) * (X1 - X0);
+      const finite = res.filter((r) => isFinite(r.ttft));
+      const ymax = Math.max(noChunk.ttft, ...finite.map((r) => r.ttft)) * 1.08;
+      const ys = (v: number) => PB - (Math.min(v, ymax) / ymax) * (PB - PT);
+      for (let k = 0; k <= 4; k++) {
+        const v = (ymax / 4) * k;
+        s('line', { x1: X0, y1: ys(v), x2: X1, y2: ys(v), stroke: C.border, 'stroke-dasharray': k ? '2 4' : null }, g);
+        text(g, X0 - 8, ys(v), fmt.ms(v), { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+      }
+      // no-chunk reference
+      s('line', { x1: X0, y1: ys(noChunk.itl), x2: X1, y2: ys(noChunk.itl), stroke: C.waste, 'stroke-dasharray': '6 4', 'stroke-width': 1.5 }, g);
+      text(g, X1, ys(noChunk.itl) - 8, `no chunking: ${fmt.ms(noChunk.itl)} freeze`, { 'text-anchor': 'end', class: 't-small t-bold', fill: C.waste });
+      const line = (vals: number[], col: string) => {
+        let d = ''; let started = false;
+        vals.forEach((v, i) => { if (!isFinite(v)) return; d += `${started ? 'L' : 'M'}${xs(i)},${ys(v)}`; started = true; });
+        s('path', { d, fill: 'none', stroke: col, 'stroke-width': 2.6, 'stroke-linejoin': 'round' }, g);
+        vals.forEach((v, i) => { if (isFinite(v)) s('circle', { cx: xs(i), cy: ys(v), r: i === bi ? 6 : 3, fill: i === bi ? col : C.surface, stroke: col, 'stroke-width': 2 }, g); });
+      };
+      line(res.map((r) => r.itl), C.decode);
+      line(res.map((r) => r.ttft), C.prefill);
+      BUDGETS.forEach((B, i) => text(g, xs(i), PB + 16, fmt.num(B, 0), { 'text-anchor': 'middle', class: 't-small t-mono' + (i === bi ? ' t-bold' : ' t-faint') }));
+      text(g, (X0 + X1) / 2, H - 6, 'token budget per iteration (max_num_batched_tokens)', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      s('line', { x1: xs(bi), y1: PT, x2: xs(bi), y2: PB, stroke: C.accent, 'stroke-dasharray': '3 3' }, g);
+
+      const r = res[bi];
+      if (r.chunk <= 0) {
+        st.set('Prefill chunk / step', '0', 'budget used up by decodes!', C.waste);
+        st.set('ITL while prefilling', fmt.ms(r.itl), '');
+        st.set('TTFT of the prompt', '∞', 'prompt never advances', C.waste);
+        st.set('Time on useful prefill', '0%', '');
+        return;
+      }
+      st.set('Prefill chunk / step', fmt.int(r.chunk), `${fmt.int(BUDGETS[bi])} budget − ${dec} decode tokens`);
+      st.set('ITL while prefilling', fmt.ms(r.itl), r.itl > 100 ? 'users notice the stutter' : 'streams stay smooth', r.itl > 100 ? C.waste : C.decode);
+      st.set('TTFT of the prompt', fmt.ms(r.ttft), `${Math.ceil(prompt / r.chunk)} chunks`, C.prefill);
+      st.set('Time on useful prefill', fmt.pct(r.eff), 'rest is per-step overhead + decodes');
+    }
+    render();
+  });
+</script>

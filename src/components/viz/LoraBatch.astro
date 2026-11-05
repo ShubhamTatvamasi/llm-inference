@@ -1,0 +1,106 @@
+---
+/* One forward pass, many adapters: the base GEMM is shared by every row; a batched
+   "gather" kernel applies each row's own low-rank A_i then B_i, and the result is added. */
+---
+<div data-viz="lora-batch"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, player, stats, narration, legend, C, s } from '../../lib/viz';
+
+  const REQ = ['A', '', 'B', 'A', 'C', 'B'];
+  const COL: Record<string, string> = { A: C.token, B: C.prefill, C: C.comm, '': C.mem };
+  const SOFT: Record<string, string> = { A: C.tokenSoft, B: C.prefillSoft, C: C.commSoft, '': C.memSoft };
+  const W = 940, H = 330;
+  const RY = 86, RH = 34;
+
+  mountAll('lora-batch', (root) => {
+    let phase = 0;
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'A batch of requests using different LoRA adapters in one forward pass' });
+    const say = narration(root);
+    const st = stats(root, ['Requests in batch', 'Distinct adapters', 'Kernel launches / layer', 'Extra memory']);
+    legend(root, [['Adapter A', C.token], ['Adapter B', C.prefill], ['Adapter C', C.comm], ['Base model only', C.mem], ['Shared base weight W', C.weight]]);
+
+    function reset() { phase = 0; }
+    function step() { phase = (phase + 1) % 5; return true; }
+
+    function render() {
+      clear(svg);
+      const xs = { req: 16, x: 140, w: 270, lora: 440, plus: 620, y: 650 };
+      text(svg, xs.req, RY - 26, 'Requests', { class: 't-small t-bold t-dim' });
+      text(svg, xs.x, RY - 26, 'Activations X', { class: 't-small t-bold t-dim' });
+      text(svg, xs.y, RY - 26, 'Output Y = XW + X·Aᵢ·Bᵢ', { class: 't-small t-bold t-dim' });
+
+      // loaded adapters bank
+      const bank = ['A', 'B', 'C'];
+      text(svg, xs.lora, 14, 'Adapters resident on GPU', { class: 't-small t-bold t-dim' });
+      bank.forEach((a, i) => {
+        const bx = xs.lora + i * 52;
+        rect(svg, bx, 24, 10, 26, COL[a], { rx: 2 });
+        rect(svg, bx + 13, 24, 26, 8, COL[a], { rx: 2, opacity: 0.7 });
+        text(svg, bx + 26, 44, a, { 'text-anchor': 'middle', class: 't-bold t-small', fill: COL[a] });
+      });
+
+      REQ.forEach((a, i) => {
+        const y = RY + i * RH;
+        rect(svg, xs.req, y, 104, RH - 8, SOFT[a], { rx: 7, stroke: COL[a] });
+        text(svg, xs.req + 10, y + (RH - 8) / 2, `req ${i + 1} → ${a || 'base'}`, { class: 't-small t-bold' });
+        rect(svg, xs.x, y, 100, RH - 8, SOFT[a], { rx: 4 });
+        for (let k = 0; k < 8; k++) rect(svg, xs.x + 6 + k * 11.5, y + 7, 8, RH - 22, COL[a], { rx: 1, opacity: 0.55 });
+
+        // LoRA path
+        if (a && phase >= 2) {
+          const bi = bank.indexOf(a);
+          if (phase === 2 || phase === 3) s('path', { d: `M${xs.lora + bi * 52 + 20},52 C${xs.lora + bi * 52 + 20},${RY - 10} ${xs.lora + 15},${y - 20} ${xs.lora + 15},${y}`, fill: 'none', stroke: COL[a], 'stroke-width': 1.2, opacity: 0.35 }, svg);
+          rect(svg, xs.lora, y + 2, 30, RH - 12, COL[a], { rx: 3 });
+          text(svg, xs.lora + 15, y + (RH - 8) / 2, 'A', { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+          if (phase >= 3) {
+            s('line', { x1: xs.lora + 32, x2: xs.lora + 48, y1: y + (RH - 8) / 2, y2: y + (RH - 8) / 2, stroke: COL[a] }, svg);
+            rect(svg, xs.lora + 50, y + 2, 110, RH - 12, COL[a], { rx: 3, opacity: 0.75 });
+            text(svg, xs.lora + 105, y + (RH - 8) / 2, 'B → Δy', { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+          }
+        } else if (!a && phase >= 2) {
+          text(svg, xs.lora + 4, y + (RH - 8) / 2, 'no adapter: skip', { class: 't-small t-faint' });
+        }
+
+        // output
+        if (phase >= 1) {
+          rect(svg, xs.y, y, 200, RH - 8, C.weightSoft, { rx: 4, stroke: C.weight, 'stroke-opacity': 0.5 });
+          text(svg, xs.y + 8, y + (RH - 8) / 2, 'XW', { class: 't-small t-mono' });
+          if (phase >= 4 && a) {
+            rect(svg, xs.y + 120, y + 4, 74, RH - 16, COL[a], { rx: 3 });
+            text(svg, xs.y + 157, y + (RH - 8) / 2, `+ Δ${a}`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+          }
+        }
+      });
+
+      // shared W
+      const wh = REQ.length * RH - 8;
+      rect(svg, xs.w, RY, 140, wh, C.weight, { rx: 6, opacity: phase === 1 ? 1 : 0.55 });
+      text(svg, xs.w + 70, RY + wh / 2 - 8, 'W', { 'text-anchor': 'middle', class: 't-big', 'font-size': 26, fill: 'var(--bg)' });
+      text(svg, xs.w + 70, RY + wh / 2 + 18, 'one big GEMM', { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+      if (phase === 1) for (let i = 0; i < REQ.length; i++) s('line', { x1: xs.x + 102, x2: xs.w - 2, y1: RY + i * RH + 13, y2: RY + i * RH + 13, stroke: C.weight, 'stroke-width': 1.5 }, svg);
+      if (phase >= 4) text(svg, xs.plus, RY + wh / 2, '+', { 'text-anchor': 'middle', class: 't-big', 'font-size': 22 });
+
+      // kernel tags
+      const tags = ['', 'kernel 1 · base GEMM (all rows)', 'kernel 2 · LoRA shrink: gather Aᵢ per row (SGMV / BGMV)', 'kernel 3 · LoRA expand: gather Bᵢ per row', 'add Δy into the output'];
+      if (phase) { rect(svg, 16, H - 34, W - 32, 26, C.accentSoft, { rx: 7 }); text(svg, 28, H - 21, tags[phase], { class: 't-small t-bold', fill: C.accent }); }
+
+      st.set('Requests in batch', String(REQ.length), 'continuous batching as usual');
+      st.set('Distinct adapters', '3 + base', 'all in ONE forward pass');
+      st.set('Kernel launches / layer', '3', '1 base GEMM + 2 LoRA gathers');
+      st.set('Extra memory', '≈ +1%', 'vs 3 extra full model copies', C.good);
+
+      const msgs = [
+        'Six requests from different tenants share one batch. Four of them want a fine-tuned <b>adapter</b> (A, B or C), and one wants the plain base model.',
+        '<b>Base GEMM:</b> every row multiplies the same frozen <b>W</b>. This is the expensive part, and it is shared, so batching works as usual.',
+        '<b>Shrink:</b> one batched kernel gathers each row’s own <b>Aᵢ</b> (d → r, tiny) by adapter index. Rows with the same adapter are grouped into segments.',
+        '<b>Expand:</b> a second gather kernel applies each row’s <b>Bᵢ</b> (r → d), producing a per-row delta Δy.',
+        '<b>Add:</b> y = xW + (α/r)·x·Aᵢ·Bᵢ. Each user gets their own fine-tuned behaviour, but the GPU did one big shared matmul plus two skinny ones.',
+      ];
+      say(msgs[phase]);
+    }
+
+    player(bar, root, { step, reset, render, interval: 1500, autoplay: true, loop: true });
+  });
+</script>

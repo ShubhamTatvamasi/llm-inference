@@ -1,0 +1,116 @@
+---
+layout: ../layouts/Chapter.astro
+title: Quantization
+description: Store and compute with fewer bits. FP8, INT8, INT4 and FP4 explained bit by bit, why scales and outliers matter, and which phase of inference each scheme actually speeds up.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import QuantBits from '../components/viz/QuantBits.astro';
+import QuantMatrix from '../components/viz/QuantMatrix.astro';
+import QuantCalc from '../components/viz/QuantCalc.astro';
+
+A 70B-parameter model in BF16 is **140 GB** of weights. That needs at least two 80 GB GPUs before you store a single token of [KV cache](../kv-cache/). Every decode step also has to stream all 140 GB through the memory bus. **Quantization** stores the numbers in fewer bits, so the model shrinks, the bus moves fewer bytes per token, and on modern GPUs the math itself can run faster.
+
+## Bits, exponents and mantissas
+
+A floating-point number spends its bits on three things: a **sign**, an **exponent** that sets the *range* (how big or small a value can be), and a **mantissa** that sets the *precision* (how finely values are spaced). Integers have no exponent: they are evenly spaced and need an external **scale** to map them onto real values.
+
+<Viz title="Number-format explorer" label="Explore">
+  <QuantBits />
+  <Fragment slot="caption">
+    <p>Try <b>300</b> in FP16 (fine) and in FP8 E4M3 (it rounds to 288). Try <b>70000</b>: FP16 overflows to ∞, while BF16 keeps FP32's 8-bit exponent and survives. Switch to <b>FP4 E2M1</b>: only 8 non-negative values exist (0, 0.5, 1, 1.5, 2, 3, 4, 6). Low-bit formats only work with good <b>scaling</b>.</p>
+  </Fragment>
+</Viz>
+
+| Format | Bits (S/E/M) | Max value | Where it's used |
+|---|---|---|---|
+| **FP32** | 1 / 8 / 23 | 3.4 × 10³⁸ | Training master weights, accumulators |
+| **BF16** | 1 / 8 / 7 | 3.4 × 10³⁸ | Default for weights and activations today |
+| **FP16** | 1 / 5 / 10 | 65,504 | Older default; overflows more easily |
+| **FP8 E4M3** | 1 / 4 / 3 | 448 | Inference weights and activations |
+| **FP8 E5M2** | 1 / 5 / 2 | 57,344 | Gradients (more range, less precision) |
+| **INT8** | 8-bit integer | scale × 127 | W8A8 (SmoothQuant), KV cache |
+| **INT4** | 4-bit integer | scale × 7 | Weight-only (GPTQ, AWQ, GGUF Q4) |
+| **FP4 E2M1** | 1 / 2 / 1 | 6 (× block scale) | NVFP4 / MXFP4 on Blackwell-class GPUs |
+
+## Scales, granularity and outliers
+
+To quantize a tensor $w$ to a $b$-bit integer, pick a scale $s$ and round:
+
+$$
+q = \mathrm{round}\!\left(\frac{w}{s}\right), \qquad s = \frac{\max |w|}{2^{b-1} - 1}, \qquad \hat w = q \cdot s
+$$
+
+The **absmax** sets the scale, so a single big value stretches the grid for everything that shares that scale, and small values round to zero. The fix is to use **more scales over smaller groups**. One scale per tensor is crude. One per output channel is common for 8-bit. One per **group of 32–128 weights** is standard for 4-bit.
+
+<Viz title="Quantize a weight matrix, step by step" label="Live">
+  <QuantMatrix />
+  <Fragment slot="caption">
+    <p>Turn on the <b>outlier input channel</b> with per-channel INT4: each row's scale is set by its outlier, so the error map lights up across the whole matrix. Switch to <b>per-group</b>: only the groups that contain the outlier suffer. The extra scales cost very little, under 0.2 bits per weight at real group sizes.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="tip" title="Activations are worse than weights">
+Weights are fixed and fairly well-behaved, so you can calibrate them offline. **Activations** change with every input, and LLMs develop a few hidden-state channels with values 100× larger than the rest. That is why 8-bit *activation* quantization needed tricks like **SmoothQuant**, which moves part of the outlier magnitude from activations into the weights with a per-channel rescale. FP8's exponent helps here too: it tolerates a wide dynamic range far better than INT8.
+</Callout>
+
+## Getting from FP16 to 4 bits without breaking the model
+
+Rounding every weight to its nearest grid point (**round-to-nearest**, RTN) works at 8 bits and starts to hurt at 4 bits. The popular post-training methods are smarter about it:
+
+- **GPTQ** quantizes weights one column at a time and updates the not-yet-quantized columns to **compensate** for the error, using second-order information from a small calibration set.
+- **AWQ** observes that ~1% of weight channels matter most, namely those that see large activations. It **scales those channels up** before quantizing so they keep more precision.
+- **GGUF** (llama.cpp) packs block-quantized formats like Q4_K and Q8_0 into a single file for CPU, Apple silicon and edge inference.
+- **Microscaling** (MXFP4, NVFP4) puts the scales into the hardware format itself: every block of 16–32 FP4 values shares an 8-bit scale, and the tensor cores apply it natively.
+
+## Which phase gets faster?
+
+This is the most important practical question, and the answer depends on whether the **math** runs in low precision or only the **storage** does.
+
+- **Weight-only (W4A16, W8A16)**: weights are stored small and **dequantized to BF16 inside the kernel**. That cuts the bytes read per token, which is exactly what memory-bound [decode](../prefill-decode/) needs. The math still runs in BF16, so compute-bound **prefill gains little**, and at large batch the dequantization overhead can even make it slower.
+- **Weight + activation (W8A8 FP8/INT8, W4A4 FP4)**: both operands are low-precision, so the **tensor cores run at 2× (8-bit) or 4× (4-bit) the BF16 rate**. That speeds up prefill *and* large-batch decode. It needs hardware support: FP8 on Hopper, Ada and newer; FP4 on Blackwell.
+
+<Viz title="Memory, decode and prefill per scheme" label="Calculator">
+  <QuantCalc />
+  <Fragment slot="caption">
+    <p>Pick <b>A100</b>: it has no FP8 tensor cores, so FP8 is weight-only and prefill stays at the BF16 rate. Pick <b>B200</b>: FP4 runs natively and prefill throughput jumps. Notice that INT4 weight-only gives the best batch-1 decode speed but no prefill speedup.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="warn" title="4-bit can make you slower under load">
+A team switches from FP8 to INT4 weight-only to "save GPUs", and throughput under load **drops**. At large batch, decode is no longer purely memory-bound, and the INT4 kernel pays dequantization costs and runs BF16 math. The FP8 kernel was using native low-precision tensor cores. Always benchmark at your real concurrency.
+</Callout>
+
+## Don't forget the KV cache
+
+Quantization is not just for weights. An **FP8 KV cache** halves the cache's memory per token, so you can fit roughly twice the concurrent sequences or context length. Decode also reads half as many cache bytes. The per-token scales can be per tensor or per head. The risk is **long-context accuracy**: attention over thousands of slightly perturbed keys can blur exact recall. Use the [KV calculator](../kv-cache/) to see the capacity gain, and evaluate retrieval-heavy tasks before you turn it on.
+
+## Proving it's good enough
+
+1. Compare against the BF16 model on **your own task evals**, with identical prompts and sampling settings.
+2. Include the slices most likely to regress: **math and reasoning, code, long context, structured output and tool calls**, and non-English languages.
+3. Watch **output length** too. Quantized models sometimes ramble or stop early, which shifts cost and latency.
+4. Set acceptance thresholds **before** running the evals, and keep the BF16 model deployable for rollback.
+
+<Interview>
+  <Q q="What do the exponent and mantissa bits control in a float format?" level="core">
+    The exponent sets the **dynamic range**, from the smallest to the largest representable magnitude. The mantissa sets the **precision**: the relative spacing between neighbouring values. BF16 keeps FP32's 8 exponent bits (same range) and keeps only 7 mantissa bits. FP16 has more precision (10 bits) but overflows above 65,504.
+  </Q>
+  <Q q="Weight-only INT4 vs W8A8 FP8: which phase does each speed up?" level="core">
+    W4A16 cuts bytes read, so it speeds up memory-bound **decode** at small batch, but the math is still BF16, so **prefill** barely improves. FP8 W8A8 runs the matmuls on FP8 tensor cores at about 2× the BF16 rate, so it speeds up **prefill and large-batch decode**, as long as the GPU supports FP8.
+  </Q>
+  <Q q="Why do we use per-group scales for 4-bit weights?" level="mid">
+    With only 16 levels, one large value in a group stretches the step size and rounds small weights to zero. Smaller groups (e.g. 128 weights) adapt the scale to local magnitudes. The overhead is one FP16 scale per 128 weights, about 0.125 extra bits per weight.
+  </Q>
+  <Q q="What problem does SmoothQuant solve?" level="mid">
+    LLM activations have a few outlier channels that make per-tensor INT8 activation quantization very lossy. SmoothQuant divides those activation channels by a per-channel factor and multiplies the matching weight rows by the same factor. The math is unchanged, but the activations become easy to quantize and the weights absorb the difficulty.
+  </Q>
+  <Q q="We moved to INT4 to save GPUs and throughput at peak load dropped. Why?" level="senior">
+    At high concurrency, decode becomes more compute-bound. The W4A16 kernel dequantizes in registers and does BF16 math, so it loses to FP8 W8A8, which uses native FP8 tensor cores. Check which kernel was selected, measure throughput at several concurrency levels, and compare output lengths and any changed engine flags (e.g. speculative decoding settings).
+  </Q>
+  <Q q="How do NVFP4 / MXFP4 differ from INT4 with group scales?" level="senior">
+    They are **floating-point** 4-bit values (E2M1) with a shared per-block scale (8-bit) applied natively by the tensor cores. That makes W4A4 matmuls possible at 4-bit throughput. INT4 group quantization is usually weight-only and dequantized to BF16 before the math. FP4 needs Blackwell-class hardware and careful accuracy validation.
+  </Q>
+</Interview>

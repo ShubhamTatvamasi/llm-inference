@@ -1,0 +1,169 @@
+---
+/* Scheduler loop: waiting → running → (preempted | swapped) with a finite KV
+   block pool. Preemption policy: evict the most recently admitted sequence. */
+---
+<div data-viz="scheduler-sim"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, segmented, stats, legend, narration, C, SERIES, rng } from '../../lib/viz';
+
+  type Mode = 'recompute' | 'swap';
+  type Status = 'future' | 'waiting' | 'running' | 'swapped' | 'done';
+  interface R { id: number; name: string; arr: number; prompt: number; out: number; gen: number; blocks: number; status: Status; admitT: number; preempted: number }
+  const GPU_BLOCKS = 24, CPU_BLOCKS = 24, BS = 4, MAX_SEQS = 6, WATERMARK = 1, N = 11;
+  const COLS = [0, 2, 3, 5, 7, 6, 4].map((i) => SERIES[i]);
+
+  function makeReqs(): R[] {
+    const r = rng(21);
+    let t = 0;
+    return Array.from({ length: N }, (_, i) => {
+      t += i === 0 ? 0 : Math.round(r() * 2);
+      return { id: i, name: String.fromCharCode(65 + i), arr: t, prompt: 4 + Math.round(r() * 10), out: 10 + Math.round(r() * 16), gen: 0, blocks: 0, status: 'future' as Status, admitT: -1, preempted: 0 };
+    });
+  }
+
+  mountAll('scheduler-sim', (root) => {
+    let mode: Mode = 'recompute';
+    let reqs = makeReqs();
+    let t = 0, freeGPU = GPU_BLOCKS, usedCPU = 0, preemptions = 0, wasted = 0, events: string[] = [];
+    let waitQ: R[] = [];
+
+    const bar = ctrlBar(root);
+    const W = 940, H = 400;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Scheduler queues and KV block pool with preemption' });
+    const g = s('g', {}, svg);
+    const say = narration(root);
+    const st = stats(root, ['Step', 'Running / waiting', 'Preemptions', 'Lost work']);
+    legend(root, [['KV blocks owned by a request', SERIES[0]], ['Free block', C.surface3], ['Preempted / swapped', C.waste]]);
+
+    const need = (q: R) => Math.ceil((q.prompt + q.gen) / BS);
+
+    function reset() { reqs = makeReqs(); t = 0; freeGPU = GPU_BLOCKS; usedCPU = 0; preemptions = 0; wasted = 0; events = []; waitQ = []; }
+
+    function preemptOne(): boolean {
+      const running = reqs.filter((q) => q.status === 'running').sort((a, b) => b.admitT - a.admitT);
+      const v = running[0];
+      if (!v) return false;
+      preemptions++; v.preempted++;
+      freeGPU += v.blocks;
+      if (mode === 'recompute') {
+        wasted += v.prompt + v.gen;
+        events.push(`<b>Out of blocks → preempt ${v.name}</b> (newest): its ${v.blocks} blocks are freed and its KV is <b>discarded</b>; it rejoins the front of the queue and will redo prefill on ${v.prompt + v.gen} tokens.`);
+        v.blocks = 0; v.status = 'waiting'; waitQ.unshift(v);
+      } else {
+        usedCPU += v.blocks;
+        events.push(`<b>Out of blocks → swap out ${v.name}</b>: its ${v.blocks} blocks are copied to CPU memory over PCIe; it resumes when GPU space frees up.`);
+        v.status = 'swapped';
+      }
+      return true;
+    }
+
+    function step() {
+      events = [];
+      // arrivals
+      reqs.forEach((q) => { if (q.status === 'future' && q.arr <= t) { q.status = 'waiting'; waitQ.push(q); } });
+      // 1) decode running (oldest first); grow KV
+      const running = reqs.filter((q) => q.status === 'running').sort((a, b) => a.admitT - b.admitT);
+      for (const q of running) {
+        if (q.status !== 'running' || q.admitT === t) continue;
+        if ((q.prompt + q.gen) % BS === 0) {
+          while (freeGPU === 0) { if (!preemptOne()) break; }
+          if (q.status !== 'running') continue; // we preempted ourselves
+          if (freeGPU === 0) continue;
+          freeGPU--; q.blocks++;
+        }
+        q.gen++;
+        if (q.gen >= q.out) { q.status = 'done'; freeGPU += q.blocks; q.blocks = 0; events.push(`${q.name} finished → blocks freed`); }
+      }
+      // 2) swap-in (priority over new admissions)
+      if (mode === 'swap') {
+        for (const q of reqs.filter((x) => x.status === 'swapped').sort((a, b) => a.admitT - b.admitT)) {
+          const running2 = reqs.filter((x) => x.status === 'running').length;
+          if (q.blocks + WATERMARK <= freeGPU && running2 < MAX_SEQS) {
+            freeGPU -= q.blocks; usedCPU -= q.blocks; q.status = 'running';
+            events.push(`${q.name} swapped back in`);
+          } else break;
+        }
+      }
+      // 3) admit from waiting queue (FIFO, stop at first that doesn't fit)
+      while (waitQ.length) {
+        const q = waitQ[0];
+        const runningN = reqs.filter((x) => x.status === 'running').length;
+        if (runningN >= MAX_SEQS) { events.push(`max_num_seqs = ${MAX_SEQS} reached`); break; }
+        if (mode === 'swap' && reqs.some((x) => x.status === 'swapped')) break;
+        const nb = need(q);
+        if (nb + WATERMARK > freeGPU) { events.push(`${q.name} waits: needs ${nb} blocks, ${freeGPU} free`); break; }
+        waitQ.shift(); freeGPU -= nb; q.blocks = nb; q.status = 'running'; q.admitT = t;
+        events.push(`admit ${q.name}: prefill ${q.prompt + q.gen} tokens → ${nb} blocks`);
+      }
+      t++;
+      return reqs.some((q) => q.status !== 'done');
+    }
+
+    function render() {
+      clear(g);
+      // GPU pool
+      text(g, 20, 14, `GPU KV block pool (${GPU_BLOCKS} blocks × ${BS} tokens)`, { class: 't-small t-bold t-dim' });
+      const owners: R[] = [];
+      reqs.filter((q) => q.status === 'running').sort((a, b) => a.admitT - b.admitT).forEach((q) => { for (let k = 0; k < q.blocks; k++) owners.push(q); });
+      for (let b = 0; b < GPU_BLOCKS; b++) {
+        const x = 20 + (b % 12) * 50, y = 26 + Math.floor(b / 12) * 36;
+        const o = owners[b];
+        rect(g, x, y, 44, 30, o ? COLS[o.id % COLS.length] : C.surface3, { rx: 5, opacity: o ? 0.9 : 0.6 });
+        if (o) text(g, x + 22, y + 15, o.name, { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+      }
+      // CPU pool / recompute note
+      text(g, 650, 14, mode === 'swap' ? `CPU swap space (${CPU_BLOCKS} blocks)` : 'Preempted KV (recompute mode)', { class: 't-small t-bold t-dim' });
+      if (mode === 'swap') {
+        const sw: R[] = [];
+        reqs.filter((q) => q.status === 'swapped').forEach((q) => { for (let k = 0; k < q.blocks; k++) sw.push(q); });
+        for (let b = 0; b < CPU_BLOCKS; b++) {
+          const x = 650 + (b % 8) * 34, y = 26 + Math.floor(b / 8) * 24;
+          const o = sw[b];
+          rect(g, x, y, 30, 20, o ? COLS[o.id % COLS.length] : 'transparent', { rx: 4, stroke: o ? 'none' : C.border, 'stroke-dasharray': o ? null : '2 3', opacity: o ? 0.75 : 1 });
+          if (o) text(g, x + 15, y + 10, o.name, { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+        }
+      } else {
+        rect(g, 650, 26, 270, 66, C.wasteSoft, { rx: 8, stroke: C.waste, 'stroke-dasharray': '4 3' });
+        text(g, 785, 50, 'discarded — recomputed later', { 'text-anchor': 'middle', class: 't-small t-bold', fill: C.waste });
+        text(g, 785, 70, `${wasted} tokens of prefill redone so far`, { 'text-anchor': 'middle', class: 't-small t-mono', fill: C.waste });
+      }
+
+      // queues
+      const QY = 126;
+      const cols = [
+        { x: 20, w: 250, title: 'Waiting (FIFO)' },
+        { x: 290, w: 400, title: `Running (max_num_seqs = ${MAX_SEQS})` },
+        { x: 710, w: 210, title: mode === 'swap' ? 'Swapped out' : 'Done' },
+      ];
+      cols.forEach((c) => { rect(g, c.x, QY, c.w, H - QY - 10, C.surface2, { rx: 10, stroke: C.border }); text(g, c.x + 12, QY + 16, c.title, { class: 't-small t-bold' }); });
+      const chip = (q: R, x: number, y: number, dashed = false) => {
+        const col = COLS[q.id % COLS.length];
+        rect(g, x, y, 34, 24, dashed ? 'transparent' : col, { rx: 6, stroke: col, 'stroke-dasharray': dashed ? '3 2' : null, 'stroke-width': 1.5 });
+        text(g, x + 17, y + 12, q.name, { 'text-anchor': 'middle', class: 't-small t-bold', fill: dashed ? col : 'var(--bg)' });
+        if (q.preempted) s('circle', { cx: x + 32, cy: y + 2, r: 5, fill: C.waste }, g);
+      };
+      waitQ.forEach((q, i) => chip(q, 32 + (i % 5) * 46, QY + 30 + Math.floor(i / 5) * 32, true));
+      const running = reqs.filter((q) => q.status === 'running').sort((a, b) => a.admitT - b.admitT);
+      running.forEach((q, i) => {
+        const y = QY + 30 + i * 36;
+        chip(q, 302, y);
+        const bw = 214;
+        rect(g, 346, y + 7, bw, 10, C.surface3, { rx: 5 });
+        rect(g, 346, y + 7, (bw * q.gen) / q.out, 10, COLS[q.id % COLS.length], { rx: 5 });
+        text(g, 570, y + 12, `${q.gen}/${q.out} tok · ${q.blocks} blk`, { class: 't-small t-mono t-dim' });
+      });
+      const right = mode === 'swap' ? reqs.filter((q) => q.status === 'swapped') : reqs.filter((q) => q.status === 'done');
+      right.forEach((q, i) => chip(q, 722 + (i % 4) * 46, QY + 30 + Math.floor(i / 4) * 32, mode === 'swap'));
+
+      st.set('Step', String(t));
+      st.set('Running / waiting', `${running.length} / ${waitQ.length}`, `${freeGPU} free blocks`);
+      st.set('Preemptions', String(preemptions), 'red dot = was preempted', preemptions ? C.waste : undefined);
+      st.set('Lost work', mode === 'recompute' ? `${wasted} tok` : `${usedCPU} blk on CPU`, mode === 'recompute' ? 'prefill to redo' : 'PCIe copies each way', wasted || usedCPU ? C.waste : undefined);
+      say(t === 0 ? `Press <b>Play</b>. ${N} requests arrive over time and grow by one token per step; every ${BS} tokens a sequence needs a new KV block. With only ${GPU_BLOCKS} blocks, something has to give.` : events.length ? events.join(' · ') : 'All running sequences decode one token.');
+    }
+
+    const pp = player(bar, root, { step, reset, render, interval: 900, autoplay: true });
+    segmented(bar, [{ value: 'recompute', label: 'Preempt: recompute' }, { value: 'swap', label: 'Preempt: swap to CPU' }], mode, (v) => { mode = v as Mode; pp.reset(); });
+  });
+</script>

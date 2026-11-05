@@ -1,0 +1,92 @@
+---
+/* Anatomy of a cold start for a new inference pod, with toggles for each optimisation
+   and the three Kubernetes probes lighting up at the right moments. */
+---
+<div data-viz="cold-start"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, player, checkbox, stats, narration, C } from '../../lib/viz';
+
+  interface Phase { key: string; name: string; slow: number; fast: number; opt: string; color: string; what: string; }
+  const PHASES: Phase[] = [
+    { key: 'node', name: 'GPU node provisioning', slow: 240, fast: 0, opt: 'Warm node pool / reserved capacity', color: C.mem, what: 'The cluster autoscaler asks the cloud for a GPU VM, which then boots and joins the cluster with its drivers and device plugin.' },
+    { key: 'image', name: 'Image pull (~10 GB)', slow: 110, fast: 4, opt: 'Pre-pulled / cached image', color: C.comm, what: 'CUDA, PyTorch and the engine make serving images huge. Pulling them over the network is slow.' },
+    { key: 'weights', name: 'Weight download', slow: 95, fast: 12, opt: 'Weights staged on local NVMe / shared cache', color: C.weight, what: 'Fetching the model files (e.g. 16 GB of safetensors for an 8B model in BF16) from object storage or a model hub.' },
+    { key: 'load', name: 'Load into GPU memory', slow: 30, fast: 14, opt: 'Fast parallel loader (mmap safetensors)', color: C.prefill, what: 'Copying tensors from disk into HBM, sharded across GPUs when using TP.' },
+    { key: 'warm', name: 'Warm-up: profile, compile, CUDA graphs', slow: 75, fast: 20, opt: 'Persisted compile cache', color: C.compute, what: 'The engine profiles memory to size the KV cache, JIT-compiles kernels and captures CUDA graphs for common batch sizes.' },
+    { key: 'probe', name: 'First request + readiness', slow: 6, fast: 6, opt: '', color: C.kv, what: 'A warm-up request succeeds and the readiness probe flips. Only now should the load balancer send traffic.' },
+  ];
+
+  const W = 940, H = 236, X0 = 20, X1 = 920;
+
+  mountAll('cold-start', (root) => {
+    const on: Record<string, boolean> = { node: false, image: false, weights: false, load: false, warm: false, probe: false };
+    let t = 0;
+    const bar = ctrlBar(root);
+    const opts = ctrlBar(root);
+    PHASES.filter((p) => p.opt).forEach((p) => checkbox(opts, p.opt, false, (v) => { on[p.key] = v; t = 0; render(); }));
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Cold start timeline broken into phases with Kubernetes probe states' });
+    const say = narration(root);
+    const st = stats(root, ['Cold start (this config)', 'Unoptimised', 'Pod phase']);
+
+    const durs = () => PHASES.map((p) => (on[p.key] ? p.fast : p.slow));
+    const total = () => durs().reduce((a, b) => a + b, 0);
+    const SLOW = PHASES.reduce((a, p) => a + p.slow, 0);
+
+    function reset() { t = 0; }
+    function step() { t = Math.min(total(), t + Math.max(4, total() / 70)); return t < total(); }
+
+    function render() {
+      clear(svg);
+      const d = durs(), T = total();
+      const scale = (X1 - X0) / SLOW; // fixed scale so optimisations visibly shrink the bar
+      text(svg, X0, 14, 'Unoptimised', { class: 't-small t-faint' });
+      // reference (unoptimised) thin bar
+      let x = X0;
+      PHASES.forEach((p) => { rect(svg, x, 24, p.slow * scale, 8, p.color, { rx: 0, opacity: 0.35 }); x += p.slow * scale; });
+      text(svg, X1, 14, `${Math.round(SLOW / 60 * 10) / 10} min`, { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+
+      // this config, animated fill
+      text(svg, X0, 54, 'This configuration', { class: 't-small t-bold' });
+      x = X0; let acc = 0; let cur = PHASES.length - 1;
+      PHASES.forEach((p, i) => {
+        const w = d[i] * scale;
+        rect(svg, x, 64, Math.max(w, 0), 40, C.surface2, { rx: 0, stroke: C.border });
+        const filled = Math.max(0, Math.min(d[i], t - acc));
+        if (filled > 0) rect(svg, x, 64, filled * scale, 40, p.color, { rx: 0, opacity: 0.9 });
+        if (t >= acc && t < acc + d[i]) cur = i;
+        if (w > 64) text(svg, x + 6, 84, p.name.split(':')[0].split('(')[0].trim(), { class: 't-small t-bold', fill: filled > 30 ? 'var(--bg)' : C.text });
+        if (w > 30) text(svg, x + 6, 116, `${d[i]}s`, { class: 't-small t-mono t-faint' });
+        acc += d[i]; x += w;
+      });
+      line(svg, X0 + t * scale, 58, X0 + t * scale, 110, C.accent, { 'stroke-width': 1.5 });
+
+      // probes
+      const loaded = t >= d.slice(0, 4).reduce((a, b) => a + b, 0);
+      const running = t >= d.slice(0, 2).reduce((a, b) => a + b, 0);
+      const ready = t >= T;
+      const probes: [string, boolean, string][] = [
+        ['startupProbe', loaded && t > 0, 'generous budget: covers download + load'],
+        ['livenessProbe', running && t > 0, 'lenient: never kill a busy engine'],
+        ['readinessProbe', ready, 'passes only after warm-up; fails while draining'],
+      ];
+      probes.forEach(([name, ok, hint], i) => {
+        const px = X0 + i * 300, py = 150;
+        rect(svg, px, py, 288, 50, C.surface2, { rx: 10, stroke: ok ? C.good : C.border });
+        s('circle', { cx: px + 18, cy: py + 18, r: 6, fill: ok ? C.good : C.surface3, stroke: ok ? 'none' : C.borderStrong }, svg);
+        text(svg, px + 32, py + 18, name, { class: 't-mono t-bold t-small' });
+        text(svg, px + 280, py + 18, ok ? 'passing' : 'pending', { 'text-anchor': 'end', class: 't-small t-bold', fill: ok ? C.good : C.faint });
+        text(svg, px + 12, py + 38, hint, { class: 't-small t-dim' });
+      });
+      text(svg, X0, H - 8, ready ? '✓ Pod Ready: added to the InferencePool / Service endpoints' : 'Not ready: the gateway must not send traffic yet', { class: 't-small t-bold', fill: ready ? C.good : C.faint });
+
+      const phase = t === 0 ? 'Pending' : !running ? (on.node || t > d[0] ? 'ContainerCreating' : 'Pending (no node)') : ready ? 'Running · Ready' : 'Running · not ready';
+      st.set('Cold start (this config)', `${(T / 60).toFixed(1)} min`, `${T} s`, T < 120 ? C.good : undefined);
+      st.set('Unoptimised', `${(SLOW / 60).toFixed(1)} min`, `${SLOW} s`);
+      st.set('Pod phase', phase);
+      say(t === 0 ? 'Press <b>Play</b> to bring up a new replica, then tick the optimisations and replay. Every minute here is a minute of SLO violations during a traffic ramp.' : `<b>${PHASES[cur].name}.</b> ${PHASES[cur].what}`);
+    }
+
+    player(bar, root, { step, reset, render, interval: 70, autoplay: false });
+  });
+</script>

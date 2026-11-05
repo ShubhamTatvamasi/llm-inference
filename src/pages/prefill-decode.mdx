@@ -1,0 +1,114 @@
+---
+layout: ../layouts/Chapter.astro
+title: Prefill vs Decode
+description: Every request runs in two very different phases. Prefill chews through the prompt in one big compute-bound pass; decode then emits one token at a time, bound by memory bandwidth.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import PDTimeline from '../components/viz/PDTimeline.astro';
+import PDShapes from '../components/viz/PDShapes.astro';
+import PDEstimator from '../components/viz/PDEstimator.astro';
+
+When you send a prompt to an LLM, the server does two jobs that look similar on paper but behave completely differently on hardware:
+
+1. <span class="chip prefill">Prefill</span>: run the **entire prompt** through the model in one forward pass, fill the [KV cache](../kv-cache/), and produce the first output token.
+2. <span class="chip decode">Decode</span>: repeatedly feed the **last generated token** back in, one forward pass per token, until a stop token or the length limit.
+
+Almost every serving technique in this guide exists because these two phases want opposite things from the GPU.
+
+## Watch one request
+
+<Viz title="One wide pass, then many thin ones" label="Live">
+  <PDTimeline />
+  <Fragment slot="caption">
+    <p>The model is Llama 3.1 8B in BF16 on one H100. The time axis is to scale. Prefill is one long, wide pass; decode is a train of short passes, each producing one token. Compare the two utilisation meters across phases, then try a 128-token prompt: prefill becomes so short that it too is limited by reading the weights.</p>
+  </Fragment>
+</Viz>
+
+The user-facing latency metrics come straight from this picture:
+
+- **TTFT** (time to first token) ≈ queueing + **prefill** time. It grows with prompt length.
+- **ITL** (inter-token latency, also reported as TPOT, time per output token) ≈ the duration of **one decode step**. It sets how fast text streams.
+- **End-to-end latency** ≈ TTFT + (output tokens − 1) × ITL.
+
+These are covered in depth in [Latency Metrics & Goodput](../metrics/).
+
+## Same weights, different shapes
+
+In both phases, most of the work is the same operation: multiply activations by a weight matrix. The difference is **how many tokens share each weight read**. In prefill, the activation matrix has one row per prompt token. In decode, it has exactly **one** row per sequence.
+
+<Viz title="Tokens per pass decide the bottleneck" label="Explore">
+  <PDShapes />
+  <Fragment slot="caption">
+    <p>One 4096×4096 BF16 weight matrix (32 MiB) must be read from HBM no matter how many tokens use it. With N tokens the matmul does 2·N·4096² FLOPs, so FLOPs per byte ≈ N. An H100 needs roughly 295 FLOPs per byte to keep its tensor cores fed. One decode token gets about 1.</p>
+  </Fragment>
+</Viz>
+
+This ratio of FLOPs to bytes is the **arithmetic intensity**. It is the key to [the roofline model](../roofline/):
+
+$$
+\text{Arithmetic intensity} = \frac{2 N d^2}{2 d^2 + 4 N d} \;\approx\; N \quad (\text{when } N \ll d)
+$$
+
+| | Prefill | Decode |
+|---|---|---|
+| Tokens per forward pass | the whole prompt (hundreds to thousands) | 1 per sequence |
+| Bottleneck | <span class="chip compute">compute</span> (tensor-core FLOPs) | <span class="chip weight">memory bandwidth</span> (bytes from HBM) |
+| Cost grows with | prompt length (linearly; attention part quadratically) | output length × (weights + KV) bytes |
+| User-visible metric | TTFT | ITL / TPOT |
+| Batching helps? | Barely: already saturates the GPU | Enormously: shares every weight read |
+| KV cache | **writes** K/V for all prompt tokens | **reads** all of it, **appends** one entry |
+
+<Callout type="key">
+Prefill is **compute-bound**, so it is fast per token: thousands of prompt tokens per second. Decode is **memory-bound**, so it is slow per token, but cheap to batch. A good serving engine keeps the GPU busy with **many decodes at once** and slips prefills in without stalling them.
+</Callout>
+
+## Estimate your own request
+
+<Viz title="Where the time goes" label="Calculator">
+  <PDEstimator />
+  <Fragment slot="caption">
+    <p>A first-order model: prefill = max(FLOPs ÷ achieved compute, weight bytes ÷ achieved bandwidth), with the quadratic attention term included. ITL = max(bytes read per step ÷ bandwidth, FLOPs ÷ compute), where bytes per step = weights + KV of every sequence in the batch. It ignores queueing, scheduler and network overhead, so real numbers are higher.</p>
+  </Fragment>
+</Viz>
+
+Things to notice:
+
+- For **chat-style** requests (a few hundred prompt tokens, a few hundred output tokens), well over 90% of the time is spent **decoding**.
+- With a **32K-token prompt**, prefill, and therefore TTFT, becomes significant. The quadratic attention term starts to show.
+- Adding **others decoding alongside** barely changes ITL at first, because they share the same weight read. With long contexts, though, their KV-cache reads add up.
+
+## Why the split matters for serving
+
+The two phases interfere with each other once many users share a GPU:
+
+- A long **prefill** occupies the GPU for tens to hundreds of milliseconds. Every user who is decoding gets **no tokens** during that time, which shows up as a stall in their stream. [Chunked prefill](../chunked-prefill/) splits long prompts into slices to bound the stall.
+- **Decode** wants a large batch to amortise weight reads, so the engine keeps many sequences decoding at once. That is [continuous batching](../batching/).
+- At large scale, you can run the two phases on **different GPUs**, each tuned for its own bottleneck. That is [disaggregated prefill/decode](../disaggregation/).
+
+<Callout type="tip" title="Rule of thumb">
+Prefill cost ≈ **2 × params × prompt tokens** FLOPs. Decode cost ≈ **weight bytes ÷ bandwidth** per step, shared across the whole batch. If you remember these two lines, you can sanity-check almost any latency number.
+</Callout>
+
+<Interview>
+  <Q q="Why is prefill compute-bound and decode memory-bound?" level="core">
+    In prefill, each weight read from HBM is applied to **every** prompt token, so arithmetic intensity is about N, the prompt length: hundreds to thousands of FLOPs per byte, above the GPU's ridge point. In decode, each weight is applied to **one** token per sequence (intensity ≈ batch size), far below the ridge. The tensor cores spend most of their time waiting for bytes.
+  </Q>
+  <Q q="Which metric does each phase drive, and how would a user notice?" level="core">
+    Prefill drives **TTFT**: how long before anything appears. Decode drives **ITL/TPOT**: how fast the text streams once it starts. A long document upload hurts TTFT. A large model or slow GPU hurts ITL.
+  </Q>
+  <Q q="Estimate TTFT for a 4,000-token prompt on an 8B model running on one H100." level="mid">
+    FLOPs ≈ 2 × 8×10⁹ × 4,000 = 6.4×10¹³, plus a small attention term. At about 55% of 989 TFLOPS (≈545 TFLOPS) that is roughly **120 ms**, before any queueing. A quick check: the weight read alone (16 GB ÷ 3.35 TB/s ≈ 5 ms) is much smaller, so prefill is compute-bound as expected.
+  </Q>
+  <Q q="Why does batching help decode throughput so much but barely helps prefill?" level="mid">
+    Decode is memory-bound: adding sequences reuses the same weight bytes, so you get more tokens for almost the same step time until you approach the compute limit. Prefill is already compute-bound. Batching two prefills together just takes about twice as long.
+  </Q>
+  <Q q="A user complains their stream 'freezes' for half a second at random. What is a likely cause?" level="senior">
+    Another user's long prompt is being **prefilled** on the same GPU. While that big pass runs, no decode steps happen for anyone else, so their ITL spikes. Fixes: **chunked prefill** with a smaller token budget, prioritising decodes in the scheduler, routing very long prompts to a separate pool, or **P/D disaggregation** at scale.
+  </Q>
+  <Q q="Does a short prompt (say 50 tokens) behave like prefill or like decode?" level="senior">
+    In practice, more like decode. With only 50 tokens per pass the arithmetic intensity is about 50 FLOPs/byte, still below the ridge, so the pass time is dominated by **reading the weights** (≈ one decode step). Prefill only becomes truly compute-bound once a pass has a few hundred tokens or more, which is why engines like to batch several small prefills together.
+  </Q>
+</Interview>

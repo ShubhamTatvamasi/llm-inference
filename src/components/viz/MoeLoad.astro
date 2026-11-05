@@ -1,0 +1,84 @@
+---
+/* Expert load balance: histogram of tokens per expert for one batch, with capacity line,
+   dropped (overflow) tokens, and the straggler effect for dropless execution. */
+---
+<div data-viz="moe-load"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, slider, select, stats, legend, narration, rng, C, fmt } from '../../lib/viz';
+
+  const W = 940, H = 260;
+
+  mountAll('moe-load', (root) => {
+    let T = 1024, E = 64, k = 4, cf = 1.25, skew = 0.6;
+    const b1 = ctrlBar(root);
+    select(b1, 'Experts', [8, 16, 64, 128, 256].map((n) => ({ value: String(n), label: String(n) })), String(E), (v) => { E = Number(v); render(); });
+    select(b1, 'top-k', [1, 2, 4, 8].map((n) => ({ value: String(n), label: String(n) })), String(k), (v) => { k = Number(v); render(); });
+    slider(b1, { label: 'Tokens in batch', min: 64, max: 8192, step: 64, value: T, format: (v) => fmt.int(v), onInput: (v) => { T = v; render(); } });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'Router imbalance', min: 0, max: 1.5, step: 0.05, value: skew, format: (v) => (v === 0 ? 'uniform' : v.toFixed(2)), onInput: (v) => { skew = v; render(); } });
+    slider(b2, { label: 'Capacity factor', min: 1, max: 2.5, step: 0.05, value: cf, format: (v) => v.toFixed(2) + '×', onInput: (v) => { cf = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Histogram of tokens per expert with capacity limit' });
+    const st = stats(root, ['Ideal per expert', 'Hottest expert', 'Dropped (capacity mode)', 'Efficiency (dropless)']);
+    legend(root, [['Tokens within capacity', C.compute], ['Overflow: dropped, or makes everyone wait', C.waste], ['Capacity = factor × ideal', C.text]]);
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      // popularity: Zipf-like with exponent = skew, randomly permuted so hot experts are scattered
+      const r = rng(7);
+      const perm = Array.from({ length: E }, (_, i) => i).sort(() => r() - 0.5);
+      const pop = perm.map((rank) => Math.pow(rank + 1, -skew));
+      const counts = new Array(E).fill(0);
+      const r2 = rng(11);
+      for (let t = 0; t < T; t++) {
+        // sample k distinct experts proportional to pop (with jitter per token)
+        const w = pop.map((p) => p * (0.5 + r2()));
+        let tot = 0; for (const x of w) tot += x;
+        for (let j = 0; j < k; j++) {
+          let u = r2() * tot; let pick = E - 1;
+          for (let e = 0; e < E; e++) { u -= w[e]; if (u <= 0 && w[e] > 0) { pick = e; break; } }
+          counts[pick]++; tot -= w[pick]; w[pick] = 0;
+        }
+      }
+      const ideal = (T * k) / E;
+      const cap = Math.ceil(cf * ideal);
+      const max = Math.max(...counts);
+      const dropped = counts.reduce((a, c) => a + Math.max(0, c - cap), 0);
+      const yMax = Math.max(max, cap) * 1.1;
+      const X0 = 50, X1 = W - 10, Y0 = 20, Y1 = H - 34;
+      const bw = (X1 - X0) / E;
+      const sy = (v: number) => Y1 - (v / yMax) * (Y1 - Y0);
+      // axes
+      s('line', { x1: X0, y1: Y1, x2: X1, y2: Y1, stroke: C.border }, svg);
+      [0, 0.5, 1].forEach((f) => {
+        const v = Math.round(yMax * f);
+        text(svg, X0 - 6, sy(v), String(v), { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      });
+      text(svg, X0, H - 12, `${E} experts (one bar each), ${fmt.int(T * k)} token→expert assignments`, { class: 't-small t-faint' });
+      for (let e = 0; e < E; e++) {
+        const c = counts[e];
+        const x = X0 + e * bw;
+        const inCap = Math.min(c, cap);
+        rect(svg, x + bw * 0.12, sy(inCap), bw * 0.76, Y1 - sy(inCap), C.compute, { rx: Math.min(3, bw / 4), opacity: 0.85 });
+        if (c > cap) rect(svg, x + bw * 0.12, sy(c), bw * 0.76, sy(cap) - sy(c), C.waste, { rx: Math.min(3, bw / 4) });
+      }
+      // ideal + capacity lines
+      s('line', { x1: X0, y1: sy(ideal), x2: X1, y2: sy(ideal), stroke: C.dim, 'stroke-dasharray': '2 4' }, svg);
+      text(svg, X1, sy(ideal) - 8, 'ideal', { 'text-anchor': 'end', class: 't-small t-dim' });
+      s('line', { x1: X0, y1: sy(cap), x2: X1, y2: sy(cap), stroke: C.text, 'stroke-width': 1.5, 'stroke-dasharray': '6 4' }, svg);
+      text(svg, X0 + 6, sy(cap) - 8, `capacity ${cap}`, { class: 't-small t-bold' });
+
+      const eff = ideal / max;
+      st.set('Ideal per expert', fmt.num(ideal, 1), 'T × k / E');
+      st.set('Hottest expert', fmt.int(max), `${(max / ideal).toFixed(2)}× ideal`, max / ideal > 2 ? C.waste : undefined);
+      st.set('Dropped (capacity mode)', `${((dropped / (T * k)) * 100).toFixed(1)}%`, `${fmt.int(dropped)} assignments`, dropped > 0 ? C.waste : C.good);
+      st.set('Efficiency (dropless)', `${(eff * 100).toFixed(0)}%`, 'avg load ÷ hottest load', eff < 0.5 ? C.waste : eff < 0.75 ? C.prefill : C.good);
+      say(skew < 0.15
+        ? 'A well-balanced router spreads tokens evenly, so every expert (and every GPU that hosts one) finishes at about the same time.'
+        : `The hottest expert gets <b>${(max / ideal).toFixed(1)}×</b> its fair share. With a capacity limit, the overflow is <b>dropped</b> (those tokens skip the expert). In <b>dropless</b> serving nothing is dropped, but every GPU waits for the busiest expert, so only <b>${(eff * 100).toFixed(0)}%</b> of the expert compute is doing useful work.`);
+    }
+    render();
+  });
+</script>

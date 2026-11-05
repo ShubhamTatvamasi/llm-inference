@@ -1,0 +1,106 @@
+---
+/* Streaming detokenization: byte-level tokens can end in the middle of a UTF-8 character. */
+---
+<div data-viz="tok-stream"></div>
+
+<script>
+  import { mountAll, h, ctrlBar, player, segmented, narration, C } from '../../lib/viz';
+  import { getBPE, encodeFull, symBytes, label } from './tok-bpe';
+
+  const TEXT = 'Hi 👋 the नमस्ते model';
+
+  function completePrefix(buf: number[]) {
+    let i = 0;
+    while (i < buf.length) {
+      const b = buf[i];
+      const len = b < 0x80 ? 1 : b >> 5 === 6 ? 2 : b >> 4 === 14 ? 3 : b >> 3 === 30 ? 4 : 1;
+      if (i + len > buf.length) break;
+      i += len;
+    }
+    return i;
+  }
+  const dec = new TextDecoder('utf-8');
+  const hex = (b: number) => b.toString(16).toUpperCase().padStart(2, '0');
+
+  mountAll('tok-stream', (root) => {
+    const toks = encodeFull(TEXT, getBPE(400));
+    let mode: 'inc' | 'naive' = 'inc';
+    let i = 0; let buf: number[] = []; let out = ''; let log: string[] = []; let held = false;
+
+    const bar = ctrlBar(root);
+    const rows = h('div', { class: 'tstr' }, root);
+    const row = (k: string, color: string) => {
+      const r = h('div', { class: 'tstr-row' }, rows);
+      const l = h('div', { class: 'tstr-k', text: k }, r); l.style.color = color;
+      return h('div', { class: 'tstr-v' }, r);
+    };
+    const rTok = row('1 · tokens from the model', C.token);
+    const rBuf = row('2 · pending byte buffer', C.prefill);
+    const rOut = row('3 · text sent to client', C.decode);
+    const rLog = row('SSE events', C.mem);
+    const say = narration(root);
+
+    function reset() { i = 0; buf = []; out = ''; log = []; held = false; }
+    function step() {
+      if (i >= toks.length) return false;
+      const bytes = symBytes(toks[i]); i++;
+      let delta = '';
+      if (mode === 'naive') { delta = dec.decode(new Uint8Array(bytes)); held = false; }
+      else {
+        buf.push(...bytes);
+        const n = completePrefix(buf);
+        delta = dec.decode(new Uint8Array(buf.slice(0, n)));
+        buf = buf.slice(n);
+        held = buf.length > 0;
+      }
+      out += delta;
+      if (delta) log.push(`data: {"delta": ${JSON.stringify(delta)}}`);
+      log = log.slice(-4);
+      return i < toks.length;
+    }
+    function render() {
+      rTok.innerHTML = '';
+      toks.forEach((t, j) => {
+        const c = h('span', { class: 'tstr-chip' + (j < i ? ' on' : '') + (j === i - 1 ? ' cur' : ''), text: label(t) }, rTok);
+        if (symBytes(t).some((b) => b >= 0x80) && label(t).startsWith('\\x')) c.classList.add('part');
+      });
+      rBuf.innerHTML = '';
+      if (mode === 'naive') h('span', { class: 'tstr-faint', text: 'none: each token is decoded on its own' }, rBuf);
+      else if (!buf.length) h('span', { class: 'tstr-faint', text: 'empty' }, rBuf);
+      else buf.forEach((b) => h('span', { class: 'tstr-byte', text: hex(b) }, rBuf));
+      rOut.innerHTML = '';
+      const o = h('span', { class: 'tstr-out' }, rOut);
+      for (const ch of out) { const s = h('span', { text: ch }, o); if (ch === '�') s.className = 'tstr-bad'; }
+      h('span', { class: 'tstr-caret' }, rOut);
+      rLog.innerHTML = log.length ? log.map((l) => `<div class="tstr-log">${l.replace(/</g, '&lt;')}</div>`).join('') : '<span class="tstr-faint">waiting…</span>';
+
+      const cur = i > 0 ? toks[i - 1] : '';
+      if (i === 0) say('Press <b>Play</b>. The model emits <b>token IDs</b>, one per decode step. Each token is a few <b>bytes</b>, and some characters span several tokens.');
+      else if (mode === 'naive' && out.includes('�')) say(`Token “${label(cur)}” is only <b>part</b> of a character. Decoding it alone produces <b style="color:var(--c-waste)">�</b> replacement characters on the user's screen.`);
+      else if (held) say(`Token “${label(cur)}” ends <b>mid-character</b>. The detokenizer <b>holds back</b> ${buf.length} byte${buf.length > 1 ? 's' : ''} until the character is complete.`);
+      else say(`Token “${label(cur)}” completes the text so far, so it is flushed to the client as an SSE event.`);
+    }
+
+    player(bar, root, { step, reset, render, interval: 750, autoplay: true });
+    segmented(bar, [{ value: 'inc', label: 'Incremental detokenizer' }, { value: 'naive', label: 'Naive per-token decode' }], 'inc', (v) => { mode = v as typeof mode; reset(); render(); });
+  });
+</script>
+
+<style is:global>
+  .tstr { display: grid; gap: 8px; }
+  .tstr-row { display: grid; grid-template-columns: 190px 1fr; gap: 12px; align-items: center; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: color-mix(in srgb, var(--surface-2) 55%, transparent); }
+  .tstr-k { font-size: 0.74rem; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em; }
+  .tstr-v { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; min-height: 28px; font-family: var(--font-mono); font-size: 0.82rem; min-width: 0; }
+  .tstr-chip { padding: 1px 6px; border-radius: 6px; border: 1px dashed var(--border-strong); color: var(--text-faint); white-space: pre; transition: all 0.25s; }
+  .tstr-chip.on { border-style: solid; border-color: var(--c-token); background: var(--c-token-soft); color: var(--text); }
+  .tstr-chip.on.part { border-color: var(--c-prefill); background: var(--c-prefill-soft); }
+  .tstr-chip.cur { box-shadow: 0 0 0 2px var(--c-kv); }
+  .tstr-byte { padding: 1px 6px; border-radius: 6px; background: var(--c-prefill-soft); color: var(--c-prefill); border: 1px solid var(--c-prefill); font-weight: 600; }
+  .tstr-out { font-family: var(--font-sans); font-size: 1.15rem; white-space: pre; }
+  .tstr-bad { color: var(--c-waste); background: var(--c-waste-soft); border-radius: 3px; }
+  .tstr-caret { display: inline-block; width: 2px; height: 1.2em; background: var(--c-decode); animation: tchat-blink 1s infinite; vertical-align: middle; }
+  .tstr-faint { color: var(--text-faint); font-family: var(--font-sans); font-size: 0.82rem; }
+  .tstr-log { width: 100%; color: var(--text-dim); font-size: 0.76rem; white-space: pre-wrap; word-break: break-all; }
+  @keyframes tchat-blink { 50% { opacity: 0.3; } }
+  @media (max-width: 640px) { .tstr-row { grid-template-columns: 1fr; gap: 6px; } }
+</style>

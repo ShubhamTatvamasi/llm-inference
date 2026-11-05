@@ -1,0 +1,111 @@
+---
+layout: ../layouts/Chapter.astro
+title: The Roofline
+description: One picture explains why decode is slow, why batching helps, why attention does not benefit from batching, and why every new GPU needs even bigger batches. It all comes down to arithmetic intensity.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import RooflinePlot from '../components/viz/RooflinePlot.astro';
+import RooflineRidges from '../components/viz/RooflineRidges.astro';
+
+Every GPU kernel is limited by one of two things: how fast the chip can **do math**, or how fast it can **move bytes** from memory to the math units. The **roofline model** puts both limits on one chart, so you can see at a glance which one applies to any operation.
+
+## Arithmetic intensity
+
+The only property of an operation you need is its **arithmetic intensity**: how much math it does per byte it reads or writes in HBM.
+
+$$
+I = \frac{\text{FLOPs performed}}{\text{bytes moved to/from HBM}} \quad [\text{FLOP/byte}]
+$$
+
+Given a GPU with peak compute $P$ (FLOP/s) and memory bandwidth $B$ (byte/s), the best throughput a kernel can reach is
+
+$$
+\text{attainable FLOP/s} = \min\big(P,\; B \times I\big)
+$$
+
+Plot that on log-log axes and you get the "roof": a **slanted** line on the left (the memory roof, slope $B$) that meets a **flat** line on the right (the compute roof, height $P$). The meeting point is the **ridge**, at $I^{\star} = P / B$.
+
+- Operations to the **left** of the ridge are <span class="chip weight">memory-bound</span>. Faster math would not help; fewer bytes would.
+- Operations to the **right** are <span class="chip compute">compute-bound</span>. Fewer bytes would not help; fewer or faster FLOPs would.
+
+## Where LLM operations land
+
+<Viz title="Roofline with live operating points" label="Live">
+  <RooflinePlot />
+  <Fragment slot="caption">
+    <p>The operating points use Llama 3.1 8B's shapes: hidden size 4096, 32 query heads sharing 8 KV heads. Press <b>Play</b> to sweep the decode batch from 1 to 1024 and watch the <span class="chip decode">decode matmul</span> point climb the memory roof until it hits the ridge. The <span class="chip kv">decode attention</span> point does not move: batching does not change its intensity.</p>
+  </Fragment>
+</Viz>
+
+### Deriving the three points
+
+**Decode matmul (batch $b$).** Multiplying $b$ token vectors by one $d \times d$ weight matrix costs $2 b d^2$ FLOPs. It must read the $d^2$ weights (2 bytes each in BF16) plus a tiny amount of activations:
+
+$$
+I_\text{decode} \approx \frac{2 b d^2}{2 d^2} = b \quad \text{(BF16)} \qquad\qquad I_\text{decode} \approx 2b \quad \text{(FP8)}
+$$
+
+So **intensity equals batch size**. On an H100 (ridge ≈ 295 in BF16), you need roughly **300 sequences decoding together** before the matmuls become compute-bound.
+
+**Prefill matmul.** The same formula with $b$ = the number of prompt tokens. A 2,048-token prompt sits far to the right of the ridge, so prefill is compute-bound even for a single request.
+
+**Decode attention.** Each new query reads that sequence's **own** K and V cache. Batching adds more sequences, but each one brings its own cache, so the bytes-per-FLOP ratio stays the same. With GQA, each K/V element is shared by $g$ query heads:
+
+$$
+I_\text{attn} \approx \frac{2g}{\text{bytes per element}} \quad\Rightarrow\quad g = 4 \text{ in BF16} \;\Rightarrow\; I \approx 4
+$$
+
+<Callout type="key" title="Why attention does not benefit from batching">
+Batching shares **weights**, which are the same for every sequence. It cannot share the **KV cache**, which is different for every sequence. Long-context decode therefore stays firmly memory-bound however large the batch. That is why GQA, MLA and KV-cache quantization matter so much: they shrink the bytes.
+</Callout>
+
+## The ridge keeps moving right
+
+Memory bandwidth improves with each GPU generation, but compute at the **newest precision** improves faster. Compare each chip running at its best format: A100 in BF16 has a ridge around **150**, H100 in FP8 about **590**, and B200 in FP4 about **1,100** FLOPs per byte. Lower precisions double or quadruple the FLOPs while only halving the bytes. So the batch needed to saturate the tensor cores keeps **growing**. Switch the precision below and watch the bars stretch.
+
+<Viz title="How much reuse each GPU demands" label="Explore">
+  <RooflineRidges />
+  <Fragment slot="caption">
+    <p>Each bar is a GPU's ridge point at the chosen precision. The vertical line is your decode matmul's intensity: ≈ 2 × batch ÷ bytes per weight. Bars turn <span class="chip compute">orange</span> when your batch is large enough to be compute-bound on that GPU.</p>
+  </Fragment>
+</Viz>
+
+## Moving an operation on the roofline
+
+There are only two ways to make a memory-bound kernel faster:
+
+| Move | How | Examples |
+|---|---|---|
+| **Right**: more FLOPs per byte | Reuse each byte for more work | larger [batches](../batching/), [speculative decoding](../speculative-decoding/) (verify several tokens per weight read), fusing kernels so intermediates never touch HBM ([kernels](../kernels/), [FlashAttention](../flash-attention/)) |
+| **Fewer bytes** (also moves right) | Shrink what must be read | [quantization](../quantization/) of weights / KV, GQA / MLA, [prefix caching](../prefix-caching/) |
+| **Up**: a higher roof | Faster hardware | more bandwidth (H200, B200), more GPUs ([tensor parallelism](../parallelism/) adds their bandwidth together) |
+
+For compute-bound work, such as prefill and very large batches, the levers are the opposite: lower-precision math (FP8, FP4 tensor cores), fewer FLOPs (sparsity, MoE), or more GPUs.
+
+<Callout type="tip" title="Speculative decoding, in roofline terms">
+Verifying *k* draft tokens in one pass multiplies the decode matmul's intensity by about *k* **without** adding sequences. It moves the point right on the roofline for free, which is exactly what a memory-bound workload needs. See [speculative decoding](../speculative-decoding/).
+</Callout>
+
+<Interview>
+  <Q q="Define arithmetic intensity and the ridge point." level="core">
+    Arithmetic intensity is **FLOPs ÷ bytes moved** (to and from main memory) for an operation. The ridge point is **peak FLOP/s ÷ peak bandwidth** for a device. If an operation's intensity is below the ridge, it is memory-bound; above it, compute-bound.
+  </Q>
+  <Q q="What is the arithmetic intensity of a decode matmul at batch 32 in BF16, and is it memory-bound on an H100?" level="core">
+    About 2·32·d² FLOPs ÷ 2·d² bytes ≈ **32 FLOP/byte**. The H100's BF16 ridge is about 989 ÷ 3.35 ≈ **295**, so it is memory-bound and the tensor cores are at most about 11% busy.
+  </Q>
+  <Q q="Why doesn't batching improve the arithmetic intensity of decode attention?" level="mid">
+    Weights are shared across sequences, but KV caches are not. Doubling the batch doubles the attention FLOPs **and** doubles the KV bytes read, so the ratio stays fixed at about 2·(query heads per KV head) ÷ bytes per element. Only shrinking KV (GQA, MLA, quantization) or reusing it (for example, shared prefixes in some kernels) moves it.
+  </Q>
+  <Q q="FP8 doubles both the FLOPs and the bytes saved. What happens to the ridge, and to decode?" level="mid">
+    FP8 tensor-core peak is about 2× BF16, so the **ridge doubles** (H100 ≈ 590 FLOP/B). But FP8 weights are half the bytes, so the decode matmul's intensity also doubles (≈ 2b). Decode still gets a large real speedup: it reads half as many bytes per step, and in the memory-bound regime bytes are what count.
+  </Q>
+  <Q q="Your kernel benchmark shows 40% of peak FLOPs on a decode workload. Is that good or bad?" level="senior">
+    It is suspiciously high for decode: either the batch is very large or the measurement is wrong. For decode you should be comparing **achieved bandwidth** against peak bandwidth (MBU). A well-tuned memory-bound kernel should hit 70–90% MBU; its FLOP utilisation follows from intensity and will naturally be low.
+  </Q>
+  <Q q="Why might a newer GPU with 2× the FLOPs give almost no speedup for your chatbot?" level="senior">
+    If the workload is decode-dominated at moderate batch size, it sits on the **memory roof**. Throughput scales with **bandwidth**, not FLOPs. If the new GPU has only modestly more bandwidth, per-token latency barely changes. You would need much larger batches (and enough KV memory to hold them) to reach the new, higher compute roof.
+  </Q>
+</Interview>

@@ -1,0 +1,110 @@
+---
+/* Adapter residency: a few GPU slots (max_loras), more CPU slots, everything else on disk.
+   Requests follow a skewed (Zipf) popularity; LRU decides who gets evicted. */
+---
+<div data-viz="lora-cache"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, player, slider, stats, legend, narration, C, SERIES, rng, s } from '../../lib/viz';
+
+  const N = 12;
+  const COST = { gpu: 0, cpu: 3, disk: 180 }; // ms added to the request (illustrative)
+  const W = 940, H = 300;
+
+  mountAll('lora-cache', (root) => {
+    let gpuSlots = 3, cpuSlots = 5, skew = 1.1;
+    let gpu: number[] = [], cpu: number[] = [];
+    let r = rng(5);
+    let last: { a: number; tier: 'gpu' | 'cpu' | 'disk'; evicted?: number } | null = null;
+    let counts = { gpu: 0, cpu: 0, disk: 0 }, addMs = 0, hist: ('gpu' | 'cpu' | 'disk')[] = [];
+
+    const bar = ctrlBar(root);
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'GPU slots (max_loras)', min: 1, max: 8, value: gpuSlots, onInput: (v) => { gpuSlots = v; reset(); render(); } });
+    slider(bar2, { label: 'CPU slots', min: 0, max: 11, value: cpuSlots, onInput: (v) => { cpuSlots = v; reset(); render(); } });
+    slider(bar2, { label: 'Popularity skew', min: 0, max: 2, step: 0.1, value: skew, format: (v) => v.toFixed(1), onInput: (v) => { skew = v; reset(); render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Adapter cache tiers: GPU, CPU and disk' });
+    const say = narration(root);
+    const st = stats(root, ['GPU hit rate', 'Loaded from CPU', 'Loaded from disk', 'Avg. added latency']);
+    legend(root, [['GPU hit: no extra cost', C.kv], ['CPU → GPU copy (~ms)', C.prefill], ['Disk → GPU load (~100s of ms)', C.waste]]);
+
+    const weights = () => { const w = Array.from({ length: N }, (_, i) => 1 / Math.pow(i + 1, skew)); const z = w.reduce((a, b) => a + b, 0); return w.map((x) => x / z); };
+
+    function reset() { gpu = []; cpu = []; r = rng(5); last = null; counts = { gpu: 0, cpu: 0, disk: 0 }; addMs = 0; hist = []; }
+    function touch(list: number[], a: number) { const i = list.indexOf(a); if (i >= 0) list.splice(i, 1); list.unshift(a); }
+    function step() {
+      const w = weights(); let u = r(), a = 0;
+      for (; a < N - 1; a++) { u -= w[a]; if (u < 0) break; }
+      let tier: 'gpu' | 'cpu' | 'disk';
+      let evicted: number | undefined;
+      if (gpu.includes(a)) { tier = 'gpu'; touch(gpu, a); }
+      else {
+        tier = cpu.includes(a) ? 'cpu' : 'disk';
+        if (tier === 'cpu') cpu.splice(cpu.indexOf(a), 1);
+        gpu.unshift(a);
+        if (gpu.length > gpuSlots) {
+          evicted = gpu.pop()!;
+          if (cpuSlots > 0) { cpu.unshift(evicted); if (cpu.length > cpuSlots) cpu.pop(); }
+        }
+      }
+      counts[tier]++; addMs += COST[tier]; hist.push(tier); if (hist.length > 60) hist.shift();
+      last = { a, tier, evicted };
+      return true;
+    }
+
+    function slotRow(y: number, label: string, sub: string, n: number, list: number[], fill: string) {
+      text(svg, 16, y + 14, label, { class: 't-bold' });
+      text(svg, 16, y + 32, sub, { class: 't-small t-faint' });
+      for (let i = 0; i < n; i++) {
+        const x = 180 + i * 62;
+        const a = list[i];
+        const isNew = last && a === last.a;
+        rect(svg, x, y, 54, 40, a === undefined ? 'transparent' : fill, { rx: 8, stroke: isNew ? C.text : a === undefined ? C.border : 'none', 'stroke-width': isNew ? 2 : 1, 'stroke-dasharray': a === undefined ? '3 3' : null });
+        if (a !== undefined) {
+          s('circle', { cx: x + 12, cy: y + 20, r: 5, fill: SERIES[a % SERIES.length] }, svg);
+          text(svg, x + 33, y + 20, `L${a}`, { 'text-anchor': 'middle', class: 't-mono t-bold' });
+        }
+      }
+      if (n === 0) text(svg, 180, y + 20, 'disabled', { class: 't-small t-faint' });
+    }
+
+    function render() {
+      clear(svg);
+      slotRow(14, 'GPU', 'max_loras · used in-batch', gpuSlots, gpu, C.kvSoft);
+      slotRow(74, 'CPU RAM', 'max_cpu_loras · staging', cpuSlots, cpu, C.prefillSoft);
+      // disk row: all adapters, tiny
+      text(svg, 16, 148, 'Disk / object store', { class: 't-bold' });
+      text(svg, 16, 166, 'all adapters', { class: 't-small t-faint' });
+      const w = weights();
+      for (let a = 0; a < N; a++) {
+        const x = 180 + a * 46;
+        const hh = Math.max(3, w[a] * 110);
+        rect(svg, x, 186 - hh, 36, hh, C.surface3, { rx: 3 });
+        s('circle', { cx: x + 18, cy: 196, r: 4, fill: SERIES[a % SERIES.length] }, svg);
+        text(svg, x + 18, 212, `L${a}`, { 'text-anchor': 'middle', class: 't-mono t-small', fill: last?.a === a ? C.text : C.dim });
+      }
+      text(svg, 180 + N * 46 + 6, 150, 'bar height =', { class: 't-small t-faint' });
+      text(svg, 180 + N * 46 + 6, 164, 'request share', { class: 't-small t-faint' });
+
+      // recent history strip
+      text(svg, 16, 252, 'Last 60', { class: 't-small t-bold t-dim' });
+      text(svg, 16, 268, 'requests', { class: 't-small t-faint' });
+      hist.forEach((t, i) => rect(svg, 180 + i * 12, 246, 10, 22, t === 'gpu' ? C.kv : t === 'cpu' ? C.prefill : C.waste, { rx: 2 }));
+
+      const tot = counts.gpu + counts.cpu + counts.disk || 1;
+      st.set('GPU hit rate', `${((counts.gpu / tot) * 100).toFixed(0)}%`, `${counts.gpu} of ${tot}`, C.kv);
+      st.set('Loaded from CPU', String(counts.cpu), `~${COST.cpu} ms each`, C.prefill);
+      st.set('Loaded from disk', String(counts.disk), `~${COST.disk} ms each`, C.waste);
+      st.set('Avg. added latency', `${(addMs / tot).toFixed(1)} ms`, 'to time-to-first-token');
+
+      if (!last) say('Press <b>Play</b>. Requests arrive for 12 adapters; a few are popular, most are rare (long tail).');
+      else {
+        const where = last.tier === 'gpu' ? '<b>already on the GPU</b>: no extra cost' : last.tier === 'cpu' ? 'found in <b>CPU RAM</b>, copied over PCIe in a few ms' : 'a <b>cold miss</b>: loaded from disk, adding hundreds of ms to TTFT';
+        say(`Request for <b>L${last.a}</b>: ${where}.${last.evicted !== undefined ? ` GPU full → least-recently-used <b>L${last.evicted}</b> ${cpuSlots ? 'moved to CPU' : 'dropped'}.` : ''}`);
+      }
+    }
+
+    player(bar, root, { step, reset, render, interval: 600, autoplay: true, speeds: [1, 2, 4, 8] });
+  });
+</script>

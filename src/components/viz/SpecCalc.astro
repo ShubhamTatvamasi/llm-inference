@@ -1,0 +1,85 @@
+---
+/* Expected tokens per target pass, and the speedup vs batch size under a simple roofline model:
+   verifying k+1 tokens is ~free while decode is memory-bound, but costs real compute once the batch is large. */
+---
+<div data-viz="spec-calc"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, slider, select, stats, legend, C, s } from '../../lib/viz';
+
+  // Llama 3.1 8B in BF16 on one H100: weights 16 GB, 3.35 TB/s, 989 TFLOPS @ ~60% achievable
+  const T_MEM = 16e9 / 3.35e12;          // s to stream the weights once
+  const T_TOK = (2 * 8e9) / (989e12 * 0.6); // s of compute per token
+  const tTarget = (B: number, n: number) => Math.max(T_MEM, B * n * T_TOK);
+  const E = (a: number, k: number) => (a >= 0.999 ? k + 1 : (1 - Math.pow(a, k + 1)) / (1 - a));
+  const W = 940, H = 300;
+  const METHODS = [
+    { value: '0.10', label: 'Draft model (~1B for an 8B target)' },
+    { value: '0.04', label: 'Draft heads (EAGLE / Medusa / MTP)' },
+    { value: '0.00', label: 'n-gram / prompt lookup (no model)' },
+  ];
+
+  mountAll('spec-calc', (root) => {
+    let alpha = 0.75, k = 4, c = 0.04, B = 8;
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Acceptance rate α', min: 0.3, max: 0.95, step: 0.01, value: alpha, format: (v) => v.toFixed(2), onInput: (v) => { alpha = v; render(); } });
+    slider(bar, { label: 'Draft length k', min: 1, max: 8, value: k, onInput: (v) => { k = v; render(); } });
+    const bar2 = ctrlBar(root);
+    select(bar2, 'Drafter', METHODS, '0.04', (v) => { c = Number(v); render(); });
+    const BS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+    slider(bar2, { label: 'Batch size', min: 0, max: BS.length - 1, value: 3, format: (i) => String(BS[i]), onInput: (i) => { B = BS[i]; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Speedup of speculative decoding versus batch size' });
+    const st = stats(root, ['Expected tokens / target pass', 'Speedup at this batch', 'Best k at this batch', 'Verify pass cost']);
+    legend(root, [['Speedup vs plain decoding', C.kv], ['Break-even (1×)', C.dim], ['Region where speculation slows you down', C.waste]]);
+
+    const speed = (b: number, kk = k) => (E(alpha, kk) * tTarget(b, 1)) / (tTarget(b, kk + 1) + kk * c * tTarget(b, 1));
+
+    function render() {
+      clear(svg);
+      const X0 = 60, X1 = W - 30, Y0 = 20, Y1 = H - 46;
+      const lx = (b: number) => X0 + (Math.log2(b) / Math.log2(512)) * (X1 - X0);
+      const maxY = 5;
+      const ly = (v: number) => Y1 - (Math.min(v, maxY) / maxY) * (Y1 - Y0);
+      for (let v = 0; v <= maxY; v++) {
+        s('line', { x1: X0, x2: X1, y1: ly(v), y2: ly(v), stroke: C.border, 'stroke-dasharray': v === 1 ? '5 4' : null, 'stroke-width': v === 1 ? 1.5 : 1 }, svg);
+        text(svg, X0 - 10, ly(v), `${v}×`, { 'text-anchor': 'end', class: 't-faint t-small t-mono' });
+      }
+      for (const b of BS) text(svg, lx(b), Y1 + 16, String(b), { 'text-anchor': 'middle', class: 't-faint t-small t-mono' });
+      text(svg, (X0 + X1) / 2, Y1 + 36, 'concurrent sequences in the batch (log scale)', { 'text-anchor': 'middle', class: 't-dim t-small' });
+
+      // waste region
+      let pts = '', wastePts: [number, number][] = [];
+      for (let i = 0; i <= 200; i++) {
+        const b = Math.pow(2, (i / 200) * 9);
+        const v = speed(b);
+        pts += `${i ? 'L' : 'M'}${lx(b).toFixed(1)},${ly(v).toFixed(1)}`;
+        if (v < 1) wastePts.push([lx(b), ly(v)]);
+      }
+      if (wastePts.length > 1) {
+        const d = `M${wastePts[0][0]},${ly(1)} ` + wastePts.map(([x, y]) => `L${x},${y}`).join(' ') + ` L${wastePts[wastePts.length - 1][0]},${ly(1)} Z`;
+        s('path', { d, fill: C.wasteSoft, stroke: 'none' }, svg);
+      }
+      s('path', { d: pts, fill: 'none', stroke: C.kv, 'stroke-width': 2.5 }, svg);
+      // knee: where verifying k+1 tokens stops being free
+      const knee = T_MEM / ((k + 1) * T_TOK);
+      if (knee >= 1 && knee <= 512) {
+        s('line', { x1: lx(knee), x2: lx(knee), y1: Y0, y2: Y1, stroke: C.compute, 'stroke-dasharray': '3 4' }, svg);
+        text(svg, lx(knee) + 6, Y0 + 8, `verify pass turns compute-bound (B ≈ ${Math.round(knee)})`, { class: 't-small', fill: C.compute });
+      }
+      const v = speed(B);
+      s('circle', { cx: lx(B), cy: ly(v), r: 6, fill: v >= 1 ? C.kv : C.waste, stroke: 'var(--bg)', 'stroke-width': 2 }, svg);
+      rect(svg, lx(B) - 34, ly(v) - 32, 68, 20, C.surface3, { rx: 6 });
+      text(svg, lx(B), ly(v) - 22, `${v.toFixed(2)}×`, { 'text-anchor': 'middle', class: 't-bold t-mono' });
+
+      let bestK = 1, bestV = 0;
+      for (let kk = 1; kk <= 8; kk++) { const sv = speed(B, kk); if (sv > bestV) { bestV = sv; bestK = kk; } }
+      const e = E(alpha, k);
+      st.set('Expected tokens / target pass', e.toFixed(2), `(1 − α^(k+1)) / (1 − α), max ${k + 1}`, C.kv);
+      st.set('Speedup at this batch', `${v.toFixed(2)}×`, v >= 1 ? 'faster than plain decode' : 'slower: wasted compute', v >= 1 ? C.good : C.waste);
+      st.set('Best k at this batch', String(bestK), bestV < 1 ? 'better: turn speculation off' : `→ ${bestV.toFixed(2)}×`);
+      st.set('Verify pass cost', `${(tTarget(B, k + 1) / tTarget(B, 1)).toFixed(2)}× a decode step`, `${B} × ${k + 1} = ${B * (k + 1)} tokens checked`);
+    }
+    render();
+  });
+</script>

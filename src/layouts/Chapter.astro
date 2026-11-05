@@ -1,0 +1,115 @@
+---
+import Base from './Base.astro';
+import Sidebar from '../components/Sidebar.astro';
+import { chapters, parts, chapterIndex } from '../data/chapters';
+import { chapterUrl } from '../lib/url';
+
+interface Props {
+  frontmatter?: { title?: string; description?: string };
+  headings?: { depth: number; slug: string; text: string }[];
+}
+const { frontmatter = {}, headings = [] } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const slug = Astro.url.pathname.replace(base, '').replace(/^\/|\/$/g, '');
+const idx = chapterIndex(slug);
+const ch = chapters[idx];
+if (!ch) throw new Error(`Chapter "${slug}" is not registered in src/data/chapters.ts`);
+const part = parts.find((p) => p.id === ch.part)!;
+const prev = chapters[idx - 1];
+const next = chapters[idx + 1];
+const num = String(idx + 1).padStart(2, '0');
+const toc = headings.filter((h) => h.depth === 2);
+---
+<Base title={frontmatter.title ?? ch.title} description={frontmatter.description ?? ch.blurb}>
+  <div class="shell">
+    <Sidebar current={slug} />
+    <main class="main" data-chapter={slug}>
+      <article class="prose">
+        <header class="ch-head">
+          <div class="ch-meta">
+            <span class="ch-part">Part {part.num} · {part.title}</span>
+            <span class="ch-num">Chapter {num} / {chapters.length}</span>
+          </div>
+          <h1>{ch.title}</h1>
+          <p class="ch-lede">{frontmatter.description ?? ch.blurb}</p>
+        </header>
+        <slot />
+      </article>
+
+      <nav class="pager" aria-label="Chapter navigation">
+        {prev ? (
+          <a class="pg prev" href={chapterUrl(prev.slug)}><span class="pg-k">← Previous</span><span class="pg-t">{prev.title}</span></a>
+        ) : <span />}
+        {next ? (
+          <a class="pg next" href={chapterUrl(next.slug)}><span class="pg-k">Next →</span><span class="pg-t">{next.title}</span></a>
+        ) : <span />}
+      </nav>
+      <footer class="foot">Token by Token · LLM inference &amp; serving, visualized</footer>
+    </main>
+    {toc.length > 2 && (
+      <aside class="toc" aria-label="On this page">
+        <div class="toc-h">On this page</div>
+        <ul>{toc.map((h) => <li><a href={`#${h.slug}`} data-toc={h.slug}>{h.text}</a></li>)}</ul>
+      </aside>
+    )}
+  </div>
+  <script>
+    // mark visited + highlight current heading in TOC
+    const main = document.querySelector<HTMLElement>('[data-chapter]');
+    if (main) {
+      try {
+        const k = 'tbt-visited';
+        const set = new Set<string>(JSON.parse(localStorage.getItem(k) || '[]'));
+        set.add(main.dataset.chapter!);
+        localStorage.setItem(k, JSON.stringify([...set]));
+      } catch {}
+    }
+    const links = new Map<string, HTMLElement>();
+    document.querySelectorAll<HTMLElement>('[data-toc]').forEach((a) => links.set(a.dataset.toc!, a));
+    if (links.size) {
+      const hs = [...document.querySelectorAll<HTMLElement>('.prose h2[id]')];
+      const io = new IntersectionObserver(() => {
+        let cur = hs[0]?.id;
+        for (const h of hs) if (h.getBoundingClientRect().top < 140) cur = h.id;
+        links.forEach((a, id) => a.classList.toggle('on', id === cur));
+      }, { rootMargin: '0px 0px -60% 0px' });
+      hs.forEach((h) => io.observe(h));
+      addEventListener('scroll', () => {
+        let cur = hs[0]?.id;
+        for (const h of hs) if (h.getBoundingClientRect().top < 140) cur = h.id;
+        links.forEach((a, id) => a.classList.toggle('on', id === cur));
+      }, { passive: true });
+    }
+  </script>
+  <style>
+    .shell { display: grid; grid-template-columns: var(--sidebar-w) minmax(0, 1fr); max-width: 1600px; margin: 0 auto; }
+    .main { padding: 36px 48px 80px; min-width: 0; }
+    .ch-head { margin: 8px 0 2.2rem; padding-bottom: 1.6rem; border-bottom: 1px solid var(--border); }
+    .ch-meta { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; font-size: 0.78rem; }
+    .ch-part { color: var(--accent); font-weight: 600; padding: 3px 10px; border-radius: 999px; background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); }
+    .ch-num { color: var(--text-faint); font-family: var(--font-mono); font-size: 0.72rem; }
+    .ch-lede { font-size: 1.16rem; color: var(--text-dim) !important; line-height: 1.6; margin: 0 !important; max-width: 640px; }
+    .pager { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; max-width: var(--prose-w); margin: 3.5rem 0 0; }
+    .pg { display: flex; flex-direction: column; gap: 4px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); transition: border-color 0.2s, transform 0.2s; }
+    .pg:hover { border-color: var(--accent); transform: translateY(-2px); background-size: 0 0; }
+    .pg.next { text-align: right; }
+    .pg-k { font-size: 0.78rem; color: var(--text-faint); }
+    .pg-t { font-weight: 620; }
+    .foot { max-width: var(--prose-w); margin-top: 3rem; padding-top: 1.4rem; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 0.82rem; }
+    .toc { display: none; }
+    @media (min-width: 1700px) {
+      .shell { grid-template-columns: var(--sidebar-w) minmax(0, 1fr) 220px; max-width: 1840px; }
+      .toc { display: block; position: sticky; top: calc(var(--header-h) + 36px); align-self: start; padding: 8px 20px 0 0; max-height: calc(100vh - 120px); overflow-y: auto; }
+      .toc-h { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-faint); font-weight: 650; margin-bottom: 10px; }
+      .toc ul { list-style: none; margin: 0; padding: 0; border-left: 1px solid var(--border); }
+      .toc a { display: block; padding: 4px 0 4px 14px; margin-left: -1px; font-size: 0.82rem; color: var(--text-dim); border-left: 1px solid transparent; background: none; line-height: 1.4; }
+      .toc a:hover { color: var(--text); }
+      .toc a.on { color: var(--accent); border-left-color: var(--accent); }
+    }
+    @media (max-width: 960px) {
+      .shell { grid-template-columns: minmax(0, 1fr); }
+      .main { padding: 24px 18px 60px; }
+    }
+    @media (max-width: 560px) { .pager { grid-template-columns: 1fr; } }
+  </style>
+</Base>

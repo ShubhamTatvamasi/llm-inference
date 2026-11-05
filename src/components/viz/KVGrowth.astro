@@ -1,0 +1,120 @@
+---
+/* KV cache growth: prefill writes K/V for every prompt token in all layers at once;
+   each decode step appends exactly one column. Toggle "no cache" to see the O(n²) recompute. */
+---
+<div data-viz="kv-growth"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, segmented, stats, legend, narration, C, fmt } from '../../lib/viz';
+
+  const PROMPT = ['The', 'quick', 'brown', 'fox', 'jumps', 'over'];
+  const GEN = ['the', 'lazy', 'dog', '.', 'It', 'was', 'not', 'amused'];
+  const LAYERS = 4;
+  const W = 940, H = 390;
+  const X0 = 92, CW = 58, TOK_Y = 26, GRID_Y = 124, ROW_H = 30, KV_H = 11;
+
+  mountAll('kv-growth', (root) => {
+    const bar = ctrlBar(root);
+    let mode: 'cache' | 'nocache' = 'cache';
+    let step = 0; // 0 = idle, 1 = prefill done, 1+k = k tokens decoded
+    let work = 0; // K/V vectors computed (per layer)
+    let lastWork = 0;
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'KV cache filling up layer by layer as tokens are generated' });
+    const say = narration(root);
+    const st = stats(root, ['Tokens in context', 'K/V vectors computed', 'Work this step', 'Cache size (Llama 3.1 8B, BF16)']);
+    legend(root, [['Prompt K/V (written in prefill)', C.prefill], ['Generated K/V (appended in decode)', C.decode], ['Written this step', C.kv], ['Recomputed this step (no cache)', C.waste]]);
+
+    const total = () => (step === 0 ? 0 : PROMPT.length + (step - 1));
+
+    function reset() { step = 0; work = 0; lastWork = 0; }
+    function stepFn() {
+      const maxSteps = 1 + GEN.length;
+      if (step >= maxSteps) return false;
+      step++;
+      if (step === 1) lastWork = PROMPT.length; // prefill computes all prompt K/V once (both modes)
+      else lastWork = mode === 'cache' ? 1 : total(); // decode: 1 new vs recompute all
+      work += lastWork;
+      return step < maxSteps;
+    }
+
+    function render() {
+      clear(svg);
+      const n = total();
+      const isPrefill = step === 1;
+      const newest = n - 1;
+
+      // layer labels
+      for (let l = 0; l < LAYERS; l++) {
+        const y = GRID_Y + l * (ROW_H * 2 + 6);
+        text(svg, 8, y + ROW_H / 2 - 2, `Layer ${l === LAYERS - 1 ? 'L' : l + 1}`, { class: 't-dim t-small t-bold' });
+        text(svg, 62, y + 7, 'K', { class: 't-faint t-small t-mono' });
+        text(svg, 62, y + 7 + KV_H + 4, 'V', { class: 't-faint t-small t-mono' });
+        if (l === LAYERS - 2) text(svg, 8, y + ROW_H + 16, '⋮', { class: 't-faint' });
+      }
+
+      const all = [...PROMPT, ...GEN];
+      for (let j = 0; j < all.length; j++) {
+        const x = X0 + j * CW;
+        const isPrompt = j < PROMPT.length;
+        const present = j < n;
+        const isNew = present && (isPrefill ? isPrompt : j === newest && step > 1);
+        // token chip
+        const chipFill = !present ? 'transparent' : isPrompt ? C.prefillSoft : C.decodeSoft;
+        const chipStroke = !present ? C.border : isPrompt ? C.prefill : C.decode;
+        rect(svg, x + 2, TOK_Y - 14, CW - 6, 28, chipFill, { stroke: chipStroke, 'stroke-dasharray': present ? null : '3 3', rx: 7 });
+        text(svg, x + CW / 2 - 1, TOK_Y, all[j], { 'text-anchor': 'middle', class: present ? 't-bold' : 't-faint', 'font-size': 11.5 });
+        text(svg, x + CW / 2 - 1, TOK_Y + 24, `t${j}`, { 'text-anchor': 'middle', class: 't-faint t-mono t-small' });
+
+        for (let l = 0; l < LAYERS; l++) {
+          const y = GRID_Y + l * (ROW_H * 2 + 6);
+          for (let kvI = 0; kvI < 2; kvI++) {
+            const yy = y + kvI * (KV_H + 4);
+            let fill: string = 'transparent', stroke: string = C.border, op = 1;
+            if (present) {
+              fill = isPrompt ? C.prefill : C.decode; stroke = 'none'; op = 0.75;
+              if (isNew) { fill = C.kv; op = 1; }
+              else if (mode === 'nocache' && step > 1 && j < newest) { fill = C.waste; op = 0.85; }
+            }
+            rect(svg, x + 4, yy, CW - 10, KV_H, fill, { stroke, opacity: op, rx: 3, 'stroke-dasharray': present ? null : '2 3' });
+          }
+        }
+      }
+
+      // attention fan from the newest query to all cached keys
+      if (step > 1) {
+        const qx = X0 + newest * CW + CW / 2 - 1;
+        for (let j = 0; j < n; j++) {
+          const kx = X0 + j * CW + CW / 2 - 1;
+          const y0 = GRID_Y - 10;
+          const mid = (qx + kx) / 2;
+          s('path', { d: `M${qx},${y0} Q${mid},${y0 - 26 - Math.abs(qx - kx) * 0.05} ${kx},${y0}`, fill: 'none', stroke: C.accent, 'stroke-width': 1.2, opacity: 0.55 }, svg);
+        }
+        text(svg, qx, GRID_Y + LAYERS * (ROW_H * 2 + 6) + 6, `▲ query of “${all[newest]}” attends to all ${n} keys`, { 'text-anchor': 'middle', class: 't-small t-dim' });
+      }
+
+      // footer bar: work counter visual
+      const fy = H - 18;
+      const maxWork = PROMPT.length + GEN.reduce((a, _, i) => a + PROMPT.length + i + 1, 0); // worst case (no cache)
+      text(svg, 8, fy, 'Total work', { class: 't-small t-dim t-bold' });
+      text(svg, W - 12, fy - 14, `${work} / ${maxWork} (no-cache worst case)`, { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      rect(svg, X0, fy - 5, W - X0 - 10, 10, C.surface3, { rx: 5 });
+      rect(svg, X0, fy - 5, (W - X0 - 10) * Math.min(1, work / maxWork), 10, mode === 'cache' ? C.kv : C.waste, { rx: 5 });
+
+      // stats + narration
+      const perTok = 2 * 32 * 8 * 128 * 2; // 128 KiB
+      st.set('Tokens in context', String(n));
+      st.set('K/V vectors computed', String(work), 'per layer, cumulative', mode === 'cache' ? C.kv : C.waste);
+      st.set('Work this step', step === 0 ? '–' : String(lastWork), step <= 1 ? 'prefill: all prompt tokens' : mode === 'cache' ? 'only the new token' : 'every token, again');
+      st.set('Cache size (Llama 3.1 8B, BF16)', fmt.bytes(perTok * n), `${fmt.bytes(perTok)} per token`);
+
+      if (step === 0) say('Press <b>Play</b>. First comes <b>prefill</b>: the whole prompt is processed in one forward pass.');
+      else if (isPrefill) say(`<b>Prefill:</b> one pass over all ${PROMPT.length} prompt tokens computes their K and V in <i>every</i> layer and writes them to the cache.`);
+      else if (mode === 'cache') say(`<b>Decode step ${step - 1}:</b> only “${all[newest]}” is new. Its K/V are computed once and <b>appended</b>; all older K/V are simply <b>read</b> from the cache.`);
+      else say(`<b>No cache, step ${step - 1}:</b> to produce one token we recompute K/V for all ${n} tokens. Total work grows like <b>n²</b>.`);
+    }
+
+    player(bar, root, { step: stepFn, reset, render, interval: 1100, autoplay: true });
+    segmented(bar, [{ value: 'cache', label: 'With KV cache' }, { value: 'nocache', label: 'No cache' }], 'cache', (v) => { mode = v as typeof mode; reset(); render(); });
+  });
+</script>

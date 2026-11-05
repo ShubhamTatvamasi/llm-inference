@@ -1,0 +1,81 @@
+---
+/* Where the parameters live, and how many FLOPs and bytes one generated token costs. */
+---
+<div data-viz="tf-calc"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, select, slider, stats, legend, C, fmt } from '../../lib/viz';
+  import { MODELS, getModel, kvBytesPerToken } from '../../data/hardware';
+
+  const W = 940, H = 170;
+
+  mountAll('tf-calc', (root) => {
+    let model = getModel('llama3-8b');
+    let lg = 12; // log2 context
+    const bar = ctrlBar(root);
+    select(bar, 'Model', MODELS.filter((m) => m.attn !== 'MLA').map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    slider(bar, { label: 'Context so far', min: 8, max: 17, step: 0.5, value: lg, format: (v) => fmt.num(Math.round(2 ** v), 0), onInput: (v) => { lg = v; render(); } });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Parameter breakdown by component' });
+    legend(root, [['Embeddings', C.token], ['Attention projections', C.compute], ['MLP / experts (all)', C.weight], ['LM head', C.decode]]);
+    const st = stats(root, ['Total params (computed)', 'Active per token', 'FLOPs / generated token', 'Bytes read / step (batch 1)', 'FLOPs per byte']);
+
+    function render() {
+      clear(svg);
+      const m = model;
+      const L = m.layers, d = m.hidden, hd = m.headDim;
+      const emb = m.vocab * d;
+      const head = m.vocab * d; // untied for all listed models
+      const attn = L * (d * (m.heads + 2 * m.kvHeads) * hd + m.heads * hd * d);
+      const ex = m.experts?.total ?? 1, ea = m.experts?.active ?? 1;
+      const mlpAll = L * 3 * d * m.ffn * ex;
+      const mlpAct = L * 3 * d * m.ffn * ea;
+      const total = emb + head + attn + mlpAll;
+      const active = emb + head + attn + mlpAct;
+      const n = Math.round(2 ** lg);
+
+      const parts = [
+        { k: 'Embeddings', v: emb, c: C.token },
+        { k: 'Attention', v: attn, c: C.compute },
+        { k: m.experts ? `MLP (${ex} experts)` : 'MLP', v: mlpAll, c: C.weight },
+        { k: 'LM head', v: head, c: C.decode },
+      ];
+      const X = 20, BW = W - 40;
+      text(svg, X, 18, `${m.name}: where the ${fmt.num(total, 1)} parameters live`, { class: 't-bold' });
+      let x = X;
+      parts.forEach((p) => {
+        const w = (p.v / total) * BW;
+        rect(svg, x, 34, Math.max(1, w - 2), 46, p.c, { rx: 6 });
+        if (w > 90) {
+          text(svg, x + 10, 50, p.k, { class: 't-small t-bold', style: 'fill:var(--bg)' });
+          text(svg, x + 10, 67, `${fmt.num(p.v, 2)} · ${fmt.pct(p.v / total, 0)}`, { class: 't-small t-mono', style: 'fill:var(--bg)' });
+        }
+        x += w;
+      });
+      if (m.experts) {
+        const aw = (mlpAct / total) * BW;
+        const sx = X + ((emb + attn) / total) * BW;
+        rect(svg, sx, 88, Math.max(3, aw), 14, C.weight, { rx: 3 });
+        text(svg, sx + Math.max(3, aw) + 8, 95, `only ${ea} of ${ex} experts (${fmt.num(mlpAct, 1)}) run per token`, { class: 't-small t-bold', style: `fill:${C.weight}` });
+      }
+      // FLOPs per token split
+      const fW = 2 * (active - emb); // matmuls (embedding lookup is free)
+      const fA = 4 * L * n * m.heads * hd; // QKᵀ + PV for one query over n keys
+      const fy = 124;
+      text(svg, X, fy - 8, `FLOPs for one decode step at context ${fmt.num(n, 0)}`, { class: 't-small t-dim t-bold' });
+      const tot = fW + fA;
+      rect(svg, X, fy, (fW / tot) * BW - 2, 20, C.weightSoft, { rx: 4, stroke: C.weight });
+      rect(svg, X + (fW / tot) * BW, fy, Math.max(2, (fA / tot) * BW), 20, C.computeSoft, { rx: 4, stroke: C.compute });
+      text(svg, X + 8, fy + 10, `weights 2·N = ${fmt.num(fW, 1)}`, { class: 't-small t-mono' });
+      if ((fA / tot) * BW > 170) text(svg, X + (fW / tot) * BW + 8, fy + 10, `attention ${fmt.num(fA, 1)}`, { class: 't-small t-mono' });
+      else text(svg, X + BW, fy + 36, `attention ${fmt.num(fA, 1)} (${fmt.pct(fA / tot, 1)})`, { 'text-anchor': 'end', class: 't-small t-mono t-dim' });
+
+      const bytes = (active - (emb - d)) * 2 + kvBytesPerToken(m, 2) * n; // weights read (BF16) + KV read
+      st.set('Total params (computed)', fmt.num(total, 2), `config says ${fmt.num(m.params, 2)}`);
+      st.set('Active per token', fmt.num(active, 2), m.experts ? 'MoE: a small slice' : 'dense: all of it');
+      st.set('FLOPs / generated token', fmt.num(tot, 1), '≈ 2 × active params + attention', C.compute);
+      st.set('Bytes read / step (batch 1)', fmt.bytes(bytes), 'BF16 weights + this KV cache');
+      st.set('FLOPs per byte', (tot / bytes).toFixed(2), 'H100 needs ~300 to be compute-bound', C.waste);
+    }
+    render();
+  });
+</script>

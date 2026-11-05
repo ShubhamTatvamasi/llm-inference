@@ -1,0 +1,85 @@
+---
+/* Flash-Decoding: at decode time there is only one query per sequence, so
+   batch × kv_heads thread blocks may leave most SMs idle. Splitting the KV
+   sequence into chunks (split-K) fills the GPU; a cheap reduction merges results. */
+---
+<div data-viz="flash-split"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, select, slider, stats, C, SERIES, fmt } from '../../lib/viz';
+
+  const W = 940, H = 330, SMS = 132;
+  const KVS = [1024, 4096, 16384, 65536, 131072];
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+  const kfmt = (n: number) => (n >= 1024 ? `${n / 1024}K` : String(n));
+
+  mountAll('flash-split', (root) => {
+    let batch = 1, kvi = 3, kvHeads = 8, splits = 1;
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Batch', min: 1, max: 32, value: batch, onInput: (v) => { batch = v; render(); } });
+    slider(bar, { label: 'Context', min: 0, max: KVS.length - 1, value: kvi, format: (i) => kfmt(KVS[i]), onInput: (i) => { kvi = i; render(); } });
+    select(bar, 'KV heads', [1, 8, 32].map((h) => ({ value: String(h), label: String(h) })), String(kvHeads), (v) => { kvHeads = Number(v); render(); });
+    const bar2 = ctrlBar(root);
+    const sp = slider(bar2, { label: 'KV splits per sequence', min: 1, max: 64, value: splits, onInput: (v) => { splits = v; render(); } });
+    const autoBtn = document.createElement('button');
+    autoBtn.className = 'btn'; autoBtn.type = 'button'; autoBtn.textContent = 'Auto-pick splits';
+    autoBtn.addEventListener('click', () => { sp.set(best().k); });
+    bar2.appendChild(autoBtn);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'SM occupancy for decode attention with and without KV splitting' });
+    const st = stats(root, ['Thread blocks', 'SMs busy (first wave)', 'Relative time', 'Best split']);
+
+    const timeFor = (k: number) => {
+      const blocks = batch * kvHeads * k;
+      const waves = Math.ceil(blocks / SMS);
+      const chunk = KVS[kvi] / k;
+      return waves * chunk + (k > 1 ? 0.02 * KVS[kvi] / 16 + 64 * k : 0); // + reduction overhead
+    };
+    const best = () => { let bk = 1, bt = Infinity; for (let k = 1; k <= 64; k++) { const t = timeFor(k); if (t < bt) { bt = t; bk = k; } } return { k: bk, t: bt }; };
+
+    function render() {
+      clear(svg);
+      const kv = KVS[kvi];
+      const blocks = batch * kvHeads * splits;
+      const firstWave = Math.min(blocks, SMS);
+
+      // top: one sequence's KV split into chunks
+      text(svg, 10, 16, `One sequence's KV cache (${kfmt(kv)} tokens, per KV head) split into ${splits} chunk${splits > 1 ? 's' : ''}`, { class: 't-small t-bold' });
+      const KX = 10, KW = 600, KY = 28;
+      const shownSplits = Math.min(splits, 32);
+      for (let i = 0; i < shownSplits; i++) {
+        rect(svg, KX + (i * KW) / shownSplits + 1, KY, KW / shownSplits - 2, 22, SERIES[i % SERIES.length], { rx: 3, opacity: 0.85 });
+      }
+      if (splits > 32) text(svg, KX + KW + 8, KY + 11, `(+${splits - 32} more)`, { class: 't-small t-faint' });
+      // reduce box
+      if (splits > 1) {
+        for (let i = 0; i < shownSplits; i += Math.max(1, Math.floor(shownSplits / 6))) {
+          const x = KX + ((i + 0.5) * KW) / shownSplits;
+          s('path', { d: `M${x},${KY + 22} Q${x},${KY + 52} ${720},${KY + 44}`, fill: 'none', stroke: C.faint, 'stroke-width': 1 }, svg);
+        }
+        rect(svg, 720, KY + 26, 210, 36, C.decodeSoft, { rx: 8, stroke: C.decode });
+        text(svg, 825, KY + 44, 'reduce: merge (m, l, O) partials', { 'text-anchor': 'middle', class: 't-small t-bold', ...fillStyle(C.decode) });
+      } else {
+        text(svg, 720, KY + 11, '← one SM walks the whole cache', { class: 't-small t-dim' });
+      }
+
+      // SM grid
+      const GY = 104, cols = 22, cw = 38, ch = 26;
+      text(svg, 10, GY - 10, `${SMS} SMs (H100) — first wave of thread blocks`, { class: 't-small t-bold' });
+      for (let i = 0; i < SMS; i++) {
+        const x = 10 + (i % cols) * (cw + 4), y = GY + Math.floor(i / cols) * (ch + 4);
+        const busy = i < firstWave;
+        const seq = Math.floor(i / (kvHeads * splits)) % SERIES.length;
+        rect(svg, x, y, cw, ch, busy ? SERIES[seq] : C.surface3, { rx: 4, opacity: busy ? 0.9 : 1 });
+      }
+      const util = firstWave / SMS;
+      text(svg, 10, H - 10, util < 0.5 ? `Only ${firstWave} of ${SMS} SMs have work: the rest idle while a few SMs crawl through ${fmt.num(kv / splits, 0)} tokens each.` : `${firstWave} of ${SMS} SMs busy, each handling ≈${fmt.num(kv / splits, 1)} tokens.`, { class: 't-small t-bold', ...fillStyle(util < 0.5 ? C.waste : C.good) });
+
+      const b = best();
+      st.set('Thread blocks', fmt.int(blocks), `batch ${batch} × ${kvHeads} KV heads × ${splits} split${splits > 1 ? 's' : ''}`);
+      st.set('SMs busy (first wave)', fmt.pct(util), `${Math.ceil(blocks / SMS)} wave${Math.ceil(blocks / SMS) > 1 ? 's' : ''}`, util < 0.5 ? C.waste : C.good);
+      st.set('Relative time', `${(timeFor(splits) / timeFor(1)).toFixed(2)}×`, 'vs no split (lower is better)');
+      st.set('Best split', String(b.k), `${(timeFor(1) / b.t).toFixed(1)}× faster than no split`);
+    }
+    render();
+  });
+</script>

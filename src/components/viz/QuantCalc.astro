@@ -1,0 +1,87 @@
+---
+/* Compare quantization schemes for a model on a GPU: weight memory, batch-1 decode speed
+   (memory-bound) and prefill throughput (compute-bound), honouring native format support. */
+---
+<div data-viz="quant-calc"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, select, stats, legend, C, hatchDefs, uniq, fmt, s } from '../../lib/viz';
+  import { MODELS, GPUS, getModel, getGPU, type GPU } from '../../data/hardware';
+
+  type Scheme = { id: string; name: string; sub: string; wBytes: number; compute: (g: GPU) => number | null; computeNote: (g: GPU) => string };
+  const SCHEMES: Scheme[] = [
+    { id: 'bf16', name: 'BF16', sub: 'W16A16 · baseline', wBytes: 2, compute: (g) => g.bf16TF, computeNote: () => 'BF16 tensor cores' },
+    { id: 'fp8', name: 'FP8', sub: 'W8A8 · per-channel / block scales', wBytes: 1.0, compute: (g) => g.fp8TF ?? g.bf16TF, computeNote: (g) => (g.fp8TF ? 'native FP8 tensor cores' : 'no FP8 cores → weight-only, BF16 math') },
+    { id: 'int8', name: 'INT8', sub: 'W8A8 · SmoothQuant-style', wBytes: 1.0, compute: (g) => g.int8TOPS ?? g.bf16TF, computeNote: () => 'INT8 tensor cores' },
+    { id: 'w4a16', name: 'INT4', sub: 'W4A16 · GPTQ / AWQ, g=128', wBytes: 0.5 + 2 / 128, compute: (g) => g.bf16TF * 0.8, computeNote: () => 'dequant to BF16 in-kernel (~20% overhead at big batch)' },
+    { id: 'fp4', name: 'FP4', sub: 'W4A4 · NVFP4 / MXFP4 microscaling', wBytes: 0.5 + 1 / 16, compute: (g) => g.fp4TF, computeNote: (g) => (g.fp4TF ? 'native FP4 tensor cores' : 'not native on this GPU') },
+  ];
+  const W = 940, ROW = 54, H = 84 + SCHEMES.length * ROW;
+
+  mountAll('quant-calc', (root) => {
+    let model = getModel('llama3-70b');
+    let gpu = getGPU('h100');
+    const bar = ctrlBar(root);
+    select(bar, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(bar, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Memory, decode speed and prefill throughput per quantization scheme' });
+    const hid = uniq('qh');
+    const st = stats(root, ['BF16 weights', 'Smallest footprint', 'Batch-1 decode gain', 'Prefill gain']);
+    legend(root, [['Weight memory (lower is better)', C.weight], ['Batch-1 decode tok/s: memory-bound', C.decode], ['Prefill tok/s: compute-bound', C.prefill], ['No native support', C.waste]]);
+
+    function render() {
+      clear(svg);
+      const hatch = hatchDefs(svg, hid, C.waste);
+      const cols = [
+        { x: 200, w: 220, title: 'Weight memory', color: C.weight },
+        { x: 450, w: 220, title: 'Decode, batch 1 (tok/s)', color: C.decode },
+        { x: 700, w: 220, title: 'Prefill (tok/s, ~60% MFU)', color: C.prefill },
+      ];
+      cols.forEach((c) => text(svg, c.x, 22, c.title, { class: 't-small t-bold t-dim' }));
+      const rows = SCHEMES.map((sc) => {
+        const mem = model.params * sc.wBytes;
+        const decode = (gpu.bwTBs * 1e12) / (model.activeParams * sc.wBytes); // tokens/s if the weights fit
+        const tf = sc.compute(gpu);
+        const prefill = tf ? (tf * 1e12 * 0.6) / (2 * model.activeParams) : null;
+        return { sc, mem, decode, prefill, tf };
+      });
+      const maxMem = Math.max(...rows.map((r) => r.mem));
+      const maxDec = Math.max(...rows.map((r) => r.decode));
+      const maxPre = Math.max(...rows.map((r) => r.prefill ?? 0));
+      rows.forEach((r, i) => {
+        const y = 44 + i * ROW;
+        if (i % 2 === 0) rect(svg, 8, y - 6, W - 16, ROW - 2, C.surface2, { rx: 8, opacity: 0.6 });
+        text(svg, 20, y + 12, r.sc.name, { class: 't-bold', 'font-size': 14 });
+        text(svg, 20, y + 30, r.sc.sub, { class: 't-small t-faint' });
+        // memory
+        const nG = Math.ceil(r.mem / (gpu.memGB * 1e9 * 0.85));
+        rect(svg, cols[0].x, y + 2, (r.mem / maxMem) * cols[0].w, 16, C.weight, { rx: 4 });
+        text(svg, cols[0].x, y + 32, `${fmt.num(r.mem / 1e9, 1)} GB · ${nG} GPU${nG > 1 ? 's' : ''} to fit`, { class: 't-small t-mono', fill: nG > 1 ? C.prefill : C.text });
+        // decode
+        rect(svg, cols[1].x, y + 2, (r.decode / maxDec) * cols[1].w, 16, C.decode, { rx: 4 });
+        text(svg, cols[1].x, y + 32, `${fmt.num(r.decode, 0)} tok/s${nG > 1 ? ` (per-GPU BW, ×${nG} with TP)` : ''}`, { class: 't-small t-mono' });
+        // prefill
+        if (r.prefill) {
+          rect(svg, cols[2].x, y + 2, (r.prefill / maxPre) * cols[2].w, 16, C.prefill, { rx: 4, opacity: r.sc.id === 'fp8' && !gpu.fp8TF ? 0.5 : 1 });
+          text(svg, cols[2].x, y + 32, `${fmt.num(r.prefill, 1)} tok/s`, { class: 't-small t-mono' });
+        } else {
+          rect(svg, cols[2].x, y + 2, cols[2].w * 0.5, 16, hatch, { stroke: C.waste, rx: 4 });
+          text(svg, cols[2].x, y + 32, r.sc.computeNote(gpu), { class: 't-small', fill: C.waste });
+        }
+        s('title', { text: r.sc.computeNote(gpu) }, svg.lastElementChild as Element);
+      });
+      text(svg, 20, H - 26, 'Decode ≈ bandwidth ÷ weight bytes (KV-cache reads ignored).  Prefill ≈ peak FLOPS of the math format × 0.6 ÷ (2 × active params).', { class: 't-small t-faint' });
+      text(svg, 20, H - 8, `${gpu.name}: ${gpu.bwTBs} TB/s · BF16 ${gpu.bf16TF} TF${gpu.fp8TF ? ` · FP8 ${gpu.fp8TF} TF` : ' · no FP8'}${gpu.fp4TF ? ` · FP4 ${gpu.fp4TF} TF` : ' · no FP4'} (dense, spec-sheet peak)`, { class: 't-small t-faint' });
+
+      const b = rows[0];
+      const smallest = rows.reduce((a, r) => (r.mem < a.mem ? r : a));
+      st.set('BF16 weights', `${fmt.num(b.mem / 1e9, 1)} GB`, model.name);
+      st.set('Smallest footprint', `${fmt.num(smallest.mem / 1e9, 1)} GB`, `${smallest.sc.name}: ${(b.mem / smallest.mem).toFixed(1)}× smaller`, C.good);
+      st.set('Batch-1 decode gain', `up to ${(rows[3].decode / b.decode).toFixed(1)}×`, 'fewer bytes per token → faster');
+      const bestPre = rows.reduce((a, r) => ((r.prefill ?? 0) > (a.prefill ?? 0) ? r : a));
+      st.set('Prefill gain', `${((bestPre.prefill ?? 0) / (b.prefill ?? 1)).toFixed(1)}×`, `best: ${bestPre.sc.name}. Needs low-precision math, not just small weights`);
+    }
+    render();
+  });
+</script>

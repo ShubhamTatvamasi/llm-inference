@@ -1,0 +1,83 @@
+---
+/* What-if explorer: prompt structure → cache hits → prefill tokens and TTFT saved. */
+---
+<div data-viz="prefix-playground"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, segmented, slider, stats, legend, C, fmt } from '../../lib/viz';
+
+  type Sc = 'shared' | 'multiturn' | 'tsfirst' | 'tslast';
+  const BS = 16;
+  const PREFILL_TPS = 12000; // tokens/s prefill for an 8B model on one H100 (rough)
+  const OVERHEAD = 0.015;    // s scheduling + first decode step
+
+  mountAll('prefix-playground', (root) => {
+    let sc: Sc = 'shared', sys = 1500, user = 150, n = 10;
+    const bar = ctrlBar(root);
+    segmented(bar, [
+      { value: 'shared', label: 'Shared system prompt' },
+      { value: 'multiturn', label: 'Multi-turn chat' },
+      { value: 'tsfirst', label: 'Timestamp at start' },
+      { value: 'tslast', label: 'Timestamp at end' },
+    ], sc, (v) => { sc = v as Sc; render(); });
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'System prompt / doc', min: 0, max: 6000, step: 100, value: sys, format: (v) => `${fmt.num(v, 1)} tok`, onInput: (v) => { sys = v; render(); } });
+    slider(bar2, { label: 'User turn', min: 20, max: 1000, step: 10, value: user, format: (v) => `${v} tok`, onInput: (v) => { user = v; render(); } });
+    slider(bar2, { label: 'Requests', min: 2, max: 12, value: n, onInput: (v) => { n = v; render(); } });
+
+    const W = 940;
+    const svg = svgRoot(root, W, 300, { 'aria-label': 'Per-request cached versus computed prompt tokens' });
+    const g = s('g', {}, svg);
+    const st = stats(root, ['Prefix hit rate', 'Prefill tokens saved', 'Avg TTFT (no cache)', 'Avg TTFT (with cache)']);
+    legend(root, [['Cached prefix (K/V reused)', C.kv], ['Computed in prefill', C.prefill]]);
+
+    const floorB = (x: number) => Math.floor(x / BS) * BS;
+
+    function requests() {
+      const out: { total: number; cached: number }[] = [];
+      const answer = user * 2; // assistant replies ~2× user turns
+      for (let i = 0; i < n; i++) {
+        if (sc === 'multiturn') {
+          const total = sys + i * (user + answer) + user;
+          const prevSeq = i === 0 ? 0 : sys + (i - 1) * (user + answer) + user + answer; // previous prompt + its answer
+          out.push({ total, cached: i === 0 ? 0 : floorB(prevSeq) });
+        } else if (sc === 'tsfirst') {
+          out.push({ total: 12 + sys + user, cached: 0 });
+        } else {
+          const extra = sc === 'tslast' ? 12 : 0;
+          out.push({ total: sys + user + extra, cached: i === 0 ? 0 : floorB(sys) });
+        }
+      }
+      return out;
+    }
+
+    function render() {
+      clear(g);
+      const rq = requests();
+      const H = 40 + rq.length * 21;
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      const max = Math.max(...rq.map((r) => r.total));
+      const X0 = 70, X1 = W - 150;
+      text(g, 0, 12, 'Prompt tokens per request', { class: 't-small t-bold t-dim' });
+      rq.forEach((r, i) => {
+        const y = 26 + i * 21;
+        const sx = (v: number) => ((X1 - X0) * v) / max;
+        text(g, 0, y + 8, `req ${i + 1}`, { class: 't-small t-mono t-faint' });
+        rect(g, X0, y, sx(r.cached), 16, C.kv, { rx: 3 });
+        rect(g, X0 + sx(r.cached), y, sx(r.total - r.cached), 16, C.prefill, { rx: 3 });
+        const ttftNo = r.total / PREFILL_TPS + OVERHEAD;
+        const ttft = (r.total - r.cached) / PREFILL_TPS + OVERHEAD;
+        text(g, X0 + sx(r.total) + 8, y + 8, `${fmt.ms(ttft * 1000)}${r.cached ? `  (was ${fmt.ms(ttftNo * 1000)})` : ''}`, { class: 't-small t-mono', fill: r.cached ? C.kv : C.dim });
+      });
+      const tot = rq.reduce((a, r) => a + r.total, 0);
+      const hit = rq.reduce((a, r) => a + r.cached, 0);
+      const avgNo = rq.reduce((a, r) => a + r.total / PREFILL_TPS + OVERHEAD, 0) / rq.length;
+      const avgC = rq.reduce((a, r) => a + (r.total - r.cached) / PREFILL_TPS + OVERHEAD, 0) / rq.length;
+      st.set('Prefix hit rate', fmt.pct(hit / tot), 'of all prompt tokens', hit ? C.kv : C.waste);
+      st.set('Prefill tokens saved', fmt.num(hit, 1), `of ${fmt.num(tot, 1)} total`);
+      st.set('Avg TTFT (no cache)', fmt.ms(avgNo * 1000), 'prefill at ~12k tok/s');
+      st.set('Avg TTFT (with cache)', fmt.ms(avgC * 1000), `${(avgNo / avgC).toFixed(1)}× faster`, C.kv);
+    }
+    render();
+  });
+</script>

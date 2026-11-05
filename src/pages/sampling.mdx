@@ -1,0 +1,103 @@
+---
+layout: ../layouts/Chapter.astro
+title: Logits → Next Token
+description: The model outputs a score for every token in the vocabulary. How temperature, top-k, top-p, min-p and penalties turn those scores into one choice, and how that choice drives the per-token decode loop and its stop conditions.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import SampLogits from '../components/viz/SampLogits.astro';
+import SampLoop from '../components/viz/SampLoop.astro';
+
+The [last layer](../transformer/) hands the LM head one vector, and the LM head returns a **logit**, an unnormalised score, for **every** token in the vocabulary: about 128K numbers for Llama 3. Generation means choosing **one** of them, and doing that again for every output token.
+
+## From logits to probabilities
+
+Softmax with a **temperature** $T$ turns logits $z_i$ into a probability distribution:
+
+$$
+p_i = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}}
+$$
+
+- $T \to 0$: all mass goes to the largest logit. This is **greedy** decoding.
+- $T = 1$: the model's own distribution.
+- $T > 1$: flatter, so rare tokens get more chances, with more creativity and more mistakes.
+
+Temperature alone still lets every token have some probability, and among 128K candidates the long tail of nonsense adds up. **Truncation** filters cut that tail before sampling.
+
+## The sampling pipeline
+
+Play with each knob and watch which candidates survive:
+
+<Viz title="Turning logits into one token" label="Interactive">
+  <SampLogits />
+  <Fragment slot="caption">
+    <p>Violet bars are the final probabilities after every filter, renormalised to sum to 1. The thin grey line under each row is the raw T = 1 probability. <b>Sample ×200</b> draws from the final distribution, so you can check it behaves as advertised. Try T = 1.6 with top-p 0.9, or min-p 0.1 at high temperature.</p>
+  </Fragment>
+</Viz>
+
+| Knob | Rule | Good for |
+|---|---|---|
+| **temperature** | divide logits by $T$ | overall randomness |
+| **top-k** | keep the $k$ most likely tokens | hard cap on candidates |
+| **top-p** (nucleus) | keep the smallest set whose probability sums to $\geq p$ | adapts to how confident the model is |
+| **min-p** | keep tokens with $p \geq \text{min\_p} \times p_\text{max}$ | stays sane at high temperature |
+| **repetition / presence / frequency penalties** | lower the logits of tokens already used | reducing loops and repetition |
+| **logit bias / masks** | add or forbid specific tokens | bans, [structured output](../structured-output/) |
+
+<Callout type="note" title="Greedy is not 'more correct'">
+Greedy decoding is deterministic and good for short factual answers. In long generations it tends to fall into repetition loops. **Beam search**, which keeps the k best partial sequences, is rarely used for chat LLMs: it multiplies compute and KV cache by k, and it favours bland, generic text.
+</Callout>
+
+### Where sampling runs
+
+Sampling is cheap compared with the forward pass, but it is not free. A batch of 256 sequences means sorting or partially sorting 256 × 128K logits every step for top-k and top-p. Engines run it **on the GPU, batched**, with dedicated kernels: some sort, some use rejection-style tricks that avoid a full sort. Per-request settings mean every row in the batch can have a different temperature and different filters. That is one reason sampling is fused and optimised so carefully.
+
+## The decode loop
+
+Sampling sits inside the loop that runs once per output token, for every active request:
+
+<Viz title="One output token per trip around the loop" label="Live">
+  <SampLoop />
+  <Fragment slot="caption">
+    <p>Each lap is one decode step. Lower <b>max_tokens</b> to watch a request end with <code>finish_reason: "length"</code>, or switch to a stop string to end it at the first period. The moment a request stops, its KV-cache memory is released for other requests.</p>
+  </Fragment>
+</Viz>
+
+Every stop condition is checked **after every token**:
+
+- **EOS / end-of-turn token**: the model decided it is done (`finish_reason: "stop"`).
+- **Stop strings**: user-provided strings such as `"\n\n"` or `"</answer>"`. A stop string can span several tokens, so the engine checks the detokenized text, and must not stream the partial match to the client.
+- **max_tokens**: a hard cap (`finish_reason: "length"`). It guards against runaway generations that would hold a batch slot and KV cache for no reason.
+
+<Callout type="warn" title="Seeds and determinism">
+Setting `seed` makes the random draws repeatable, but outputs can still differ between runs. Batched floating-point math depends on batch composition, and a different set of neighbouring requests can change logits slightly and flip a close sampling decision. Even greedy decoding is not bit-reproducible on a busy server unless the engine uses batch-invariant kernels.
+</Callout>
+
+## Why sampling settings matter for serving
+
+- **Output length drives cost.** Hotter sampling often produces longer, rambling outputs. Each extra token is one more [decode step](../prefill-decode/) and more [KV cache](../kv-cache/).
+- **[Speculative decoding](../speculative-decoding/) is sensitive to temperature.** Draft tokens are accepted less often when the target distribution is flatter, so speedups shrink as $T$ rises.
+- **Repetition loops can burn GPU time** until `max_tokens`. Penalties and sensible limits protect capacity.
+
+<Interview>
+  <Q q="What does temperature do mathematically?" level="core">
+    It divides the logits by T before softmax. T &lt; 1 sharpens the distribution towards the top token (T → 0 is greedy). T &gt; 1 flattens it, giving low-probability tokens more chance.
+  </Q>
+  <Q q="Explain top-p (nucleus) sampling and why it is often preferred to top-k." level="core">
+    Sort tokens by probability and keep the smallest prefix whose cumulative probability reaches p, then renormalise and sample. Unlike a fixed k, the number of candidates adapts: a confident model keeps 1–2 tokens, while an uncertain one keeps many.
+  </Q>
+  <Q q="What is min-p and what problem does it fix?" level="mid">
+    It keeps only tokens whose probability is at least min_p × the top token's probability. The threshold scales with the model's confidence, so it removes the junk tail even at high temperatures, where top-p tends to let too many low-quality tokens through.
+  </Q>
+  <Q q="What are the finish reasons, and why must stop strings be handled carefully when streaming?" level="mid">
+    "stop" (EOS or a stop string matched) and "length" (max_tokens hit). Stop strings can span several tokens, so the server matches on detokenized text and must hold back text that might be the start of a stop string; otherwise it would stream text that then has to be retracted.
+  </Q>
+  <Q q="Why might the same prompt with temperature 0 give different outputs on a production server?" level="senior">
+    Batched GPU kernels are not batch-invariant. Different batch sizes and compositions change reduction orders and tiling, which slightly changes logits. When two top candidates are close, greedy can flip, and the sequences then diverge. Other causes include different engine versions, quantisation, or tensor-parallel configurations.
+  </Q>
+  <Q q="Where does sampling run in an engine, and how is it kept fast with per-request settings?" level="senior">
+    On the GPU, after the LM head, for the whole batch at once. Engines use fused kernels that apply per-row temperature, penalties and masks, then top-k/top-p via partial sorts or sort-free rejection sampling. This avoids shipping 128K-wide logits to the CPU every step.
+  </Q>
+</Interview>

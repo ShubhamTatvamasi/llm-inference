@@ -1,0 +1,84 @@
+---
+/* KV transfer cost: bytes = prompt × KV/token; time = bytes ÷ link bandwidth.
+   Compared with prefill compute time, naive (after) vs layer-wise pipelined (overlapped). */
+---
+<div data-viz="disagg-kv"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, select, slider, stats, narration, C, fmt } from '../../lib/viz';
+  import { MODELS, getModel, getGPU, kvBytesPerToken } from '../../data/hardware';
+
+  const LINKS = [
+    { id: 'nvl', label: 'NVLink, same node (~900 GB/s)', gbs: 900 },
+    { id: 'ib400', label: 'RDMA 400 Gb/s (~50 GB/s)', gbs: 50 },
+    { id: 'roce200', label: 'RDMA 200 Gb/s (~25 GB/s)', gbs: 25 },
+    { id: 'tcp100', label: 'TCP 100 GbE (~10 GB/s)', gbs: 10 },
+  ];
+  const W = 940, H = 190;
+
+  mountAll('disagg-kv', (root) => {
+    let model = getModel('llama3-70b');
+    let prompt = 8192, kvB = 2, link = LINKS[1];
+    const gpu = getGPU('h100');
+    const b1 = ctrlBar(root);
+    select(b1, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(b1, 'KV dtype', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }], '2', (v) => { kvB = Number(v); render(); });
+    select(b1, 'Link', LINKS.map((l) => ({ value: l.id, label: l.label })), link.id, (v) => { link = LINKS.find((l) => l.id === v)!; render(); });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'Prompt tokens', min: 256, max: 131072, step: 256, value: prompt, format: (v) => fmt.num(v, 1), onInput: (v) => { prompt = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Prefill compute time versus KV transfer time' });
+    const st = stats(root, ['KV to move', 'Transfer time', 'Prefill compute (8 GPUs)', 'Exposed delay (layer-wise)']);
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      const kv = kvBytesPerToken(model, kvB) * prompt;
+      const tx = kv / (link.gbs * 1e9) + 0.0005;
+      // prefill on an 8-GPU node at 50% MFU, includes attention quadratic term
+      const fl = 2 * model.activeParams * prompt + 2 * model.layers * prompt * prompt * model.hidden;
+      const tp = fl / (8 * gpu.bf16TF * 1e12 * 0.5);
+      const maxT = Math.max(tp + tx, 1e-6);
+      const X0 = 180, X1 = W - 20;
+      const sx = (t: number) => X0 + (t / maxT) * (X1 - X0);
+      const row = (y: number, label: string, sub: string) => { text(svg, 6, y + 12, label, { class: 't-small t-bold' }); text(svg, 6, y + 26, sub, { class: 't-small t-faint' }); };
+
+      row(18, 'Naive', 'transfer after prefill');
+      rect(svg, X0, 20, sx(tp) - X0, 22, C.prefill, { rx: 4 });
+      if (sx(tp) - X0 > 80) text(svg, X0 + 8, 31, `prefill ${fmt.ms(tp * 1e3)}`, { class: 't-small t-bold', fill: 'var(--bg)' });
+      rect(svg, sx(tp), 20, sx(tp + tx) - sx(tp), 22, C.comm, { rx: 4 });
+      if (sx(tp + tx) - sx(tp) > 80) text(svg, sx(tp) + 8, 31, `KV xfer ${fmt.ms(tx * 1e3)}`, { class: 't-small t-bold', fill: 'var(--bg)' });
+
+      row(78, 'Layer-wise', 'send each layer as it finishes');
+      rect(svg, X0, 80, sx(tp) - X0, 22, C.prefill, { rx: 4 });
+      const L = Math.min(model.layers, 40);
+      let prevEnd = 0;
+      for (let i = 0; i < L; i++) {
+        const done = tp * ((i + 1) / L);
+        const start = Math.max(done, prevEnd); // a layer's KV can leave once computed AND the link is free
+        const w = tx / L;
+        prevEnd = start + w;
+        const x = sx(start);
+        rect(svg, x, 106, Math.max(1.5, sx(start + w) - x - 0.5), 10, C.comm, { rx: 2, opacity: 0.9 });
+      }
+      const end2 = prevEnd;
+      text(svg, sx(end2) + 6, 111, `done at ${fmt.ms(end2 * 1e3)}`, { class: 't-small t-mono', fill: C.comm });
+
+      row(140, 'Compare', 'transfer ÷ prefill');
+      const ratio = tx / tp;
+      rect(svg, X0, 146, X1 - X0, 14, C.surface3, { rx: 7 });
+      rect(svg, X0, 146, (X1 - X0) * Math.min(1, ratio), 14, ratio > 1 ? C.waste : C.comm, { rx: 7 });
+      text(svg, X0 + 8, 176, `transfer is ${ratio < 0.01 ? '<1' : (ratio * 100).toFixed(0)}% of prefill time`, { class: 't-small t-dim' });
+
+      const exposed = end2 - tp;
+      st.set('KV to move', fmt.bytes(kv), `${fmt.bytes(kvBytesPerToken(model, kvB))} × ${fmt.int(prompt)} tok`);
+      st.set('Transfer time', fmt.ms(tx * 1e3), link.label.split(' (')[0]);
+      st.set('Prefill compute (8 GPUs)', fmt.ms(tp * 1e3), `${gpu.name}, ~50% MFU`);
+      st.set('Exposed delay (layer-wise)', fmt.ms(exposed * 1e3), 'added to TTFT', exposed > 0.05 ? C.waste : C.good);
+      say(ratio > 1
+        ? `The link is too slow: moving ${fmt.bytes(kv)} takes longer than computing it. Use RDMA (NIXL/UCX, Mooncake), FP8 KV, or keep prefill and decode in the same NVLink domain.`
+        : `Prefill FLOPs grow faster than KV bytes, so the longer the prompt, the easier it is to hide the transfer. Sending <b>layer by layer</b> overlaps transfer with compute and leaves only ~${fmt.ms(exposed * 1e3)} exposed.`);
+    }
+    render();
+  });
+</script>

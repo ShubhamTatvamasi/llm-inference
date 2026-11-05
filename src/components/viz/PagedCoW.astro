@@ -1,0 +1,87 @@
+---
+/* Parallel sampling (n=2) sharing prompt blocks via reference counts, with
+   copy-on-write when a sample writes into a shared, partially-filled block. */
+---
+<div data-viz="paged-cow"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, narration, legend, C, SERIES, arrowDefs, uniq } from '../../lib/viz';
+
+  interface PBlock { id: number; toks: string[]; ref: number; fresh?: boolean; copied?: boolean }
+  interface State { seqs: { name: string; table: number[] }[]; blocks: PBlock[]; note: string }
+
+  const BS = 4;
+  // Hand-written scenario (each state is one step of the story)
+  function scenario(): State[] {
+    const P0 = ['Write', 'a', 'haiku', 'about'];
+    const P1 = ['the', 'sea'];
+    return [
+      { seqs: [{ name: 'prompt', table: [3, 7] }], blocks: [{ id: 3, toks: P0, ref: 1 }, { id: 7, toks: P1, ref: 1 }],
+        note: 'Prefill stores the 6-token prompt in two blocks: <b>#3</b> is full, <b>#7</b> is half full.' },
+      { seqs: [{ name: 'sample 1', table: [3, 7] }, { name: 'sample 2', table: [3, 7] }], blocks: [{ id: 3, toks: P0, ref: 2, fresh: true }, { id: 7, toks: P1, ref: 2, fresh: true }],
+        note: 'Request asks for <b>n = 2</b> samples. Nothing is copied: both block tables point to the <b>same</b> physical blocks, whose reference count goes to 2.' },
+      { seqs: [{ name: 'sample 1', table: [3, 12] }, { name: 'sample 2', table: [3, 7] }], blocks: [{ id: 3, toks: P0, ref: 2 }, { id: 7, toks: P1, ref: 1, fresh: true }, { id: 12, toks: [...P1, 'Waves'], ref: 1, copied: true }],
+        note: 'Sample 1 wants to append “Waves” into block #7, but #7 is <b>shared</b> (ref = 2). <b>Copy-on-write</b>: allocate #12, copy the 2 tokens, write there, and drop #7’s ref to 1.' },
+      { seqs: [{ name: 'sample 1', table: [3, 12] }, { name: 'sample 2', table: [3, 7] }], blocks: [{ id: 3, toks: P0, ref: 2 }, { id: 7, toks: [...P1, 'Grey'], ref: 1, fresh: true }, { id: 12, toks: [...P1, 'Waves'], ref: 1 }],
+        note: 'Sample 2 appends “Grey” to #7. Its ref is now 1, so it writes <b>in place</b>, with no copy needed.' },
+      { seqs: [{ name: 'sample 1', table: [3, 12, 5] }, { name: 'sample 2', table: [3, 7, 9] }], blocks: [{ id: 3, toks: P0, ref: 2 }, { id: 7, toks: [...P1, 'Grey', 'tide'], ref: 1 }, { id: 12, toks: [...P1, 'Waves', 'fold'], ref: 1 }, { id: 5, toks: ['on'], ref: 1, fresh: true }, { id: 9, toks: ['pulls'], ref: 1, fresh: true }],
+        note: 'Both samples fill their private blocks and get new ones (#5, #9). The full prompt block <b>#3 is still stored only once</b>.' },
+      { seqs: [{ name: 'sample 1', table: [3, 12, 5] }], blocks: [{ id: 3, toks: P0, ref: 1, fresh: true }, { id: 12, toks: [...P1, 'Waves', 'fold'], ref: 1 }, { id: 5, toks: ['on'], ref: 1 }],
+        note: 'Sample 2 finishes. Its private blocks (#7, #9) are freed; shared #3 just drops to ref = 1. With beam search or n = 8 samples, sharing like this saves most of the prompt’s memory.' },
+    ];
+  }
+
+  mountAll('paged-cow', (root) => {
+    const states = scenario();
+    let i = 0;
+    const bar = ctrlBar(root);
+    const W = 940, H = 256;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Copy-on-write block sharing between two samples' });
+    const arrow = arrowDefs(svg, uniq('cowa'), 'var(--text-faint)');
+    const g = s('g', {}, svg);
+    const say = narration(root);
+    legend(root, [['Shared (ref > 1)', C.token], ['Private (ref = 1)', C.kv], ['Just copied', C.prefill]]);
+
+    function render() {
+      clear(g);
+      const st = states[i];
+      const BY = 150, BW2 = 172, BH2 = 80;
+      text(g, 20, 14, 'Block tables (logical → physical)', { class: 't-small t-bold t-dim' });
+      text(g, 20, BY + BH2 + 16, 'Physical KV blocks (4 token slots each · reference count)', { class: 't-small t-bold t-dim' });
+      const pos = new Map<number, number>();
+      st.blocks.forEach((b, k) => {
+        const x = 20 + k * (BW2 + 8);
+        pos.set(b.id, x + BW2 / 2);
+        const shared = b.ref > 1;
+        const col = b.copied ? C.prefill : shared ? C.token : C.kv;
+        rect(g, x, BY, BW2, BH2, C.surface2, { rx: 10, stroke: col, 'stroke-width': b.fresh || b.copied ? 2.4 : 1.2 });
+        text(g, x + 10, BY + 14, `#${b.id}`, { class: 't-small t-mono t-bold' });
+        rect(g, x + BW2 - 50, BY + 5, 42, 18, col, { rx: 9 });
+        text(g, x + BW2 - 29, BY + 14, `ref ${b.ref}`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+        const cw = (BW2 - 16) / BS;
+        for (let k2 = 0; k2 < BS; k2++) {
+          const tok = b.toks[k2];
+          const cx = x + 8 + k2 * cw;
+          rect(g, cx, BY + 32, cw - 4, 38, tok ? col : 'transparent', { rx: 5, opacity: tok ? 0.9 : 1, stroke: tok ? 'none' : C.border, 'stroke-dasharray': tok ? null : '2 3' });
+          if (tok) text(g, cx + (cw - 4) / 2, BY + 51, tok, { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+        }
+      });
+      st.seqs.forEach((sq, r) => {
+        const y = 34, gx = 20 + r * 470;
+        const col = SERIES[r];
+        rect(g, gx, y, 96, 28, C.surface2, { rx: 8, stroke: col });
+        text(g, gx + 48, y + 14, sq.name, { 'text-anchor': 'middle', class: 't-small t-bold' });
+        sq.table.forEach((bid, li) => {
+          const bx = gx + 110 + li * 82;
+          rect(g, bx, y, 74, 28, C.surface, { rx: 6, stroke: col });
+          text(g, bx + 37, y + 14, `${li} → #${bid}`, { 'text-anchor': 'middle', class: 't-small t-mono' });
+          const px = pos.get(bid);
+          if (px !== undefined) s('path', { d: `M${bx + 37},${y + 28} C${bx + 37},${y + 70} ${px},${BY - 50} ${px},${BY - 3}`, fill: 'none', stroke: col, 'stroke-width': 1.4, opacity: 0.75, 'marker-end': arrow }, g);
+        });
+      });
+      text(g, W - 20, 14, `Step ${i + 1} / ${states.length}`, { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+      say(st.note);
+    }
+    const pp = player(bar, root, { step: () => { if (i >= states.length - 1) return false; i++; return i < states.length - 1; }, reset: () => { i = 0; }, render, interval: 2600 });
+  });
+</script>

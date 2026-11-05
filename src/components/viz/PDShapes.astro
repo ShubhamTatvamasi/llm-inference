@@ -1,0 +1,71 @@
+---
+/* Same weight matrix, different activation shapes: N tokens × W.
+   Shows FLOPs, bytes and FLOPs/byte as the number of tokens per pass changes. */
+---
+<div data-viz="pd-shapes"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, slider, segmented, stats, C, fmt } from '../../lib/viz';
+
+  const W = 940, H = 250, D = 4096;
+  const NS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+
+  mountAll('pd-shapes', (root) => {
+    let ni = 0;
+    const bar = ctrlBar(root);
+    const seg = segmented(bar, [{ value: '0', label: 'Decode (1 token)' }, { value: '11', label: 'Prefill (2,048 tokens)' }], '0', (v) => { ni = Number(v); sl.set(ni, false); render(); });
+    const sl = slider(bar, { label: 'Tokens in this pass (N)', min: 0, max: NS.length - 1, value: ni, format: (i) => fmt.int(NS[i]), onInput: (i) => { ni = i; seg.set(i === 0 ? '0' : i === 11 ? '11' : ('' as '0')); render(); } });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Matrix multiply shapes for prefill and decode' });
+    const st = stats(root, ['FLOPs', 'Bytes moved (BF16)', 'FLOPs per byte', 'On an H100 (ridge ≈ 295)']);
+
+    function render() {
+      clear(svg);
+      const N = NS[ni];
+      const isDecode = N === 1;
+      const col = isDecode ? C.decode : C.prefill, soft = isDecode ? C.decodeSoft : C.prefillSoft;
+      const S = 150; // weight square size
+      const xh = Math.max(5, (Math.log2(N) / 12) * S); // visual height of X (log)
+      const y0 = 40;
+      // X
+      const Xx = 60;
+      rect(svg, Xx, y0 + (S - xh) / 2, S, xh, col, { rx: 4, opacity: 0.9 });
+      text(svg, Xx + S / 2, y0 - 16, `X  [${fmt.int(N)} × ${D}]`, { 'text-anchor': 'middle', class: 't-mono t-small t-bold', ...fillStyle(col) });
+      text(svg, Xx + S / 2, y0 + S + 22, 'activations (tokens)', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      text(svg, Xx + S + 32, y0 + S / 2, '×', { 'text-anchor': 'middle', class: 't-big' });
+      // W
+      const Wx = Xx + S + 64;
+      rect(svg, Wx, y0, S, S, C.weight, { rx: 4, opacity: 0.85 });
+      for (let i = 1; i < 6; i++) s('line', { x1: Wx + (i * S) / 6, y1: y0, x2: Wx + (i * S) / 6, y2: y0 + S, stroke: 'var(--bg)', 'stroke-width': 1, opacity: 0.3 }, svg);
+      text(svg, Wx + S / 2, y0 - 16, `W  [${D} × ${D}]`, { 'text-anchor': 'middle', class: 't-mono t-small t-bold', ...fillStyle(C.weight) });
+      text(svg, Wx + S / 2, y0 + S + 22, 'weights: 32 MiB, read once', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      text(svg, Wx + S + 32, y0 + S / 2, '=', { 'text-anchor': 'middle', class: 't-big' });
+      // Y
+      const Yx = Wx + S + 64;
+      rect(svg, Yx, y0 + (S - xh) / 2, S, xh, soft, { rx: 4, stroke: col });
+      text(svg, Yx + S / 2, y0 - 16, `Y  [${fmt.int(N)} × ${D}]`, { 'text-anchor': 'middle', class: 't-mono t-small t-bold', ...fillStyle(col) });
+
+      // reuse meter on the right
+      const flops = 2 * N * D * D;
+      const bytes = 2 * D * D + 2 * 2 * N * D;
+      const ai = flops / bytes;
+      const mx = Yx + S + 50, mw = W - mx - 20;
+      text(svg, mx, y0 - 16, 'each weight is reused', { class: 't-small t-dim' });
+      text(svg, mx, y0 + 14, `${fmt.int(N)}×`, { class: 't-big t-mono', style: `fill:${col};font-size:30px` });
+      text(svg, mx, y0 + 52, 'FLOPs per byte', { class: 't-small t-dim' });
+      const r = Math.min(1, Math.log10(ai + 1) / Math.log10(4000));
+      rect(svg, mx, y0 + 64, mw, 14, C.surface3, { rx: 7 });
+      rect(svg, mx, y0 + 64, mw * r, 14, ai >= 295 ? C.compute : C.weight, { rx: 7 });
+      const rx = mx + mw * (Math.log10(296) / Math.log10(4000));
+      s('line', { x1: rx, y1: y0 + 58, x2: rx, y2: y0 + 84, stroke: C.text, 'stroke-width': 1.5, 'stroke-dasharray': '3 2' }, svg);
+      text(svg, rx, y0 + 96, 'ridge', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      text(svg, mx, y0 + 124, ai >= 295 ? 'compute-bound' : 'memory-bound', { class: 't-bold', ...fillStyle(ai >= 295 ? C.compute : C.weight) });
+
+      st.set('FLOPs', fmt.num(flops, 2), `2 × N × ${D} × ${D}`);
+      st.set('Bytes moved (BF16)', fmt.bytes(bytes), 'weights + inputs + outputs');
+      st.set('FLOPs per byte', ai.toFixed(ai < 10 ? 2 : 0), 'arithmetic intensity ≈ N');
+      st.set('On an H100 (ridge ≈ 295)', ai >= 295 ? 'compute-bound' : 'memory-bound', ai >= 295 ? 'tensor cores saturated' : `cores ≈ ${fmt.pct(Math.min(1, ai / 295), ai < 30 ? 1 : 0)} busy at best`, ai >= 295 ? C.compute : C.weight);
+    }
+    render();
+  });
+</script>

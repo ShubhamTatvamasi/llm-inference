@@ -1,0 +1,132 @@
+---
+/* Timeline of one request: one wide prefill pass, then many thin decode passes.
+   Shows TTFT / ITL on the user's stream and compute vs bandwidth utilisation per phase. */
+---
+<div data-viz="pd-timeline"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, segmented, stats, narration, legend, C, fmt } from '../../lib/viz';
+  import { getGPU, getModel } from '../../data/hardware';
+
+  const W = 940, H = 400, DECODE = 14;
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+  const OUT = ['Paris', ' is', ' the', ' capital', ' of', ' France', '.', ' It', ' sits', ' on', ' the', ' Seine', '.', '⏎'];
+
+  mountAll('pd-timeline', (root) => {
+    const model = getModel('llama3-8b');
+    const gpu = getGPU('h100');
+    let P = 2048;
+    let stepI = 0; // 0 idle, 1 prefill, 2.. decode
+
+    const MFU = 0.6, MBU = 0.8;
+    const wBytes = model.params * 2;
+    const kvTok = 2 * model.layers * model.kvHeads * model.headDim * 2;
+    const prefillComp = () => (2 * model.params * P + 2 * model.layers * P * P * model.hidden) / (gpu.bf16TF * 1e12 * MFU);
+    const prefillMem = () => (wBytes + kvTok * P) / (gpu.bwTBs * 1e12 * MBU);
+    const prefillT = () => Math.max(prefillComp(), prefillMem());
+    const decodeT = (ctx: number) => Math.max((wBytes + kvTok * ctx) / (gpu.bwTBs * 1e12 * MBU), (2 * model.params) / (gpu.bf16TF * 1e12 * MFU));
+
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Timeline of prefill and decode passes and the token stream' });
+    const say = narration(root);
+    const st = stats(root, ['TTFT', 'ITL (per token)', 'Tensor-core use', 'HBM bandwidth use']);
+    legend(root, [['Prefill pass (all prompt tokens at once)', C.prefill], ['Decode pass (one token)', C.decode], ['Token streamed to user', C.token]]);
+
+    function reset() { stepI = 0; }
+    function step() { stepI++; return stepI < DECODE + 1; }
+
+    function render() {
+      clear(svg);
+      const times: number[] = []; // end time of each pass
+      let t = prefillT(); times.push(t);
+      for (let i = 0; i < DECODE; i++) { t += decodeT(P + i); times.push(t); }
+      const total = t;
+      const X0 = 120, TW = W - X0 - 20;
+      const tx = (v: number) => X0 + (v / total) * TW;
+      const shown = stepI; // number of passes completed
+
+      // lane labels
+      const LY = 46, SY = 170, MY = 292;
+      text(svg, 10, LY + 30, 'GPU passes', { class: 't-bold t-small' });
+      text(svg, 10, LY + 46, 'forward passes', { class: 't-faint t-small' });
+      text(svg, 10, SY + 14, 'User sees', { class: 't-bold t-small' });
+
+      // axis
+      s('line', { x1: X0, y1: LY - 16, x2: X0 + TW, y2: LY - 16, stroke: C.border }, svg);
+      for (let k = 0; k <= 5; k++) {
+        const v = (total * k) / 5;
+        s('line', { x1: tx(v), y1: LY - 20, x2: tx(v), y2: LY - 12, stroke: C.border }, svg);
+        text(svg, tx(v), LY - 28, fmt.ms(v * 1000), { 'text-anchor': 'middle', class: 't-faint t-small t-mono' });
+      }
+
+      // prefill pass: a wide block with a stack of token rows inside
+      const pOn = shown >= 1;
+      const px0 = tx(0), px1 = tx(times[0]);
+      rect(svg, px0, LY, px1 - px0 - 2, 76, pOn ? C.prefill : 'transparent', { rx: 6, stroke: C.prefill, 'stroke-dasharray': pOn ? null : '4 3', opacity: pOn ? 0.95 : 0.6 });
+      for (let r = 0; r < 8; r++) rect(svg, px0 + 6, LY + 6 + r * 8.4, Math.max(0, px1 - px0 - 14), 5, pOn ? 'var(--bg)' : C.border, { rx: 2, opacity: pOn ? 0.28 : 0.5 });
+      if (px1 - px0 > 90) text(svg, (px0 + px1) / 2, LY + 92, `prefill · ${fmt.int(P)} tokens in one pass`, { 'text-anchor': 'middle', class: 't-small t-bold', ...fillStyle(C.prefill) });
+
+      // decode passes
+      for (let i = 0; i < DECODE; i++) {
+        const a = tx(times[i]), b = tx(times[i + 1]);
+        const on = shown >= i + 2;
+        rect(svg, a + 1, LY + 30, Math.max(2, b - a - 2), 16, on ? C.decode : 'transparent', { rx: 3, stroke: C.decode, 'stroke-dasharray': on ? null : '3 2', opacity: on ? 1 : 0.5 });
+      }
+      if (shown >= 2) text(svg, tx(times[0]) + 4, LY + 64, 'decode · 1 token per pass', { class: 't-small t-bold', ...fillStyle(C.decode) });
+
+      // playhead
+      if (shown > 0) {
+        const ph = tx(times[Math.min(shown, times.length) - 1]);
+        s('line', { x1: ph, y1: LY - 12, x2: ph, y2: SY + 50, stroke: C.accent, 'stroke-width': 1.5, 'stroke-dasharray': '3 3' }, svg);
+      }
+
+      // user stream
+      rect(svg, X0, SY, TW, 30, C.surface2, { rx: 8, stroke: C.border });
+      for (let i = 0; i < Math.min(DECODE, Math.max(0, shown - 1) + (shown >= 1 ? 1 : 0)); i++) {
+        // token i is emitted at end of pass i (prefill emits token 0)
+        const x = tx(times[i]);
+        s('circle', { cx: x, cy: SY + 15, r: 4.5, fill: C.token }, svg);
+        text(svg, x, SY + 42 + (i % 2) * 13, OUT[i].trim() || '·', { 'text-anchor': 'middle', class: 't-small t-mono t-dim' });
+      }
+      // TTFT bracket
+      if (shown >= 1) {
+        const y = SY + 80;
+        s('path', { d: `M${tx(0)},${y - 5} L${tx(0)},${y} L${tx(times[0])},${y} L${tx(times[0])},${y - 5}`, fill: 'none', stroke: C.prefill, 'stroke-width': 1.5 }, svg);
+        text(svg, (tx(0) + tx(times[0])) / 2, y + 12, `TTFT ${fmt.ms(times[0] * 1000)}`, { 'text-anchor': 'middle', class: 't-small t-bold', ...fillStyle(C.prefill) });
+      }
+      if (shown >= 3) {
+        const y = SY + 80, a = tx(times[1]), b = tx(times[2]);
+        s('path', { d: `M${a},${y - 5} L${a},${y} L${b},${y} L${b},${y - 5}`, fill: 'none', stroke: C.decode, 'stroke-width': 1.5 }, svg);
+        text(svg, b + 6, y + 12, `ITL ${fmt.ms((times[2] - times[1]) * 1000)}`, { class: 't-small t-bold', ...fillStyle(C.decode) });
+      }
+
+      // utilisation meters for the current phase
+      const phase = shown === 0 ? 'idle' : shown === 1 ? 'prefill' : 'decode';
+      let comp = 0, bw = 0;
+      if (phase === 'prefill') { comp = (prefillComp() / prefillT()) * MFU; bw = (prefillMem() / prefillT()) * MBU; }
+      if (phase === 'decode') { const d = decodeT(P + shown - 2); comp = ((2 * model.params) / (gpu.bf16TF * 1e12)) / d; bw = ((wBytes + kvTok * (P + shown - 2)) / (gpu.bwTBs * 1e12)) / d; }
+      const meter = (y: number, label: string, v: number, col: string) => {
+        text(svg, 10, y + 8, label, { class: 't-small t-dim' });
+        rect(svg, X0, y, TW, 16, C.surface3, { rx: 8 });
+        rect(svg, X0, y, Math.max(0, TW * Math.min(1, v)), 16, col, { rx: 8 });
+        text(svg, X0 + TW - 6, y + 8.5, fmt.pct(v, v < 0.1 ? 1 : 0), { 'text-anchor': 'end', class: 't-small t-mono t-bold' });
+      };
+      text(svg, 10, MY - 10, phase === 'idle' ? 'Utilisation' : `Utilisation during ${phase}`, { class: 't-bold t-small' });
+      meter(MY + 6, 'Tensor cores', comp, C.compute);
+      meter(MY + 32, 'HBM bandwidth', bw, C.weight);
+      text(svg, X0, MY + 74, phase === 'prefill' ? (comp > bw ? '→ compute-bound: math is the bottleneck' : '→ short prompt: even prefill is limited by the weight read') : phase === 'decode' ? '→ memory-bound: tensor cores wait on HBM' : '', { class: 't-small t-bold', ...fillStyle(phase === 'prefill' ? C.prefill : C.decode) });
+
+      st.set('TTFT', fmt.ms(times[0] * 1000), `prefill of ${fmt.int(P)} tokens`, C.prefill);
+      st.set('ITL (per token)', fmt.ms(decodeT(P) * 1000), `≈ ${fmt.num(1 / decodeT(P), 0)} tok/s for this user`, C.decode);
+      st.set('Tensor-core use', phase === 'idle' ? '–' : fmt.pct(comp, comp < 0.1 ? 1 : 0), phase);
+      st.set('HBM bandwidth use', phase === 'idle' ? '–' : fmt.pct(bw), phase);
+
+      if (phase === 'idle') say(`A ${fmt.int(P)}-token prompt arrives for <b>${model.name}</b> on one <b>${gpu.name}</b>. Press <b>Play</b>.`);
+      else if (phase === 'prefill') say(`<b>Prefill:</b> all ${fmt.int(P)} prompt tokens go through the network <b>together</b>. Each weight is reused ${fmt.int(P)}×, so the tensor cores are busy. The pass ends by producing the <b>first token</b>.`);
+      else say(`<b>Decode step ${shown - 1}:</b> one token in, one token out. Every weight (and the growing KV cache) is read again for just <b>one</b> token, so the tensor cores sit mostly idle.`);
+    }
+
+    player(bar, root, { step, reset, render, interval: 650, autoplay: true });
+    segmented(bar, [128, 2048, 8192].map((p) => ({ value: String(p), label: `prompt ${fmt.num(p, 0)}` })), String(P), (v) => { P = Number(v); render(); });
+  });
+</script>

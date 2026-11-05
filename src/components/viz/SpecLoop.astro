@@ -1,0 +1,165 @@
+---
+/* Speculative decoding loop: a cheap draft proposes k tokens, the target checks all
+   k+1 positions in ONE forward pass, keeps the matching prefix and adds its own token. */
+---
+<div data-viz="spec-loop"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, player, stats, legend, narration, C, s } from '../../lib/viz';
+
+  const CONTEXT = ['The', 'capital', 'of', 'France', 'is'];
+  // Each round: draft proposals (k=4) and the target's own prediction at each of the k+1 positions.
+  const ROUNDS = [
+    { draft: ['Paris', '.', 'It', 'has'], target: ['Paris', '.', 'It', 'is', '—'] },
+    { draft: ['known', 'as', 'the', 'city'], target: ['known', 'for', '—', '—', '—'] },
+    { draft: ['the', 'Eiffel', 'Tower', 'and'], target: ['the', 'Eiffel', 'Tower', 'and', 'its'] },
+    { draft: ['museums', 'and', 'art', '.'], target: ['museums', '.', '—', '—', '—'] },
+  ];
+  const K = 4;
+  const W = 940, H = 384;
+  const CHIP_W = 64, GAP = 6;
+
+  mountAll('spec-loop', (root) => {
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Draft model proposes tokens, target model verifies them in one pass' });
+    const say = narration(root);
+    const st = stats(root, ['Tokens generated', 'Target passes', 'Draft passes', 'Tokens / target pass']);
+    legend(root, [['Prompt', C.mem], ['Draft proposal', C.token], ['Accepted', C.kv], ['Rejected', C.waste], ['Target’s own token (correction / bonus)', C.decode]]);
+
+    // phase: 0..K-1 = drafting token i; K = verify; K+1 = accept
+    let round = 0, phase = -1;
+    let out: { t: string; kind: 'acc' | 'fix' }[] = [];
+    let targetPasses = 0, draftPasses = 0;
+    let timeline: ('d' | 't')[] = [];
+
+    const accepted = (r: number) => {
+      const R = ROUNDS[r]; let n = 0;
+      while (n < K && R.draft[n] === R.target[n]) n++;
+      return n;
+    };
+
+    function reset() { round = 0; phase = -1; out = []; targetPasses = 0; draftPasses = 0; timeline = []; }
+    function step() {
+      if (round >= ROUNDS.length) return false;
+      phase++;
+      if (phase < K) { draftPasses++; timeline.push('d'); }
+      else if (phase === K) { targetPasses++; timeline.push('t'); }
+      else if (phase === K + 1) {
+        const R = ROUNDS[round]; const n = accepted(round);
+        for (let i = 0; i < n; i++) out.push({ t: R.draft[i], kind: 'acc' });
+        out.push({ t: R.target[n], kind: 'fix' });
+      } else { round++; phase = 0; if (round >= ROUNDS.length) { round = ROUNDS.length; phase = -1; return false; } draftPasses++; timeline.push('d'); }
+      return true;
+    }
+
+    function chip(x: number, y: number, label: string, fill: string, stroke: string, textCls = 't-bold', w = CHIP_W, dashed = false, fs = 11.5) {
+      rect(svg, x, y, w, 28, fill, { stroke, rx: 7, 'stroke-dasharray': dashed ? '3 3' : null });
+      text(svg, x + w / 2, y + 14, label, { 'text-anchor': 'middle', class: textCls, 'font-size': fs });
+    }
+
+    function render() {
+      clear(svg);
+      // --- output row
+      text(svg, 12, 22, 'Sequence', { class: 't-dim t-small t-bold' });
+      let x = 96;
+      const all = [...CONTEXT.map((t) => ({ t, kind: 'ctx' as const })), ...out];
+      const per = Math.min(CHIP_W, Math.floor((W - 110) / Math.max(all.length, 12)) - 4);
+      for (const tk of all) {
+        const fill = tk.kind === 'ctx' ? C.memSoft : tk.kind === 'acc' ? C.kvSoft : C.decodeSoft;
+        const stroke = tk.kind === 'ctx' ? C.mem : tk.kind === 'acc' ? C.kv : C.decode;
+        chip(x, 8, tk.t, fill, stroke, 't-bold', per, false, per < 56 ? 10.5 : 11.5);
+        x += per + 4;
+      }
+
+      const R = ROUNDS[Math.min(round, ROUNDS.length - 1)];
+      const active = round < ROUNDS.length && phase >= 0;
+      const X0 = 230;
+
+      // --- draft lane
+      const DY = 84;
+      rect(svg, 10, DY - 10, W - 20, 64, C.tokenSoft, { rx: 12, opacity: 0.55 });
+      text(svg, 24, DY + 10, 'Draft model', { class: 't-bold' });
+      text(svg, 24, DY + 28, 'small & cheap, 1 token / pass', { class: 't-dim t-small' });
+      for (let i = 0; i < K; i++) {
+        const cx = X0 + i * (CHIP_W + 30);
+        const shown = active && phase >= i;
+        if (!shown) { chip(cx, DY + 4, '?', 'transparent', C.border, 't-faint', CHIP_W, true); continue; }
+        let fill: string = C.tokenSoft, stroke: string = C.token;
+        if (phase >= K + 1) {
+          const n = accepted(round);
+          if (i < n) { fill = C.kvSoft; stroke = C.kv; } else if (i === n) { fill = C.wasteSoft; stroke = C.waste; } else { fill = 'transparent'; stroke = C.border; }
+        }
+        chip(cx, DY + 4, R.draft[i], fill, stroke);
+        text(svg, cx + CHIP_W / 2, DY + 44, `d${i + 1}`, { 'text-anchor': 'middle', class: 't-faint t-mono t-small' });
+      }
+
+      // --- target lane
+      const TY = 172;
+      rect(svg, 10, TY - 10, W - 20, 92, C.decodeSoft, { rx: 12, opacity: 0.55 });
+      text(svg, 24, TY + 10, 'Target model', { class: 't-bold' });
+      text(svg, 24, TY + 28, 'big; checks all k+1', { class: 't-dim t-small' });
+      text(svg, 24, TY + 44, 'positions in ONE pass', { class: 't-dim t-small' });
+      if (active && phase >= K) {
+        // one wide bracket showing the single pass
+        const bx = X0 - 8, bw = (K + 1) * (CHIP_W + 30) - 14;
+        rect(svg, bx, TY - 2, bw, 46, 'none', { stroke: C.decode, 'stroke-width': 1.5, rx: 10, 'stroke-dasharray': '5 4' });
+        text(svg, bx + bw - 6, TY + 58, '1 forward pass, k+1 = 5 positions in parallel', { 'text-anchor': 'end', class: 't-small', fill: C.decode });
+        const n = accepted(round);
+        for (let i = 0; i <= K; i++) {
+          const cx = X0 + i * (CHIP_W + 30);
+          const tok = R.target[i];
+          let fill: string = C.decodeSoft, stroke: string = C.decode, label = tok, cls = 't-bold';
+          if (phase >= K + 1) {
+            if (i < n) { fill = C.kvSoft; stroke = C.kv; label = '✓ ' + tok; }
+            else if (i === n) { fill = C.decode; stroke = C.decode; cls = 't-bold'; }
+            else { fill = 'transparent'; stroke = C.border; label = 'unused'; cls = 't-faint'; }
+          }
+          chip(cx, TY + 6, label, fill, stroke, cls);
+          if (phase >= K + 1 && i === n) {
+            // text on saturated fill
+            const last = svg.lastElementChild as SVGTextElement; last.setAttribute('fill', 'var(--bg)');
+          }
+          // arrows from draft to target
+          if (i < K) s('line', { x1: cx + CHIP_W / 2, y1: DY + 34, x2: cx + CHIP_W / 2, y2: TY + 4, stroke: C.borderStrong, 'stroke-dasharray': '2 3' }, svg);
+        }
+        text(svg, X0 + K * (CHIP_W + 30) + CHIP_W / 2, TY - 16, 'bonus slot', { 'text-anchor': 'middle', class: 't-faint t-small' });
+      } else {
+        for (let i = 0; i <= K; i++) chip(X0 + i * (CHIP_W + 30), TY + 6, '·', 'transparent', C.border, 't-faint', CHIP_W, true);
+      }
+
+      // --- timeline (wall clock)
+      const LY = 288;
+      text(svg, 12, LY + 10, 'Wall clock', { class: 't-dim t-small t-bold' });
+      let tx = 96;
+      const scale = 0.9;
+      for (const ev of timeline) {
+        const w = ev === 'd' ? 8 * scale : 46 * scale;
+        rect(svg, tx, LY, w, 20, ev === 'd' ? C.token : C.decode, { rx: 3 });
+        tx += w + 2;
+      }
+      // baseline: normal decoding needs one target pass per generated token
+      text(svg, 12, LY + 46, 'Plain decode', { class: 't-dim t-small t-bold' });
+      let bx2 = 96;
+      for (let i = 0; i < out.length; i++) { rect(svg, bx2, LY + 36, 46 * scale, 20, C.mem, { rx: 3, opacity: 0.6 }); bx2 += 46 * scale + 2; }
+      text(svg, 96, LY + 74, `same ${out.length} tokens: ${targetPasses} big pass${targetPasses === 1 ? '' : 'es'} + ${draftPasses} tiny draft pass${draftPasses === 1 ? '' : 'es'}, vs ${out.length} big pass${out.length === 1 ? '' : 'es'} for plain decoding`, { class: 't-small t-faint' });
+
+      st.set('Tokens generated', String(out.length));
+      st.set('Target passes', String(targetPasses), 'expensive: reads all weights');
+      st.set('Draft passes', String(draftPasses), 'cheap');
+      st.set('Tokens / target pass', targetPasses ? (out.length / targetPasses).toFixed(2) : '–', 'plain decoding = 1.00', C.kv);
+
+      if (!active && round === 0) say('Press <b>Play</b>. The draft guesses the next <b>k = 4</b> tokens one by one; then the target checks them all at once.');
+      else if (!active) say(`Done: <b>${out.length} tokens</b> from only <b>${targetPasses}</b> target passes. Plain decoding would need ${out.length}.`);
+      else if (phase < K) say(`<b>Round ${round + 1}, drafting:</b> the small model proposes token ${phase + 1} of ${K}: “${R.draft[phase]}”. Each draft pass is cheap.`);
+      else if (phase === K) say(`<b>Verify:</b> the target runs <b>one</b> forward pass over context + all ${K} drafts. That gives its own prediction at each of the ${K + 1} positions, almost for the price of one decode step, because decode is memory-bound.`);
+      else {
+        const n = accepted(round);
+        say(n === K
+          ? `<b>All ${K} accepted</b>, plus the target’s <b>bonus</b> token “${R.target[K]}” from the extra slot: <b>${K + 1} tokens</b> in one target pass.`
+          : `<b>Accept ${n}</b>, reject at “${R.draft[n]}” (target wanted “${R.target[n]}”). We keep ${n} drafts + the target’s correction = <b>${n + 1} tokens</b>. Drafts after the mismatch are thrown away.`);
+      }
+    }
+
+    player(bar, root, { step, reset, render, interval: 1000, autoplay: true });
+  });
+</script>

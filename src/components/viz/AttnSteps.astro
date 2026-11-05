@@ -1,0 +1,115 @@
+---
+/* Scaled dot-product attention on a 5-token example, one operation at a time. Hover cells. */
+---
+<div data-viz="attn-steps"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, narration, legend, C, rng } from '../../lib/viz';
+
+  const TOK = ['The', 'GPU', 'reads', 'the', 'cache'];
+  const N = 5, DK = 4;
+  const W = 940, H = 400;
+  const r = rng(7);
+  const mk = () => Array.from({ length: N }, () => Array.from({ length: DK }, () => Math.round((r() * 2 - 1) * 10) / 10));
+  const Q = mk(), K = mk(), V = mk();
+  const RAW = Q.map((q) => K.map((k) => q.reduce((a, x, d) => a + x * k[d], 0)));
+  const SCALED = RAW.map((row) => row.map((x) => x / Math.sqrt(DK)));
+  const MASKED = SCALED.map((row, i) => row.map((x, j) => (j > i ? -Infinity : x)));
+  const PROBS = MASKED.map((row) => { const m = Math.max(...row); const e = row.map((x) => (x === -Infinity ? 0 : Math.exp(x - m))); const z = e.reduce((a, b) => a + b, 0); return e.map((x) => x / z); });
+  const OUT = PROBS.map((p) => Array.from({ length: DK }, (_, d) => p.reduce((a, pj, j) => a + pj * V[j][d], 0)));
+
+  const STAGES = [
+    { name: 'Q, K, V', mat: null as number[][] | null, kind: 'none' },
+    { name: 'S = Q·Kᵀ', mat: RAW, kind: 'score' },
+    { name: 'S / √d_k', mat: SCALED, kind: 'score' },
+    { name: 'causal mask', mat: MASKED, kind: 'score' },
+    { name: 'P = softmax(S)', mat: PROBS, kind: 'prob' },
+    { name: 'O = P·V', mat: PROBS, kind: 'out' },
+  ];
+
+  mountAll('attn-steps', (root) => {
+    let st = 0; let hover: [number, number] | null = null;
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Attention computed step by step on five tokens' });
+    const say = narration(root);
+    legend(root, [['positive score', C.prefill], ['negative score', C.decode], ['probability', C.kv], ['masked (future)', C.mem]]);
+
+    const small = (M: number[][], x: number, y: number, title: string, color: string, cs = 24, hiRow = -1, hiCol = -1) => {
+      text(svg, x, y - 12, title, { class: 't-bold t-small', style: `fill:${color}` });
+      M.forEach((row, i) => row.forEach((v, d) => {
+        const on = i === hiRow || (hiCol >= 0 && i === hiCol);
+        rect(svg, x + d * (cs + 2), y + i * (cs + 2), cs, cs, on ? color : C.surface2, { opacity: on ? 0.85 : 1, stroke: C.border, rx: 4 });
+        text(svg, x + d * (cs + 2) + cs / 2, y + i * (cs + 2) + cs / 2, v.toFixed(1).replace(/^(-?)0\./, '$1.'), { 'text-anchor': 'middle', 'font-size': 10.5, class: 't-mono', style: on ? 'fill:var(--bg)' : '' });
+      }));
+    };
+
+    function render() {
+      clear(svg);
+      const stage = STAGES[st];
+      const hr = hover ? hover[0] : -1, hc = hover ? hover[1] : -1;
+      // inputs
+      small(Q, 20, 44, 'Q (queries)', C.token, 28, hr);
+      small(K, 20, 238, 'K (keys)', C.kv, 28, -1, hc);
+      small(V, 538, 74, 'V (values)', C.decode, 28, -1, st === 5 && hover ? hc : -1);
+
+      // central matrix
+      const MX = 222, MY = 70, CS = 50;
+      text(svg, MX, 30, stage.name, { class: 't-big' });
+      TOK.forEach((t, j) => text(svg, MX + j * (CS + 3) + CS / 2, MY - 12, t, { 'text-anchor': 'middle', class: 't-small t-dim t-bold' }));
+      TOK.forEach((t, i) => text(svg, MX - 8, MY + i * (CS + 3) + CS / 2, t, { 'text-anchor': 'end', class: 't-small t-dim t-bold' }));
+      text(svg, MX + 2.5 * (CS + 3), MY + N * (CS + 3) + 14, 'each row: one query over all keys', { 'text-anchor': 'middle', class: 't-faint t-small' });
+      for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+        const x = MX + j * (CS + 3), y = MY + i * (CS + 3);
+        const cell = rect(svg, x, y, CS, CS, C.surface2, { rx: 6, stroke: hover && hr === i && hc === j ? C.text : C.border, 'stroke-width': hover && hr === i && hc === j ? 2 : 1 });
+        cell.style.cursor = 'pointer';
+        cell.addEventListener('mouseenter', () => { if (hover && hover[0] === i && hover[1] === j) return; hover = [i, j]; render(); });
+        if (!stage.mat) continue;
+        const v = stage.mat[i][j];
+        if (v === -Infinity || (st >= 4 && j > i)) {
+          rect(svg, x, y, CS, CS, C.memSoft, { rx: 6, 'pointer-events': 'none' });
+          text(svg, x + CS / 2, y + CS / 2, st === 3 ? '−∞' : '0', { 'text-anchor': 'middle', class: 't-faint t-mono', 'pointer-events': 'none' });
+          continue;
+        }
+        const isProb = stage.kind !== 'score';
+        const fill = isProb ? C.kv : v >= 0 ? C.prefill : C.decode;
+        const op = isProb ? 0.15 + 0.85 * v : Math.min(1, 0.15 + Math.abs(v) / 1.5);
+        rect(svg, x, y, CS, CS, fill, { rx: 6, opacity: op, 'pointer-events': 'none' });
+        text(svg, x + CS / 2, y + CS / 2, isProb ? v.toFixed(2) : v.toFixed(2), { 'text-anchor': 'middle', class: 't-mono t-bold', 'font-size': 12, 'pointer-events': 'none', style: op > 0.6 ? 'fill:var(--bg)' : '' });
+      }
+      // output
+      const OX = 720, OY = 70, OC = 44;
+      text(svg, OX, 30, 'O (outputs)', { class: 't-big', style: st === 5 ? `fill:${C.decode}` : '' });
+      OUT.forEach((row, i) => {
+        text(svg, OX - 8, OY + i * (CS + 3) + CS / 2, TOK[i], { 'text-anchor': 'end', class: 't-small t-dim' });
+        row.forEach((v, d) => {
+          const x = OX + d * (OC + 1), y = OY + i * (CS + 3) + (CS - OC) / 2;
+          if (st === 5) {
+            rect(svg, x, y, OC, OC, v >= 0 ? C.token : C.decode, { rx: 6, opacity: 0.2 + Math.min(0.8, Math.abs(v)) });
+            text(svg, x + OC / 2, y + OC / 2, v.toFixed(2), { 'text-anchor': 'middle', class: 't-mono', 'font-size': 10.5 });
+          } else rect(svg, x, y, OC, OC, 'none', { rx: 6, stroke: C.border, 'stroke-dasharray': '3 3' });
+        });
+      });
+
+      // narration
+      const i = hr, j = hc;
+      if (hover && st >= 1 && st <= 3) {
+        const terms = Q[i].map((q, d) => `${q.toFixed(1)}×${K[j][d].toFixed(1)}`).join(' + ');
+        say(j > i && st === 3 ? `“${TOK[i]}” may not look at the <b>future</b> token “${TOK[j]}”, so the score is set to <b>−∞</b> and becomes 0 after softmax.` : `score(${TOK[i]} → ${TOK[j]}) = q·k = ${terms} = <b>${RAW[i][j].toFixed(2)}</b>${st >= 2 ? ` → ÷√${DK} = <b>${SCALED[i][j].toFixed(2)}</b>` : ''}`);
+      } else if (hover && st >= 4) {
+        say(`Row “${TOK[i]}” sums to 1. It puts <b>${(PROBS[i][j] * 100).toFixed(0)}%</b> of its attention on “${TOK[j]}”. ${st === 5 ? `Output o<sub>${i}</sub> = Σ p<sub>${i}j</sub> · v<sub>j</sub>, a weighted mix of value vectors.` : ''}`);
+      } else {
+        const msg = [
+          'Each token has a <b>query</b> (what am I looking for?), a <b>key</b> (what do I contain?) and a <b>value</b> (what do I pass on?), here with d<sub>k</sub> = 4. Press <b>Play</b> or hover a cell.',
+          '<b>Dot product</b> of every query with every key: an n × n grid of similarity scores. Hover a cell to see the arithmetic.',
+          'Divide by <b>√d<sub>k</sub></b> so scores do not grow with dimension. Large scores would saturate the softmax.',
+          '<b>Causal mask</b>: a token may only attend to itself and earlier tokens. That is what makes generation left-to-right and the KV cache valid.',
+          '<b>Softmax</b> along each row turns scores into weights that sum to 1.',
+          'Each output row is a <b>weighted sum of value vectors</b>. The result goes on to the output projection and the residual stream.',
+        ];
+        say(msg[st]);
+      }
+    }
+    svg.addEventListener('mouseleave', () => { hover = null; render(); });
+    player(bar, root, { step: () => { st++; return st < STAGES.length - 1; }, reset: () => { st = 0; }, render, interval: 1800, autoplay: true });
+  });
+</script>

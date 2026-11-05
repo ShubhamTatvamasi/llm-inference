@@ -1,0 +1,122 @@
+---
+layout: ../layouts/Chapter.astro
+title: Routing & Autoscaling
+description: Once you run more than one replica, where each request goes and when replicas come and go decide your latency as much as the GPU does. LLM traffic breaks the assumptions classic load balancers make.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import RoutingSim from '../components/viz/RoutingSim.astro';
+import AutoscaleSim from '../components/viz/AutoscaleSim.astro';
+import ColdStartBar from '../components/viz/ColdStartBar.astro';
+import RetryStorm from '../components/viz/RetryStorm.astro';
+
+A classic HTTP load balancer assumes requests are **small, similar and stateless**. LLM requests are none of these:
+
+- **Wildly different sizes.** A 20-token question and a 30,000-token document review can arrive one after the other. One request can occupy a replica 1,000× longer than another.
+- **Stateful replicas.** Each replica holds a [prefix cache](../prefix-caching/) of KV blocks for recent prompts. Sending a request to a replica that already has its prefix can cut [prefill](../prefill-decode/) work by 10×. Sending it elsewhere starts from scratch.
+- **Expensive, slow capacity.** A new replica means a GPU node, a 10 GB image and tens of gigabytes of weights. It arrives in minutes, not seconds.
+
+## Where should this request go?
+
+All four policies below see the same stream of requests. Each request starts with one of eight shared system prompts (A–H), and some prompts are far more popular than others, as in real traffic. Every replica can keep three prefixes in its cache.
+
+<Viz title="Four routing policies, same traffic" label="Simulation">
+  <RoutingSim />
+  <Fragment slot="caption">
+    <p>Switch policies and compare the full-run table. Round-robin and least-outstanding scatter prefixes, so the hit rate stays near 50%. Prefix hashing hits almost every time but overloads the replica that owns the hottest prefix. Scoring by <b>load minus cache affinity</b> gets both a high hit rate and short queues. Simplified model; 1 tick = 100 ms.</p>
+  </Fragment>
+</Viz>
+
+The progression mirrors how production routers evolved:
+
+1. **Round-robin / random.** Fine for identical stateless requests. For LLMs it creates hot spots whenever a few long requests land on the same replica.
+2. **Least outstanding requests / queue-aware.** Balances load using live engine signals (running, waiting, KV usage). This is a large improvement and should be the minimum.
+3. **Prefix / KV-cache-aware.** The router tracks which replica probably holds which prefix (by hashing prompt blocks the same way the engine does) and adds a score bonus for cache affinity. Load still counts, so a hot prefix spills over instead of melting one replica.
+4. **Adapter-aware.** With [multi-LoRA](../multi-lora/), requests also prefer replicas that already have their adapter loaded.
+
+<Callout type="note" title="How this looks on Kubernetes">
+The **Gateway API Inference Extension** adds LLM-aware routing to standard Kubernetes gateways. An `InferencePool` groups the model-server pods, and an **endpoint picker** chooses the pod for each request using engine metrics: queue length, KV-cache usage, loaded adapters and prefix affinity. **llm-d** builds a full distributed serving stack on this foundation, with prefix-cache-aware scheduling and [disaggregated prefill/decode](../disaggregation/) pools. Other gateways (Envoy-based, kgateway, cloud gateways) plug into the same API.
+</Callout>
+
+## When should replicas come and go?
+
+Autoscaling an LLM service is a control loop with a **long actuator delay**. You need to pick a **signal** that predicts trouble early, and then cover the cold-start gap. Try the three common signals against one weekday of traffic:
+
+<Viz title="A day of traffic vs the autoscaler" label="Simulation">
+  <AutoscaleSim />
+  <Fragment slot="caption">
+    <p>Blue is demand; green is the capacity of <i>ready</i> replicas; red marks minutes where users queue. Make the cold start longer and watch the morning ramp turn red. Then add a scheduled floor or switch to KV-cache usage. Set min replicas to 0 to see scale-to-zero hurt the first users of the day. Illustrative model: one replica serves 6 req/s within SLO.</p>
+  </Fragment>
+</Viz>
+
+| Signal | Example metric | Verdict |
+|---|---|---|
+| CPU utilisation | container CPU | Useless: the GPU does the work |
+| GPU utilisation | `nvidia-smi` util, DCGM | Misleading: decode loops look busy at modest load and saturate at 100% |
+| Queue depth / waiting requests | `vllm:num_requests_waiting` | Honest but **late**: users are already waiting |
+| KV-cache usage | `vllm:kv_cache_usage_perc` | Early warning: rises before the queue does |
+| Latency (p95 TTFT, queue time) | `vllm:request_queue_time_seconds` | Directly tied to the SLO, but lagging and noisy |
+
+In practice, teams scale up on **KV usage or queue depth**, feed the metrics through a Prometheus adapter or **KEDA**, scale **up fast and down slow** (with a stabilisation window), and add **scheduled pre-scaling** for predictable peaks.
+
+## Why cold starts are so slow
+
+Every scale-up decision pays the cold-start cost before it helps anyone. Step through a fresh replica coming up, then tick the optimisations:
+
+<Viz title="Anatomy of a cold start" label="Live">
+  <ColdStartBar />
+  <Fragment slot="caption">
+    <p>Unoptimised, most of the time goes to infrastructure (node, image, weights), not to the model. Warm node pools, cached images and locally staged weights remove most of it. A persisted compile cache shortens the engine warm-up.</p>
+  </Fragment>
+</Viz>
+
+The probes matter as much as the speed:
+
+- **startupProbe** gets a long budget so Kubernetes does not kill a pod that is still downloading 140 GB of weights.
+- **readinessProbe** must pass only after the model is loaded **and warmed up**. If it passes earlier, the first real users pay for the JIT compilation. It should also fail during graceful drain.
+- **livenessProbe** must be lenient. An engine at 100% load answers health checks slowly, and restarting it only makes the overload worse.
+- With [tensor parallelism](../parallelism/) across several GPUs or nodes, treat the whole group as **one unit** for health and scheduling.
+
+## Protecting the service from overload
+
+Autoscaling takes minutes; traffic spikes take seconds. In between you need **admission control** in layers:
+
+- **Gateway:** per-tenant rate limits and token budgets, maximum prompt and output length, priority classes (interactive above batch).
+- **Engine:** a bounded queue. When the queue is full or the predicted wait would break the SLO, **fail fast** with `429 Too Many Requests` and a `Retry-After` header instead of queuing forever.
+- **Clients:** retry with **exponential backoff and jitter**, and a retry cap.
+
+The jitter matters more than it looks:
+
+<Viz title="1,000 clients vs a recovering server" label="Simulation">
+  <RetryStorm />
+  <Fragment slot="caption">
+    <p>The server is down for 10 s, then comes back with fixed capacity. Rejected requests still cost the server some work, so a retry storm also shrinks the useful capacity. Compare peak load and how long it takes until every client is served.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="warn" title="Cancellation is capacity">
+When a user closes the tab, the disconnect must propagate from the browser through the gateway to the engine, which then frees that sequence's KV blocks. Proxies that buffer SSE, or engines that ignore disconnects, keep generating tokens nobody will read, and those tokens use the same GPU time as useful ones.
+</Callout>
+
+<Interview>
+  <Q q="Why is round-robin a poor load-balancing strategy for LLM serving?" level="core">
+    Requests differ in cost by orders of magnitude, so equal counts do not mean equal load. Round-robin also ignores replica state: it scatters requests that share a prefix, which destroys prefix-cache reuse. Use queue-aware routing at minimum, and prefix/KV-aware routing with load weighting when prompts share prefixes.
+  </Q>
+  <Q q="Which metrics should drive autoscaling for a vLLM deployment, and which should not?" level="core">
+    Use waiting requests (`num_requests_waiting`), KV-cache usage, running requests, and p95 TTFT or queue time. Avoid CPU utilisation (irrelevant) and headline GPU utilisation (looks busy at moderate load, saturates at 100%). Scale up fast and down slowly, and pre-scale for known peaks.
+  </Q>
+  <Q q="List the components of a cold start and how to shorten each." level="mid">
+    Node provisioning (warm pools, reserved capacity), image pull (pre-pulled or cached images, smaller images), weight download (stage weights on local NVMe or a shared cache), load into GPU (fast safetensors loaders), and warm-up such as compile and CUDA graph capture (persisted compile cache). Readiness should flip only after a warm-up request succeeds.
+  </Q>
+  <Q q="You scaled from 2 to 8 replicas and average TTFT got worse. Why?" level="senior">
+    New replicas start with **empty prefix caches**, and round-robin spreads repeated prefixes thinner, so the hit rate collapses and every request pays full prefill. Readiness may also have passed before warm-up finished. Fixes: prefix-aware routing that still balances load, a shared or tiered prefix cache, and readiness only after warm-up.
+  </Q>
+  <Q q="An internal assistant scales to zero overnight. Every morning the first users wait minutes. What do you change?" level="senior">
+    Scale-to-zero suits batch work, not a predictable daily rush. Add a scheduled scale-up before office hours, keep a warm minimum during business hours, pre-pull images and stage weights on nodes, and optionally route overnight traffic to a managed API through the gateway as a fallback.
+  </Q>
+  <Q q="During an incident, the recovered service immediately falls over again. Logs show a flood of 429s. What's happening and what do you do?" level="senior">
+    A **retry storm**: clients that failed together retry together, often with fixed intervals or no jitter, so the load during recovery is many times the capacity, and rejections themselves eat capacity. Return `429` with `Retry-After`, require exponential backoff with full jitter in SDKs, cap retries at the gateway, and ramp traffic back gradually (load shedding by priority).
+  </Q>
+</Interview>

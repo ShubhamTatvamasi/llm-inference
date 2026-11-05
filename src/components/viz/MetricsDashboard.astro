@@ -1,0 +1,106 @@
+---
+/* A serving dashboard sketch. Pick a production scenario and see which panels move.
+   Metric names follow vLLM's Prometheus naming plus NVIDIA DCGM. */
+---
+<div data-viz="metrics-dash"></div>
+
+<script>
+  import { mountAll, h, svgRoot, s, clear, ctrlBar, segmented, narration, C, rng } from '../../lib/viz';
+
+  type Scn = 'healthy' | 'interference' | 'kvfull' | 'overload' | 'coldcache';
+  interface Panel { group: string; title: string; metric: string; unit: string; color: string; max: number; gen: (scn: Scn, t: number, r: () => number) => number; alarm: (scn: Scn) => boolean; }
+
+  const N = 40; // points per sparkline (one per 30 s → 20 min window)
+  const ramp = (t: number, at = 0.45) => Math.max(0, Math.min(1, (t - at) / 0.25));
+
+  const PANELS: Panel[] = [
+    { group: 'User experience', title: 'TTFT p95', max: 6.5, metric: 'vllm:time_to_first_token_seconds', unit: 's', color: C.kv,
+      gen: (sc, t, r) => { const b = 0.25 + r() * 0.05; if (sc === 'overload') return b + ramp(t) * 6; if (sc === 'kvfull') return b + ramp(t) * 1.4; if (sc === 'coldcache') return b + ramp(t, 0.4) * 0.9 * (1 - ramp(t, 0.8)); if (sc === 'interference') return b + 0.15 * r(); return b; },
+      alarm: (sc) => sc === 'overload' || sc === 'kvfull' || sc === 'coldcache' },
+    { group: 'User experience', title: 'ITL p99', max: 450, metric: 'vllm:inter_token_latency_seconds', unit: 'ms', color: C.decode,
+      gen: (sc, t, r) => { const b = 32 + r() * 4; if (sc === 'interference') return b + (r() < 0.35 * ramp(t, 0.3) + 0.05 ? 220 + r() * 180 : 0); if (sc === 'kvfull') return b + ramp(t) * 60 + r() * 20 * ramp(t); if (sc === 'overload') return b + ramp(t) * 18; return b; },
+      alarm: (sc) => sc === 'interference' || sc === 'kvfull' },
+    { group: 'Engine saturation', title: 'Requests waiting', max: 130, metric: 'vllm:num_requests_waiting', unit: '', color: C.prefill,
+      gen: (sc, t, r) => { if (sc === 'overload') return Math.round(ramp(t) * 120 + r() * 4); if (sc === 'kvfull') return Math.round(ramp(t) * 25 + r() * 5 * ramp(t)); return Math.round(r() * 2); },
+      alarm: (sc) => sc === 'overload' || sc === 'kvfull' },
+    { group: 'Engine saturation', title: 'KV cache usage', max: 100, metric: 'vllm:kv_cache_usage_perc', unit: '%', color: C.kv,
+      gen: (sc, t, r) => { const b = 45 + r() * 6; if (sc === 'kvfull') return Math.min(99.5, b + ramp(t, 0.25) * 55); if (sc === 'overload') return Math.min(97, b + ramp(t) * 45); if (sc === 'interference') return b + 8; return b; },
+      alarm: (sc) => sc === 'kvfull' || sc === 'overload' },
+    { group: 'Engine saturation', title: 'Preemptions / min', max: 45, metric: 'vllm:num_preemptions_total (rate)', unit: '', color: C.mem,
+      gen: (sc, t, r) => (sc === 'kvfull' ? Math.round(ramp(t) * 30 + r() * 10 * ramp(t)) : sc === 'overload' ? Math.round(ramp(t, 0.6) * 6 * r()) : 0),
+      alarm: (sc) => sc === 'kvfull' },
+    { group: 'Traffic shape', title: 'Prompt tokens / s', max: 80, metric: 'vllm:prompt_tokens_total (rate)', unit: 'k', color: C.prefill,
+      gen: (sc, t, r) => { const b = 18 + r() * 3; if (sc === 'interference') return b + (r() < 0.3 * ramp(t, 0.3) + 0.04 ? 60 + r() * 50 : 0); if (sc === 'overload') return b * (1 + ramp(t) * 1.6); if (sc === 'kvfull') return b * (1 + ramp(t, 0.25) * 0.4); return b; },
+      alarm: (sc) => sc === 'interference' || sc === 'overload' },
+    { group: 'Traffic shape', title: 'Prefix cache hit rate', max: 100, metric: 'vllm:prefix_cache_hits / queries', unit: '%', color: C.kv,
+      gen: (sc, t, r) => { const b = 62 + r() * 5; if (sc === 'coldcache') return b - ramp(t, 0.4) * 50 * (1 - ramp(t, 0.8)); return b; },
+      alarm: (sc) => sc === 'coldcache' },
+    { group: 'Hardware', title: 'SM activity', max: 100, metric: 'DCGM_FI_PROF_SM_ACTIVE', unit: '%', color: C.compute,
+      gen: (sc, t, r) => { const b = 55 + r() * 6; if (sc === 'overload') return Math.min(96, b + ramp(t) * 40); if (sc === 'interference') return b + (r() < 0.3 ? 30 : 0); return b; },
+      alarm: () => false },
+  ];
+
+  const STORIES: Record<Scn, string> = {
+    healthy: '<b>Healthy.</b> TTFT and ITL are flat, the queue is near zero, KV usage has headroom and there are no preemptions. This is your baseline. Alert on deviations from it.',
+    interference: '<b>Long-prompt interference.</b> TTFT is fine, but <b>p99 ITL spikes</b> exactly when prompt-token throughput spikes. Huge prompts are prefilled in the same steps as everyone’s decodes. Check: ITL p99 vs prompt length, chunked-prefill token budget, or move document ingestion to a separate pool.',
+    kvfull: '<b>KV cache saturation.</b> KV usage pins near 100%, <b>preemptions climb</b>, and tail ITL worsens as sequences are evicted and recomputed. Check: longer outputs than expected? Fixes: lower max_num_seqs, FP8 KV, more memory via TP, or more replicas.',
+    overload: '<b>Plain overload.</b> The waiting queue grows without bound and TTFT p95 rockets while ITL barely moves. Arrivals exceed capacity. Check autoscaler lag and routing balance, and shed load with 429s instead of queuing forever.',
+    coldcache: '<b>Cold prefix cache after scale-out.</b> The prefix hit rate drops and TTFT rises with no queue build-up. New replicas start empty, and round-robin spreads shared prefixes thin. Fixes: prefix-aware routing, readiness only after warm-up.',
+  };
+
+  mountAll('metrics-dash', (root) => {
+    let scn: Scn = 'healthy';
+    const bar = ctrlBar(root);
+    segmented(bar, [
+      { value: 'healthy', label: 'Healthy' }, { value: 'interference', label: 'Long-prompt stalls' },
+      { value: 'kvfull', label: 'KV saturation' }, { value: 'overload', label: 'Overload' }, { value: 'coldcache', label: 'Cold cache' },
+    ], scn, (v) => { scn = v as Scn; render(); });
+    const grid = h('div', { class: 'mdash-grid' }, root);
+    const say = narration(root);
+
+    function render() {
+      clear(grid);
+      const groups = [...new Set(PANELS.map((p) => p.group))];
+      for (const g of groups) {
+        const col = h('div', { class: 'mdash-col' }, grid);
+        h('div', { class: 'mdash-gh', text: g }, col);
+        for (const p of PANELS.filter((pp) => pp.group === g)) {
+          const r = rng(p.title.length * 97 + 11);
+          const vals = Array.from({ length: N }, (_, i) => p.gen(scn, i / (N - 1), r));
+          const alarm = p.alarm(scn);
+          const card = h('div', { class: 'mdash-card' + (alarm ? ' alarm' : '') }, col);
+          const top = h('div', { class: 'mdash-top' }, card);
+          h('span', { class: 'mdash-t', text: p.title }, top);
+          const last = vals[vals.length - 1];
+          h('span', { class: 'mdash-v', text: `${p.unit === 's' ? last.toFixed(2) : p.unit === '%' ? last.toFixed(0) : Math.round(last)}${p.unit === 's' ? ' s' : p.unit === 'ms' ? ' ms' : p.unit === '%' ? '%' : p.unit === 'k' ? 'k' : ''}` }, top);
+          const svg = svgRoot(card, 200, 44, { preserveAspectRatio: 'none', class: 'mdash-spark' });
+          const max = p.max;
+          const pts = vals.map((v, i) => `${(i / (N - 1)) * 200},${42 - Math.min(1, v / max) * 38}`).join(' ');
+          const col2 = alarm ? C.waste : p.color;
+          s('polyline', { points: `0,44 ${pts} 200,44`, fill: col2, opacity: 0.14, stroke: 'none' }, svg);
+          s('polyline', { points: pts, fill: 'none', stroke: col2, 'stroke-width': 1.6, 'vector-effect': 'non-scaling-stroke' }, svg);
+          h('code', { class: 'mdash-m', text: p.metric }, card);
+        }
+      }
+      say(STORIES[scn]);
+    }
+    render();
+  });
+</script>
+
+<style is:global>
+  [data-viz='metrics-dash'] .seg { flex-wrap: wrap; }
+  .mdash-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+  @media (max-width: 860px) { .mdash-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 480px) { .mdash-grid { grid-template-columns: minmax(0, 1fr); } }
+  .mdash-col { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .mdash-gh { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-faint); font-weight: 650; }
+  .mdash-card { background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px 7px; transition: border-color 0.2s, box-shadow 0.2s; }
+  .mdash-card.alarm { border-color: color-mix(in srgb, var(--c-waste) 60%, transparent); box-shadow: 0 0 0 3px var(--c-waste-soft); }
+  .mdash-top { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
+  .mdash-t { font-size: 0.78rem; font-weight: 600; }
+  .mdash-v { font-family: var(--font-mono); font-size: 0.82rem; font-weight: 600; }
+  .mdash-card.alarm .mdash-v { color: var(--c-waste); }
+  .viz svg.mdash-spark { height: 40px; margin: 4px 0 3px; }
+  .mdash-m { display: block; font-size: 0.64rem !important; color: var(--text-faint); background: none !important; border: 0 !important; padding: 0 !important; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+</style>

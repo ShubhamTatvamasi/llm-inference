@@ -1,0 +1,99 @@
+---
+/* Interactive GPU memory budget: weights + runtime overhead + KV cache.
+   Answers "how many concurrent sequences of length N fit?" */
+---
+<div data-viz="kv-calc"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, select, slider, stats, legend, C, fmt, hatchDefs, uniq } from '../../lib/viz';
+  import { MODELS, GPUS, kvBytesPerToken, getModel, getGPU } from '../../data/hardware';
+
+  const CTX = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const W = 940, H = 150;
+
+  mountAll('kv-calc', (root) => {
+    let model = getModel('llama3-8b');
+    let gpu = getGPU('h100');
+    let nGpu = 1, wBytes = 2, kvBytes = 2, ctxI = 4, batch = 32, util = 0.9;
+
+    const bar1 = ctrlBar(root);
+    const g1 = group(bar1);
+    select(g1, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(g1, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    select(g1, '×', [1, 2, 4, 8].map((n) => ({ value: String(n), label: `${n} GPU${n > 1 ? 's' : ''}` })), '1', (v) => { nGpu = Number(v); render(); });
+    const bar2 = ctrlBar(root);
+    select(bar2, 'Weights', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8 / INT8' }, { value: '0.5', label: 'INT4 / FP4' }], '2', (v) => { wBytes = Number(v); render(); });
+    select(bar2, 'KV cache', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }], '2', (v) => { kvBytes = Number(v); render(); });
+    const bar3 = ctrlBar(root);
+    slider(bar3, { label: 'Context / sequence', min: 0, max: CTX.length - 1, value: ctxI, format: (i) => fmt.num(CTX[i], 0), onInput: (i) => { ctxI = i; render(); } });
+    slider(bar3, { label: 'Concurrent sequences', min: 1, max: 256, value: batch, onInput: (v) => { batch = v; render(); } });
+    slider(bar3, { label: 'gpu_memory_utilization', min: 0.5, max: 0.98, step: 0.01, value: util, format: (v) => v.toFixed(2), onInput: (v) => { util = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Stacked bar of GPU memory: weights, overhead, KV cache, free' });
+    const hatchId = uniq('kvh');
+    const st = stats(root, ['KV per token', 'KV per sequence', 'Max concurrent seqs', 'Max tokens in cache']);
+    legend(root, [['Weights', C.weight], ['Activations + runtime (est.)', C.mem], ['KV cache in use', C.kv], ['KV headroom', C.kvSoft], ['Over budget', C.waste]]);
+    const formula = document.createElement('div');
+    formula.className = 'narr';
+    root.appendChild(formula);
+
+    function render() {
+      clear(svg);
+      const hatch = hatchDefs(svg, hatchId, C.waste);
+      const ctx = CTX[ctxI];
+      const total = gpu.memGB * 1e9 * nGpu;
+      const budget = total * util;
+      const weights = model.params * wBytes;
+      const overhead = Math.max(1.5e9 * nGpu, 0.04 * total); // activations, CUDA graphs, workspace (rough)
+      const kvTok = kvBytesPerToken(model, kvBytes);
+      const kvSeq = kvTok * ctx;
+      const kvUsed = kvSeq * batch;
+      const kvAvail = Math.max(0, budget - weights - overhead);
+      const maxSeqs = Math.floor(kvAvail / kvSeq);
+
+      const X = 20, BW = W - 40, Y = 40, BH = 44;
+      const sx = (b: number) => (b / total) * BW;
+      text(svg, X, 16, `${nGpu} × ${gpu.name}  ·  ${fmt.num(total / 1e9, 0)} GB total`, { class: 't-bold' });
+      text(svg, X + BW, 16, `budget = ${util.toFixed(2)} × total`, { 'text-anchor': 'end', class: 't-dim t-small' });
+      rect(svg, X, Y, BW, BH, C.surface2, { rx: 8, stroke: C.border });
+
+      let x = X;
+      const seg = (w: number, fill: string, label: string, extra: Record<string, string | number> = {}) => {
+        const ww = Math.max(0, Math.min(w, X + BW - x));
+        if (ww <= 0) return;
+        rect(svg, x, Y, ww, BH, fill, { rx: 0, ...extra });
+        if (ww > 70) text(svg, x + 8, Y + BH / 2, label, { class: 't-small t-bold', fill: 'var(--bg)' });
+        x += ww;
+      };
+      const fitsWeights = weights + overhead <= budget;
+      seg(sx(weights), C.weight, `weights ${fmt.num(weights / 1e9, 1)} GB`);
+      seg(sx(overhead), C.mem, 'runtime');
+      const kvShown = Math.min(kvUsed, kvAvail);
+      seg(sx(kvShown), C.kv, `KV ${fmt.num(kvUsed / 1e9, 1)} GB`);
+      if (kvUsed < kvAvail) seg(sx(kvAvail - kvUsed), C.kvSoft, 'free KV');
+      // budget line
+      const bx = X + sx(budget);
+      s('line', { x1: bx, y1: Y - 8, x2: bx, y2: Y + BH + 8, stroke: C.text, 'stroke-width': 1.5, 'stroke-dasharray': '4 3' }, svg);
+      text(svg, bx, Y + BH + 20, 'budget', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      if (!fitsWeights || kvUsed > kvAvail) {
+        const over = !fitsWeights ? weights + overhead - budget : kvUsed - kvAvail;
+        const ox = Math.min(bx, x);
+        const ow = Math.min(sx(over), X + BW - ox + 0);
+        rect(svg, ox, Y + BH + 30, Math.max(ow, 4), 14, hatch, { stroke: C.waste, rx: 3 });
+        text(svg, ox + Math.max(ow, 4) + 8, Y + BH + 37, !fitsWeights ? `weights don't fit: short by ${fmt.num(over / 1e9, 1)} GB` : `over by ${fmt.num(over / 1e9, 1)} GB → requests queue or get preempted`, { class: 't-small t-bold', fill: C.waste });
+      } else {
+        text(svg, X, Y + BH + 37, `✓ fits — ${fmt.pct(kvUsed / Math.max(kvAvail, 1))} of KV capacity in use`, { class: 't-small t-bold', fill: C.good });
+      }
+
+      st.set('KV per token', fmt.bytes(kvTok), model.attn === 'MLA' ? `MLA latent · ${model.layers} layers` : `2 × ${model.layers} L × ${model.kvHeads} kv-heads × ${model.headDim} × ${kvBytes} B`);
+      st.set('KV per sequence', fmt.bytes(kvSeq), `${fmt.int(ctx)} tokens`);
+      st.set('Max concurrent seqs', fitsWeights ? fmt.int(maxSeqs) : '0', `at ${fmt.num(ctx, 0)} tokens each`, maxSeqs >= batch ? C.good : C.waste);
+      st.set('Max tokens in cache', fitsWeights ? fmt.num(kvAvail / kvTok, 1) : '0', 'shared by all requests');
+
+      formula.innerHTML = model.attn === 'MLA'
+        ? `<b>KV/token</b> = layers × latent_dim × bytes = ${model.layers} × ${model.mlaDim} × ${kvBytes} = <b>${fmt.bytes(kvTok)}</b> — MLA caches one compressed latent instead of full K and V.`
+        : `<b>KV/token</b> = 2 (K,V) × layers × kv_heads × head_dim × bytes = 2 × ${model.layers} × ${model.kvHeads} × ${model.headDim} × ${kvBytes} = <b>${fmt.bytes(kvTok)}</b>${model.attn === 'MHA' ? ' — MHA: every query head has its own K/V.' : ` — GQA shares each K/V head across ${model.heads / model.kvHeads} query heads.`}`;
+    }
+    render();
+  });
+</script>

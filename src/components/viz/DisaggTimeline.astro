@@ -1,0 +1,165 @@
+---
+/* Same request trace, same 2 GPUs: colocated (prefill interrupts decode) vs
+   disaggregated (1 prefill GPU + 1 decode GPU, KV transferred between them).
+   Per-request token streams show the inter-token stalls. */
+---
+<div data-viz="disagg-timeline"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, button, segmented, stats, legend, rafLoop, reducedMotion, C, SERIES, fmt } from '../../lib/viz';
+
+  type Req = { id: number; arr: number; prompt: number; out: number };
+  const REQS: Req[] = [
+    { id: 0, arr: 0, prompt: 1200, out: 60 },
+    { id: 1, arr: 60, prompt: 900, out: 55 },
+    { id: 2, arr: 260, prompt: 4200, out: 40 },
+    { id: 3, arr: 420, prompt: 1500, out: 50 },
+    { id: 4, arr: 640, prompt: 3600, out: 40 },
+    { id: 5, arr: 900, prompt: 800, out: 45 },
+  ];
+  const RATE = 16; // prefill tokens per ms per GPU
+  const T_END = 2400;
+  const stepMs = (n: number) => 18 + 0.8 * n;
+
+  type Block = { lane: number; t0: number; t1: number; kind: 'prefill' | 'decode' | 'xfer' | 'mixed'; r?: number };
+  type Result = { blocks: Block[]; tokens: number[][]; lanes: string[]; first: number[] };
+
+  function simColocated(chunk: number | null): Result {
+    const blocks: Block[] = []; const tokens: number[][] = REQS.map(() => []); const first: number[] = REQS.map(() => NaN);
+    for (let g = 0; g < 2; g++) {
+      const mine = REQS.filter((r) => r.id % 2 === g);
+      let t = 0; const waiting: { r: Req; left: number }[] = []; const running: Req[] = []; let next = 0;
+      while (t < T_END) {
+        while (next < mine.length && mine[next].arr <= t) waiting.push({ r: mine[next++], left: mine[next - 1].prompt });
+        if (waiting.length) {
+          const w = waiting[0];
+          const take = chunk ? Math.min(chunk, w.left) : w.left;
+          const dur = take / RATE + (chunk && running.length ? stepMs(running.length) : 0);
+          blocks.push({ lane: g, t0: t, t1: t + dur, kind: chunk && running.length ? 'mixed' : 'prefill', r: w.r.id });
+          t += dur; w.left -= take;
+          if (chunk) for (const r of running) tokens[r.id].push(t);
+          if (w.left <= 0) { waiting.shift(); first[w.r.id] = t; tokens[w.r.id].push(t); running.push(w.r); }
+        } else if (running.length) {
+          const dur = stepMs(running.length);
+          blocks.push({ lane: g, t0: t, t1: t + dur, kind: 'decode' });
+          t += dur;
+          for (const r of running) tokens[r.id].push(t);
+        } else { t = next < mine.length ? mine[next].arr : T_END; continue; }
+        for (let i = running.length - 1; i >= 0; i--) if (tokens[running[i].id].length >= running[i].out) running.splice(i, 1);
+      }
+    }
+    return { blocks, tokens, first, lanes: ['GPU 0 (both phases)', 'GPU 1 (both phases)'] };
+  }
+
+  function simDisagg(): Result {
+    const blocks: Block[] = []; const tokens: number[][] = REQS.map(() => []); const first: number[] = REQS.map(() => NaN);
+    const ready: { r: Req; at: number }[] = [];
+    let t = 0;
+    for (const r of REQS) {
+      t = Math.max(t, r.arr);
+      const dur = r.prompt / RATE;
+      blocks.push({ lane: 0, t0: t, t1: t + dur, kind: 'prefill', r: r.id });
+      t += dur; first[r.id] = t; tokens[r.id].push(t);
+      const x = 4 + r.prompt * 0.006;
+      blocks.push({ lane: 2, t0: t, t1: t + x, kind: 'xfer', r: r.id });
+      ready.push({ r, at: t + x });
+    }
+    let td = 0; const running: Req[] = [];
+    while (td < T_END) {
+      for (let i = ready.length - 1; i >= 0; i--) if (ready[i].at <= td) { running.push(ready[i].r); ready.splice(i, 1); }
+      if (!running.length) { if (!ready.length) break; td = Math.min(...ready.map((x) => x.at)); continue; }
+      const dur = stepMs(running.length);
+      blocks.push({ lane: 1, t0: td, t1: td + dur, kind: 'decode' });
+      td += dur;
+      for (const r of running) tokens[r.id].push(td);
+      for (let i = running.length - 1; i >= 0; i--) if (tokens[running[i].id].length >= running[i].out) running.splice(i, 1);
+    }
+    return { blocks, tokens, first, lanes: ['GPU 0 · prefill pool', 'GPU 1 · decode pool', 'KV transfer'] };
+  }
+
+  function metrics(res: Result) {
+    const ttft = REQS.map((r) => res.first[r.id] - r.arr).filter((x) => !isNaN(x));
+    const gaps: number[] = [];
+    res.tokens.forEach((ts) => { for (let i = 1; i < ts.length; i++) gaps.push(ts[i] - ts[i - 1]); });
+    gaps.sort((a, b) => a - b);
+    return {
+      ttft: ttft.reduce((a, b) => a + b, 0) / ttft.length,
+      p99: gaps[Math.floor(gaps.length * 0.99)] ?? 0,
+      max: gaps[gaps.length - 1] ?? 0,
+      med: gaps[Math.floor(gaps.length / 2)] ?? 0,
+    };
+  }
+
+  mountAll('disagg-timeline', (root) => {
+    const bar = ctrlBar(root);
+    let topMode: 'plain' | 'chunked' = 'plain';
+    const pb = button(bar, 'Pause', () => { if (loop.running) { loop.pause(); pb.querySelector('span')!.textContent = 'Play'; } else { loop.resume(); pb.querySelector('span')!.textContent = 'Pause'; } });
+    button(bar, 'Replay', () => { now = 0; }, { icon: 'reset' });
+    segmented(bar, [{ value: 'plain', label: 'Colocated' }, { value: 'chunked', label: 'Colocated + chunked prefill' }], 'plain', (v) => { topMode = v as typeof topMode; A = simColocated(topMode === 'chunked' ? 512 : null); now = 0; upd(); });
+
+    const W = 940, H = 400;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Timelines comparing colocated and disaggregated serving' });
+    const st = stats(root, ['Avg TTFT (top / bottom)', 'Median ITL', 'p99 ITL', 'Worst stall']);
+    legend(root, [['Prefill', C.prefill], ['Decode step (whole batch)', C.decode], ['Prefill chunk + decode', C.compute], ['KV transfer', C.comm], ['Token emitted', C.text], ['Stall > 60 ms', C.waste]]);
+
+    let A = simColocated(null);
+    const B = simDisagg();
+    let now = 0;
+    const X0 = 150, X1 = W - 12;
+    const sx = (t: number) => X0 + (Math.min(t, T_END) / T_END) * (X1 - X0);
+
+    function upd() {
+      const a = metrics(A), b = metrics(B);
+      st.set('Avg TTFT (top / bottom)', `${fmt.ms(a.ttft)} / ${fmt.ms(b.ttft)}`, 'time to first token');
+      st.set('Median ITL', `${fmt.ms(a.med)} / ${fmt.ms(b.med)}`, 'steady-state streaming');
+      st.set('p99 ITL', `${fmt.ms(a.p99)} / ${fmt.ms(b.p99)}`, 'tail inter-token latency', b.p99 < a.p99 ? C.good : undefined);
+      st.set('Worst stall', `${fmt.ms(a.max)} / ${fmt.ms(b.max)}`, 'largest gap a user sees', a.max > 100 ? C.waste : undefined);
+    }
+
+    function panel(res: Result, y0: number, title: string) {
+      text(svg, 6, y0, title, { class: 't-bold' });
+      const laneH = 20;
+      res.lanes.forEach((ln, i) => {
+        const y = y0 + 14 + i * (laneH + 4);
+        text(svg, 6, y + laneH / 2, ln, { class: 't-small t-dim' });
+        rect(svg, X0, y, X1 - X0, laneH, C.surface2, { rx: 4 });
+      });
+      for (const b of res.blocks) {
+        if (b.t0 > now) continue;
+        const y = y0 + 14 + b.lane * (laneH + 4);
+        const x0 = sx(b.t0), x1 = sx(Math.min(b.t1, now));
+        const col = b.kind === 'prefill' ? C.prefill : b.kind === 'decode' ? C.decode : b.kind === 'xfer' ? C.comm : C.compute;
+        rect(svg, x0, y + (b.kind === 'decode' ? 3 : 0), Math.max(1, x1 - x0 - (b.kind === 'decode' ? 1 : 0.5)), b.kind === 'decode' ? laneH - 6 : laneH, col, { rx: 3, opacity: b.kind === 'decode' ? 0.75 : 1 });
+        if (b.r !== undefined && b.kind !== 'decode' && x1 - x0 > 22) text(svg, x0 + 4, y + laneH / 2, `R${b.r}`, { class: 't-small t-bold', fill: 'var(--bg)' });
+      }
+      const ry0 = y0 + 14 + res.lanes.length * (laneH + 4) + 6;
+      REQS.forEach((r, i) => {
+        const y = ry0 + i * 11;
+        text(svg, 6, y + 4, `R${r.id} tokens`, { class: 't-small t-faint', 'font-size': 10.5 });
+        if (r.arr <= now) s('circle', { cx: sx(r.arr), cy: y + 4, r: 2.5, fill: 'none', stroke: SERIES[i], 'stroke-width': 1.2 }, svg);
+        const ts = res.tokens[r.id];
+        let prev = r.arr;
+        ts.forEach((t, k) => {
+          if (t > now) return;
+          if (k > 0 && t - prev > 60) s('line', { x1: sx(prev), y1: y + 4, x2: sx(t), y2: y + 4, stroke: C.waste, 'stroke-width': 3, opacity: 0.85 }, svg);
+          s('line', { x1: sx(t), y1: y, x2: sx(t), y2: y + 8, stroke: SERIES[i], 'stroke-width': 1.3 }, svg);
+          prev = t;
+        });
+      });
+    }
+
+    function draw() {
+      clear(svg);
+      panel(A, 14, topMode === 'plain' ? 'Colocated: 2 GPUs, each does prefill + decode' : 'Colocated + chunked prefill (512-token chunks)');
+      panel(B, 206, 'Disaggregated: 1 prefill GPU → KV → 1 decode GPU');
+      // axis
+      for (let t = 0; t <= T_END; t += 400) text(svg, sx(t), H - 6, `${t} ms`, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      s('line', { x1: sx(now), y1: 20, x2: sx(now), y2: H - 18, stroke: C.accent, 'stroke-width': 1.5, opacity: 0.8 }, svg);
+    }
+
+    upd();
+    if (reducedMotion()) now = T_END;
+    const loop = rafLoop(root, (dt) => { now = Math.min(T_END, now + dt * 520); draw(); });
+    draw();
+  });
+</script>

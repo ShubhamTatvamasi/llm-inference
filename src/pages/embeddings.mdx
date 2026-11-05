@@ -1,0 +1,104 @@
+---
+layout: ../layouts/Chapter.astro
+title: Embeddings & Positions
+description: How a token ID becomes a vector the network can compute with, and how rotary position embeddings (RoPE) tell attention where each token sits.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import EmbLookup from '../components/viz/EmbLookup.astro';
+import EmbRoPE from '../components/viz/EmbRoPE.astro';
+
+After [tokenization](../tokenization/) the prompt is a list of integers, but a neural network needs vectors. The first layer of every LLM is therefore a **lookup table**: the **embedding matrix** $E$, with one learned row of $d_\text{model}$ numbers per vocabulary entry.
+
+## A lookup, not a multiplication
+
+Embedding a token means **reading row number `id`** from $E$. Mathematically that equals multiplying a one-hot vector by $E$, but no engine does it that way. It is a gather: copy the row out of memory.
+
+<Viz title="Token IDs select rows of the embedding matrix" label="Live">
+  <EmbLookup />
+  <Fragment slot="caption">
+    <p>Each token copies one row of <i>E</i>. Stacking those rows gives the matrix <i>X</i> of shape <code>[n_tokens × d_model]</code>, which flows into layer 1. Change the model to see how big the table is.</p>
+  </Fragment>
+</Viz>
+
+For Llama 3.1 8B the table is $128{,}256 \times 4{,}096 \approx 525\text{M}$ parameters, about **1 GB in BF16** and around 6.5% of the model. The memory is large, but the compute is tiny: each step reads only the few rows it needs.
+
+### The other end: the LM head
+
+At the very top of the network the opposite happens. The final hidden vector (size $d_\text{model}$) is multiplied by an **LM head** matrix of shape $d_\text{model} \times \text{vocab}$. That produces one score (a **logit**) for every token in the vocabulary, which [sampling](../sampling/) turns into the next token.
+
+Unlike the lookup, the LM head is a real matrix multiplication, and a big one: $2 \times 4096 \times 128{,}256 \approx 1$ GFLOP per generated token. Some models **tie** the two matrices, reusing $E^\top$ as the LM head to save memory. That is common in small models (for example Llama 3.2 1B/3B), while larger models usually keep them separate.
+
+<Callout type="note">
+Large vocabularies shorten sequences (good for every serving metric) but make the embedding table and LM head bigger. For a small model, the LM head can be a noticeable fraction of each decode step's time.
+</Callout>
+
+## Why position must be added
+
+Attention, covered in the [next chapter](../attention/), compares every token with every other token using dot products. On its own that operation is **order-blind**: shuffle the input tokens and each token gets the same set of scores, just permuted. "Dog bites man" and "man bites dog" would look identical.
+
+So the model needs position information. Three families have been used:
+
+| Scheme | How position enters | Used by |
+|---|---|---|
+| Learned absolute | add a learned vector per position $p$ | GPT-2, BERT |
+| Sinusoidal absolute | add fixed sin/cos waves | original Transformer |
+| **Rotary (RoPE)** | **rotate** q and k by an angle proportional to $p$ | Llama, Qwen, Mistral, DeepSeek, most modern LLMs |
+
+## RoPE: position as rotation
+
+RoPE splits each query and key vector (per head, $d_\text{head}=128$) into **64 pairs** of numbers and treats each pair as a 2-D point. A token at position $m$ has pair $i$ rotated by the angle $m\,\theta_i$, where each pair has its own frequency:
+
+$$
+\theta_i = \text{base}^{-2i/d_\text{head}}, \qquad i = 0, 1, \dots, \tfrac{d_\text{head}}{2}-1
+$$
+
+The key property is that the dot product of two rotated vectors depends only on the **difference** of their angles:
+
+$$
+\langle R_{m\theta}\, q,\; R_{n\theta}\, k \rangle = \langle q,\; R_{(n-m)\theta}\, k \rangle
+$$
+
+So the attention score between a query at position $m$ and a key at position $n$ depends on **how far apart they are**, not where they are. Try it:
+
+<Viz title="RoPE: rotate by position, compare by distance" label="Interactive">
+  <EmbRoPE />
+  <Fragment slot="caption">
+    <p>Four of the 64 rotation pairs, from fastest (pair 0, one turn every ~6 tokens) to slowest. The violet arrow is the query at position <i>m</i>; the green arrow is the key at position <i>n</i>. Shifting both positions spins the arrows but leaves the amber angle, and the score, unchanged.</p>
+  </Fragment>
+</Viz>
+
+The spread of frequencies acts like the hands of a clock. Fast pairs distinguish neighbouring tokens; slow pairs (wavelengths of thousands of tokens, or more with a large base) keep track of long-range position.
+
+## What this means for serving
+
+- **RoPE is applied before caching.** The keys stored in the [KV cache](../kv-cache/) are already rotated for their positions. A cached block can therefore only be reused at **the same positions**. [Prefix caching](../prefix-caching/) works because shared prefixes always start at position 0.
+- **Context extension is a RoPE trick.** Raising the base (Llama 3 uses 500,000), or rescaling the frequencies with methods such as NTK-aware scaling or YaRN, lets a model run at longer contexts than it was mostly trained on. Engines expose this through a `rope_scaling` setting in the model config. Setting `max_model_len` beyond what the model was trained or scaled for gives garbage, not errors.
+- **Positions are just integers per token.** That is what lets engines pack tokens from many requests into one flat batch: each token carries its own position ID, and each request's RoPE angles come out correct. [Continuous batching](../batching/) depends on this.
+
+<Callout type="tip" title="Intuition">
+Absolute embeddings tell a token "you are #812". RoPE instead lets every pair of tokens feel "we are 5 apart", which is the information attention actually needs.
+</Callout>
+
+<Interview>
+  <Q q="How is a token ID turned into a vector, and is that step expensive?" level="core">
+    The ID indexes one row of the embedding matrix (vocab × d_model), which is a memory gather, not a matrix multiply. The table is large (about 1 GB for Llama 3.1 8B in BF16), but each step reads only the rows for its tokens, so the compute is negligible.
+  </Q>
+  <Q q="What are tied embeddings?" level="core">
+    Reusing the input embedding matrix (transposed) as the LM head that produces logits. It saves vocab × d_model parameters. Small models often tie them; large models usually keep them separate.
+  </Q>
+  <Q q="Why does a transformer need positional information at all?" level="core">
+    Attention compares tokens with dot products and sums the results, and that operation is permutation-invariant. Without position information the model could not tell word order apart.
+  </Q>
+  <Q q="Explain RoPE in two sentences. Why is it 'relative'?" level="mid">
+    RoPE rotates each 2-D pair of the query and key vectors by an angle equal to position × a per-pair frequency. Because the dot product of two rotated vectors depends only on the angle between them, the score depends on the distance between the two positions, not on where they sit.
+  </Q>
+  <Q q="Can a cached KV block for a prefix be reused at a different position in another prompt?" level="senior">
+    Not directly. The cached keys have RoPE rotation for their original positions baked in, so they are only valid at the same positions. That is why prefix caching matches prefixes from position 0. Reusing KV at shifted positions needs re-rotation tricks and is not standard.
+  </Q>
+  <Q q="A team sets max_model_len to 4× the model's trained context and sees garbage output. Why?" level="senior">
+    RoPE angles at positions far beyond training are out of distribution, and attention breaks down. Extending context needs RoPE scaling (a larger base, NTK-aware scaling or YaRN), ideally with fine-tuning, configured to match the model. The engine will happily run the longer context without any error.
+  </Q>
+</Interview>

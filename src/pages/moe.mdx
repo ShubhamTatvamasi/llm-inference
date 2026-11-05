@@ -1,0 +1,113 @@
+---
+layout: ../layouts/Chapter.astro
+title: Mixture of Experts
+description: How MoE models get the quality of a huge model at the per-token compute of a small one, and the routing, imbalance and all-to-all communication problems that come with it.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import MoeRouter from '../components/viz/MoeRouter.astro';
+import MoeLoad from '../components/viz/MoeLoad.astro';
+import MoeEP from '../components/viz/MoeEP.astro';
+import MoeCalc from '../components/viz/MoeCalc.astro';
+
+In a dense transformer, every token passes through every weight. A **Mixture-of-Experts (MoE)** model replaces each MLP with **many smaller MLPs**, called experts, plus a tiny **router** that sends each token to only a few of them. DeepSeek-V3 has 671B parameters, but each token uses about **37B**. Qwen3-30B-A3B has 30B parameters and uses about **3B** per token.
+
+That gives an unusual cost profile: **memory scales with total parameters, compute scales with active parameters.** Everything in this chapter follows from that split.
+
+## The router
+
+Inside each MoE layer, the router is one small linear layer. It scores the token's hidden vector against every expert, applies a softmax, and keeps the **top-k**:
+
+$$
+g = \mathrm{softmax}(x\,W_\text{gate}), \qquad y = \sum_{e \,\in\, \text{top-}k(g)} \tilde g_e \; \mathrm{Expert}_e(x)
+$$
+
+where $\tilde g$ are the selected gate values, renormalised to sum to one. Attention layers stay dense and are shared by all tokens. Only the MLP part is "mixed".
+
+<Viz title="Router: top-k experts per token" label="Live">
+  <MoeRouter />
+  <Fragment slot="caption">
+    <p>Expert "specialities" are labelled here to make routing easy to follow. Real experts specialise in patterns that are much less human-readable. Note the load column: even after 12 tokens, a few experts already do most of the work.</p>
+  </Fragment>
+</Viz>
+
+Many modern MoEs (the DeepSeek family, for example) add one or more **shared experts** that every token always visits. Common knowledge goes there, and the routed experts can specialise. Models also use many **fine-grained** experts (128–256 small ones, top-8) instead of a few big ones (8 experts, top-2), which gives the router more combinations to choose from.
+
+## Load imbalance
+
+The router is learned, and nothing forces it to spread tokens evenly at inference time. Training adds balancing losses or bias terms, but real traffic still produces **hot experts**. A batch of code questions hammers the "code" experts. Two policies deal with this:
+
+- **Capacity limit.** Each expert accepts at most *capacity factor × ideal* tokens, and the overflow is **dropped**: it skips that expert and continues on the residual path. This was common in training and is rare in modern inference.
+- **Dropless.** Every token is processed. Then the step takes as long as the **busiest** expert, and every other GPU waits for it.
+
+<Viz title="Tokens per expert in one batch" label="Explore">
+  <MoeLoad />
+  <Fragment slot="caption">
+    <p>Raise <b>router imbalance</b> to model skewed traffic. Increasing the capacity factor cuts drops but reserves more buffer space. For dropless serving, the efficiency number shows how much expert compute is useful while everyone waits for the straggler.</p>
+  </Fragment>
+</Viz>
+
+## Expert parallelism and all-to-all
+
+A 671B MoE doesn't fit on one GPU, and splitting each expert with [tensor parallelism](../parallelism/) wastes effort on tiny matrices. **Expert parallelism (EP)** puts **whole experts** on different GPUs instead. Every MoE layer then needs two collective exchanges:
+
+1. **Dispatch:** each GPU sends each token to the GPUs that own its chosen experts.
+2. **Combine:** results come back to the token's home GPU and are weighted by the gate.
+
+Both are **all-to-all** operations: every GPU sends a different amount of data to every other GPU, and they happen in every MoE layer.
+
+<Viz title="Expert parallelism: dispatch → compute → combine" label="Live">
+  <MoeEP />
+  <Fragment slot="caption">
+    <p>Four GPUs host two experts each. Tokens keep their home-GPU colour so you can see how far they travel. Load imbalance across experts becomes imbalance across <b>GPUs</b>, and a "hot" GPU sets the pace for the whole layer.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key" title="Large-scale MoE layout: wide-EP + attention DP">
+Large deployments typically run attention with **data parallelism**: each GPU handles its own requests and its own KV cache, avoiding redundant KV copies, especially with MLA. They run the MoE layers with **wide expert parallelism** across many GPUs, sometimes 32–64 or more. Spreading the experts means each GPU holds only a few. Every step then reads far fewer weight bytes per GPU, and many GPUs' bandwidth is combined. Engines also add **redundant copies of hot experts** and **overlap** the all-to-all with compute (for example, two micro-batches ping-ponging) to hide communication.
+</Callout>
+
+## Memory vs compute, quantified
+
+<Viz title="Total vs active parameters, and experts touched per step" label="Calculator">
+  <MoeCalc />
+  <Fragment slot="caption">
+    <p>"Experts touched" assumes uniform routing: fraction ≈ 1 − (1 − k/E)<sup>batch</sup>. At batch 1 an MoE decodes like a small model. At large batches nearly every expert is read every step, so a single replica's decode becomes as bandwidth-hungry as a dense model of the <b>total</b> size, while FLOPs per token stay small.</p>
+  </Fragment>
+</Viz>
+
+What this means for serving:
+
+| Property | Dense 70B | MoE 30B-A3B | MoE 671B-A37B |
+|---|---|---|---|
+| Weight memory (BF16) | ~141 GB | ~61 GB | ~1.3 TB (≈ 671 GB in FP8) |
+| FLOPs per token | ~141 GFLOP | ~7 GFLOP | ~74 GFLOP |
+| Small-batch decode speed | slow (reads all weights) | very fast (reads ~3B) | fast per token; needs many GPUs |
+| Best layout | TP 4–8 | single GPU, or TP 2 | wide EP + attention DP, multi-node |
+
+<Callout type="warn">
+MoE quantization needs care. Experts that see few calibration tokens can be **under-calibrated**, so check quality on routes that hit rare experts. Router gates are usually kept at higher precision.
+</Callout>
+
+<Interview>
+  <Q q="What is the difference between total and active parameters, and which drives memory vs compute?" level="core">
+    Total parameters are all the weights, including every expert, and they all have to sit in GPU memory. Active parameters are the weights a single token actually uses (attention plus its top-k experts), and they determine FLOPs per token. A 30B-A3B model therefore needs 30B worth of memory but does about 3B worth of compute per token.
+  </Q>
+  <Q q="How does a top-k router work?" level="core">
+    A linear layer maps the hidden state to one logit per expert, followed by a softmax. The k highest experts are selected, their gate values are renormalised, and the token's output is the gate-weighted sum of those experts' outputs. Unselected experts do no computation for that token.
+  </Q>
+  <Q q="Why does batch size change MoE decode economics?" level="mid">
+    At batch 1, only k experts per layer are read, so decode is cheap in bytes. As the batch grows, the union of experts selected by all tokens approaches all experts, so each step streams nearly the whole model from memory. Per-token FLOPs stay small, but the bandwidth cost per step grows. That's why large MoEs spread experts over many GPUs.
+  </Q>
+  <Q q="What communication does expert parallelism need, and what are its risks?" level="mid">
+    Two all-to-all exchanges per MoE layer: dispatch, sending tokens to the GPUs that own their experts, and combine, sending results back. The risks are load imbalance (a hot expert makes its GPU the straggler), variable message sizes, and interconnect bandwidth and latency, especially across nodes. Mitigations include redundant hot experts, load-aware placement, and overlapping communication with compute.
+  </Q>
+  <Q q="What are capacity factor and token dropping, and why do inference engines avoid dropping?" level="senior">
+    A capacity factor sets a per-expert limit of factor × (T·k/E) tokens, and the overflow is dropped onto the residual path. This keeps buffer shapes static, which suited training. In inference, dropping changes outputs depending on what else is in the batch, which hurts quality and determinism. Engines therefore run **dropless** with grouped GEMMs and accept straggler effects.
+  </Q>
+  <Q q="Why combine attention data parallelism with expert parallelism for very large MoEs?" level="senior">
+    Splitting attention with TP would replicate or fragment the KV cache, and MLA's latent cache doesn't split well across heads. Running attention with DP, so each GPU owns its own requests and KV, avoids that redundancy. The MoE layers then use wide EP across all those GPUs, so each GPU holds only a few experts and the cluster's combined bandwidth serves the expert reads.
+  </Q>
+</Interview>

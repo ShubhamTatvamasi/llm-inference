@@ -1,0 +1,110 @@
+---
+layout: ../layouts/Chapter.astro
+title: Batching
+description: Why serving many users at once is almost free on a GPU, and how continuous (iteration-level) batching keeps every batch slot busy.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import BatchingScale from '../components/viz/BatchingScale.astro';
+import BatchingSim from '../components/viz/BatchingSim.astro';
+import BatchingWaste from '../components/viz/BatchingWaste.astro';
+
+A single decode step for a single user is a terrible use of a GPU. To produce **one** token the GPU streams **all** of the model's weights out of HBM, which is 16 GB for an 8B model in BF16. The tensor cores then do a few billion multiply-adds, which takes them almost no time, and sit idle.
+
+**Batching** fixes that. If 64 users decode in the same step, the weights are read **once** and reused 64 times. The step takes only a little longer, but it produces 64 tokens instead of one.
+
+## Why batching is (almost) free
+
+During decode, step time is roughly the time to read the bytes the step needs:
+
+$$
+t_\text{step} \approx \frac{\text{weight bytes} + \sum_\text{seqs} \text{KV bytes}}{\text{memory bandwidth}}
+$$
+
+The weight term is **shared** by the whole batch. Only the KV-cache term grows with batch size. As long as the weights dominate, adding sequences barely changes step time, so throughput grows almost linearly.
+
+<Viz title="Throughput vs per-user speed as the batch grows" label="Explore">
+  <BatchingScale />
+  <Fragment slot="caption">
+    <p>Left: tokens per second summed over all users. Right: the speed one user sees. Small batches give users fast tokens but waste the GPU. Larger batches multiply total throughput, while each user slows down only slightly, until either compute saturates or the KV cache stops fitting (hatched). Raise <b>tokens per sequence</b> and the KV term starts to dominate earlier.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key">
+Batching trades a little **per-user latency** for a lot of **total throughput**. Every serving engine is built around making large batches possible: memory managers, schedulers and kernels all exist to fit more sequences into a step.
+</Callout>
+
+## The catch: requests are not the same length
+
+Grouping requests is easy. Keeping the group full is hard. One user wants a 5-token answer; another wants a 2,000-token essay. If the batch is **locked** until every member finishes, the short requests leave behind **empty slots** that nobody can use.
+
+There are three strategies:
+
+| Strategy | When does the batch change? | Problem |
+|---|---|---|
+| **Static** | Fixed batch of *B*; waits until *B* requests are queued, runs until **all** finish | Waits to fill; slots idle behind the longest request |
+| **Dynamic** (request-level) | Starts after a short batching window or when full; then **locked** until all finish | Less waiting, same tail-blocking problem |
+| **Continuous** (iteration-level) | Batch is rebuilt **every decode iteration**: finished sequences leave, queued ones join | Needs a scheduler and paged KV memory, but almost no idle slots |
+
+Watch all three on the **same** request stream:
+
+<Viz title="Static vs dynamic vs continuous batching" label="Live">
+  <BatchingSim />
+  <Fragment slot="caption">
+    <p>Each lane is the same GPU with 4 batch slots. Each column is one iteration (one forward pass). A coloured run is one request: amber for its prefill, then its decode tokens. Red hatching is a slot held by a request that already finished, waiting for the rest of its locked batch. Turn up <b>output-length spread</b> and the locked strategies get much worse.</p>
+  </Fragment>
+</Viz>
+
+Continuous batching was introduced as **iteration-level scheduling**: the scheduler decides membership per forward pass, not per request. TensorRT-LLM calls the same idea **in-flight batching**. Today it is the default in vLLM, SGLang, TensorRT-LLM, TGI and llama.cpp's server.
+
+## How much does the tail cost?
+
+In a locked batch every slot is reserved until the **longest** member finishes. The useful fraction of slot-time is
+
+$$
+\text{useful} = \frac{\operatorname{mean}(L_1,\dots,L_B)}{\max(L_1,\dots,L_B)}
+$$
+
+and the expected maximum keeps rising with *B*. The bigger the batch, the more likely it contains one very long request.
+
+<Viz title="Locked batches waste more as batches get bigger" label="Explore">
+  <BatchingWaste />
+  <Fragment slot="caption">
+    <p>Output lengths are drawn from a log-normal distribution, a realistic shape for chat traffic: most answers are short, a few are very long. The median has no effect here; only the <b>spread</b> matters. With realistic spread and batch sizes of 32 or more, a locked batch spends most of its slot-time doing nothing.</p>
+  </Fragment>
+</Viz>
+
+## What continuous batching requires
+
+Rebuilding the batch every iteration sounds simple, but it creates three engineering problems. The next chapters cover each one:
+
+1. **Memory that can grow and shrink per request.** Sequences join and leave at any time and grow by one token per step. Pre-allocating a contiguous max-length buffer per request would waste most of the GPU. → [PagedAttention](../paged-attention/)
+2. **Mixing prefill and decode in one step.** A newcomer needs a prefill, possibly thousands of tokens, while everyone else needs a single decode token. → [Chunked prefill](../chunked-prefill/)
+3. **Deciding who runs when memory is tight.** → [Scheduler & preemption](../scheduler/)
+
+<Callout type="tip" title="How a mixed batch is computed">
+Kernels see a continuous batch as one flattened list of tokens: request A's 1 decode token, B's 1 token, C's 512-token prefill chunk, and so on. The linear layers (QKV, MLP) don't care which request a token belongs to; they just do one big matmul. Only **attention** needs per-request metadata (sequence lengths and block tables) so that each token looks only at its own request's KV cache.
+</Callout>
+
+<Interview>
+  <Q q="Why does increasing batch size raise throughput without proportionally raising latency?" level="core">
+    Decode is memory-bandwidth-bound: each step must read all the weights, whatever the batch size. A batch of *B* sequences shares that one read, so step time grows only by the extra KV-cache reads and the small amount of extra compute. Throughput is about *B* ÷ step time, so it rises almost linearly until compute saturates or KV memory runs out.
+  </Q>
+  <Q q="Explain the difference between static, dynamic and continuous batching." level="core">
+    **Static**: a fixed-size batch that runs until every member finishes. **Dynamic**: batches form from whatever arrives within a short time window, but once started the batch is still locked until all members finish. **Continuous** (iteration-level): batch membership is re-evaluated every forward pass, so a finished sequence's slot goes to a waiting request on the very next iteration.
+  </Q>
+  <Q q="In a locked batch, what fraction of slot-time is wasted, and what drives it?" level="mid">
+    The useful fraction is mean(L) ÷ max(L) over the batch's output lengths. It depends on the **spread** of the length distribution, not its scale, and it gets worse as the batch grows because the expected maximum keeps rising. Heavy-tailed chat traffic with batch sizes of 32 or more often wastes over half the slot-time.
+  </Q>
+  <Q q="Why did continuous batching need a new KV-cache memory manager?" level="mid">
+    With per-iteration joins and leaves, every sequence's KV cache grows independently and is freed at unpredictable times. Contiguous max-length reservations would leave most memory reserved but unused and fragment the rest. Paging the KV cache into fixed blocks, allocated on demand, makes the dynamic batch practical.
+  </Q>
+  <Q q="Your batch size is capped at 256 but you only ever see ~40 running sequences. What could be limiting it?" level="senior">
+    Usually **KV-cache capacity**: long contexts × concurrency exceeds free memory, so the scheduler stops admitting requests or starts preempting. Other causes: <code>max_num_batched_tokens</code> too small to admit new prefills, low arrival rate (Little's law: concurrency = arrival rate × time in system), or a <code>gpu_memory_utilization</code> setting that leaves little room for KV. Check the KV-usage and waiting-queue metrics.
+  </Q>
+  <Q q="Does a bigger batch always give better user experience?" level="senior">
+    No. Past the point where decode becomes compute-bound, or KV reads dominate, each extra sequence slows **every** user's inter-token latency. Bigger batches also mean longer queues for prefill slots, so TTFT rises. The right batch size is the largest one that still meets the latency SLOs. That is what **goodput** measures; see [metrics](../metrics/).
+  </Q>
+</Interview>

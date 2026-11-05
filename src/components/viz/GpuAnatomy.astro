@@ -1,0 +1,145 @@
+---
+/* GPU anatomy + memory hierarchy ladder for a selectable GPU.
+   Click a level (or use the toggle) to highlight where it lives on the chip. */
+---
+<div data-viz="gpu-anatomy"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, select, segmented, legend, C, fmt } from '../../lib/viz';
+  import { GPUS, getGPU } from '../../data/hardware';
+
+  type Level = 'reg' | 'smem' | 'l2' | 'hbm' | 'link' | 'pcie';
+  const W = 940, H = 640;
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+
+  mountAll('gpu-anatomy', (root) => {
+    let gpu = getGPU('h100');
+    let hl: Level = 'hbm';
+
+    const bar = ctrlBar(root);
+    select(bar, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    const seg = segmented(bar, [
+      { value: 'reg', label: 'Registers' }, { value: 'smem', label: 'SMEM / L1' }, { value: 'l2', label: 'L2' },
+      { value: 'hbm', label: 'HBM' }, { value: 'link', label: 'NVLink' }, { value: 'pcie', label: 'PCIe' },
+    ], hl, (v) => { hl = v as Level; render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'GPU anatomy and memory hierarchy' });
+    legend(root, [['Compute (tensor cores)', C.compute], ['On-chip memory', C.kv], ['Off-chip memory (HBM)', C.weight], ['Interconnect', C.comm], ['Host', C.mem]]);
+
+    function levels() {
+      const pcie = gpu.linkGBs <= 64 ? gpu.linkGBs : 64; // PCIe Gen4 ≈32, Gen5 ≈64 GB/s per direction
+      const clk = 1.75e9;
+      const smemBW = gpu.sms * 128 * clk; // bytes/s, ~128 B/clk/SM
+      const regBW = smemBW * 8;            // rough: registers ≫ SMEM
+      return [
+        { id: 'reg' as Level, name: 'Registers', cap: gpu.sms * 256 * 1024, bw: regBW, where: 'inside each SM, next to the ALUs', lat: '~1 cycle', est: true },
+        { id: 'smem' as Level, name: 'Shared mem / L1', cap: gpu.sms * gpu.smemKB * 1024, bw: smemBW, where: 'inside each SM, programmer-managed', lat: '~30 cycles', est: true },
+        { id: 'l2' as Level, name: 'L2 cache', cap: gpu.l2MB * 1024 * 1024, bw: gpu.bwTBs * 1e12 * 2.5, where: 'on-chip, shared by all SMs', lat: '~200 cycles', est: true },
+        { id: 'hbm' as Level, name: 'HBM (VRAM)', cap: gpu.memGB * 1e9, bw: gpu.bwTBs * 1e12, where: 'stacked DRAM next to the die', lat: '~500+ cycles', est: false },
+        { id: 'link' as Level, name: gpu.linkGBs > 64 ? 'NVLink / Infinity Fabric' : 'GPU↔GPU (PCIe)', cap: NaN, bw: gpu.linkGBs * 1e9, where: 'to other GPUs in the server', lat: '~µs', est: false },
+        { id: 'pcie' as Level, name: 'PCIe to host', cap: NaN, bw: pcie * 1e9, where: 'to CPU RAM / NVMe', lat: '~µs', est: false },
+      ];
+    }
+
+    function render() {
+      clear(svg);
+      seg.set(hl);
+      const on = (l: Level) => hl === l;
+      const glow = (l: Level) => (on(l) ? { stroke: C.accent, 'stroke-width': 2.5 } : {});
+
+      // ---------- anatomy ----------
+      // host
+      rect(svg, 10, 40, 140, 200, C.memSoft, { rx: 12, stroke: C.mem, ...(on('pcie') ? { stroke: C.accent, 'stroke-width': 2.5 } : {}) });
+      text(svg, 80, 62, 'Host', { 'text-anchor': 'middle', class: 't-bold' });
+      rect(svg, 28, 80, 104, 54, C.surface2, { rx: 8, stroke: C.border });
+      text(svg, 80, 107, 'CPU', { 'text-anchor': 'middle', class: 't-dim' });
+      rect(svg, 28, 146, 104, 74, C.surface2, { rx: 8, stroke: C.border });
+      text(svg, 80, 172, 'System RAM', { 'text-anchor': 'middle', class: 't-dim t-small' });
+      text(svg, 80, 192, '+ NVMe', { 'text-anchor': 'middle', class: 't-faint t-small' });
+
+      // PCIe link
+      const pcieOn = on('pcie');
+      s('line', { x1: 150, y1: 140, x2: 200, y2: 140, stroke: pcieOn ? C.accent : C.comm, 'stroke-width': pcieOn ? 6 : 4, 'stroke-dasharray': '6 4' }, svg);
+      text(svg, 175, 124, 'PCIe', { 'text-anchor': 'middle', class: 't-small t-dim' });
+
+      // GPU package
+      rect(svg, 200, 20, 590, 330, C.surface2, { rx: 16, stroke: C.borderStrong });
+      text(svg, 216, 40, gpu.name, { class: 't-bold' });
+      text(svg, 774, 40, `${gpu.sms} SMs`, { 'text-anchor': 'end', class: 't-dim t-small t-mono' });
+
+      // SM grid (2 rows × 8)
+      const cols = 8, rows = 2, gx = 216, gy = 54, sw = 68, sh = 92, gap = 4;
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        const x = gx + c * (sw + gap), y = gy + r * (sh + gap);
+        rect(svg, x, y, sw, sh, C.surface, { rx: 7, stroke: C.border });
+        text(svg, x + 6, y + 10, 'SM', { class: 't-faint t-small t-mono' });
+        // tensor cores 2x2
+        for (let i = 0; i < 4; i++) rect(svg, x + 6 + (i % 2) * 29, y + 20 + Math.floor(i / 2) * 18, 26, 15, C.compute, { rx: 3, opacity: 0.85 });
+        // registers
+        rect(svg, x + 6, y + 59, 55, 10, C.kv, { rx: 2, opacity: on('reg') ? 1 : 0.55, ...glow('reg') });
+        // smem
+        rect(svg, x + 6, y + 73, 55, 12, C.kvSoft, { rx: 2, stroke: on('smem') ? C.accent : C.kv, 'stroke-width': on('smem') ? 2.2 : 1 });
+      }
+      text(svg, 216 + cols * (sw + gap) + 2, gy + sh + 2, '…', { class: 't-faint t-big' });
+      // legend inside SM (first tile annotation)
+      text(svg, 216, gy + 2 * (sh + gap) + 8, 'each SM: tensor cores · registers · shared memory (SMEM/L1)', { class: 't-faint t-small' });
+
+      // L2
+      const l2y = 268;
+      rect(svg, 216, l2y, 558, 26, C.kvSoft, { rx: 7, stroke: on('l2') ? C.accent : C.kv, 'stroke-width': on('l2') ? 2.5 : 1 });
+      text(svg, 495, l2y + 13, `L2 cache · ${gpu.l2MB} MB · shared by all SMs`, { 'text-anchor': 'middle', class: 't-small t-bold' });
+
+      // HBM stacks
+      const n = 6, hy = 304, hw = 86;
+      for (let i = 0; i < n; i++) {
+        const x = 216 + i * (hw + 8.4);
+        rect(svg, x, hy, hw, 34, C.weightSoft, { rx: 6, stroke: on('hbm') ? C.accent : C.weight, 'stroke-width': on('hbm') ? 2.5 : 1 });
+        text(svg, x + hw / 2, hy + 17, 'HBM', { 'text-anchor': 'middle', class: 't-small t-bold', ...fillStyle(C.weight) });
+      }
+      // vertical data paths
+      for (const x of [300, 495, 690]) {
+        s('line', { x1: x, y1: l2y + 26, x2: x, y2: hy, stroke: on('hbm') || on('l2') ? C.accent : C.border, 'stroke-width': 2 }, svg);
+        s('line', { x1: x, y1: gy + 2 * (sh + gap) + 18, x2: x, y2: l2y, stroke: on('l2') || on('smem') ? C.accent : C.border, 'stroke-width': 2 }, svg);
+      }
+
+      // NVLink to other GPUs
+      const linkOn = on('link');
+      for (let i = 0; i < 3; i++) {
+        const y = 60 + i * 96;
+        rect(svg, 830, y, 100, 72, C.surface2, { rx: 10, stroke: C.border });
+        text(svg, 880, y + 36, `GPU ${i + 1}`, { 'text-anchor': 'middle', class: 't-dim t-small' });
+        s('line', { x1: 790, y1: 140 + (i - 1) * 50, x2: 830, y2: y + 36, stroke: linkOn ? C.accent : C.comm, 'stroke-width': linkOn ? 4 : 2.5 }, svg);
+      }
+      text(svg, 810, 330, gpu.linkGBs > 64 ? 'NVLink' : 'PCIe', { 'text-anchor': 'middle', class: 't-small t-dim' });
+
+      // ---------- ladder ----------
+      const L = levels();
+      const ly = 378, rowH = 40;
+      text(svg, 10, ly, 'Level', { class: 't-faint t-small t-bold' });
+      text(svg, 190, ly, 'Capacity (log scale)', { class: 't-faint t-small t-bold' });
+      text(svg, 560, ly, 'Bandwidth (log scale)', { class: 't-faint t-small t-bold' });
+      const capX = (b: number) => (Math.log10(b) - 6) / (12 - 6) * 300; // 1 MB … 1 TB
+      const bwX = (b: number) => (Math.log10(b) - 10) / (15 - 10) * 300; // 10 GB/s … 1 PB/s
+      L.forEach((lv, i) => {
+        const y = ly + 18 + i * rowH;
+        const sel = lv.id === hl;
+        const row = rect(svg, 4, y - 4, W - 8, rowH - 6, sel ? C.accentSoft : 'transparent', { rx: 8, style: 'cursor:pointer' });
+        row.addEventListener('click', () => { hl = lv.id; render(); });
+        const col = lv.id === 'hbm' ? C.weight : lv.id === 'link' || lv.id === 'pcie' ? C.comm : C.kv;
+        text(svg, 14, y + 10, lv.name, { class: 't-bold', style: 'pointer-events:none' });
+        text(svg, 14, y + 25, lv.where, { class: 't-faint t-small', style: 'pointer-events:none' });
+        if (!Number.isNaN(lv.cap)) {
+          rect(svg, 190, y + 4, Math.max(4, capX(lv.cap)), 14, col, { rx: 4, opacity: 0.85, style: 'pointer-events:none' });
+          text(svg, 196 + Math.max(4, capX(lv.cap)), y + 11, (lv.est ? '≈ ' : '') + (lv.cap >= 1e9 ? `${fmt.num(lv.cap / 1e9, 0)} GB` : fmt.bytes(lv.cap, 0)), { class: 't-small t-mono', style: 'pointer-events:none' });
+        } else {
+          text(svg, 190, y + 11, '— (a link, not storage)', { class: 't-faint t-small', style: 'pointer-events:none' });
+        }
+        rect(svg, 560, y + 4, Math.max(4, bwX(lv.bw)), 14, col, { rx: 4, opacity: 0.85, style: 'pointer-events:none' });
+        const bwStr = lv.bw >= 1e12 ? `${(lv.bw / 1e12).toFixed(lv.bw >= 1e13 ? 0 : 2)} TB/s` : `${fmt.num(lv.bw / 1e9, 0)} GB/s`;
+        text(svg, 566 + Math.max(4, bwX(lv.bw)), y + 11, (lv.est ? '≈ ' : '') + bwStr, { class: 't-small t-mono', style: 'pointer-events:none' });
+        text(svg, W - 14, y + 25, lv.lat, { 'text-anchor': 'end', class: 't-faint t-small t-mono', style: 'pointer-events:none' });
+      });
+    }
+    render();
+  });
+</script>

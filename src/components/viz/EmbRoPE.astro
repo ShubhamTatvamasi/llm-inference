@@ -1,0 +1,73 @@
+---
+/* RoPE: each pair of dimensions is rotated by position × frequency.
+   The q·k score depends only on the DISTANCE between positions. */
+---
+<div data-viz="emb-rope"></div>
+
+<script>
+  import { mountAll, svgRoot, s, text, clear, ctrlBar, slider, select, button, stats, narration, C, fmt } from '../../lib/viz';
+
+  const D = 128; // head dim → 64 rotation pairs
+  const PAIRS = [0, 12, 28, 48]; // fast → slow frequencies
+  const W = 940, H = 300, R = 78;
+  // fixed (pre-rotation) q and k pair values for each shown pair
+  const Q0 = [[1, 0.25], [0.8, 0.6], [0.3, 1], [0.9, -0.4]];
+  const K0 = [[0.7, 0.7], [1, -0.1], [0.6, 0.8], [0.2, 1]];
+
+  const rot = ([x, y]: number[], a: number) => [x * Math.cos(a) - y * Math.sin(a), x * Math.sin(a) + y * Math.cos(a)];
+
+  mountAll('emb-rope', (root) => {
+    let m = 12, n = 5, base = 10000;
+    const bar = ctrlBar(root);
+    const sm = slider(bar, { label: 'Query position m', min: 0, max: 200, value: m, onInput: (v) => { m = v; render(); } });
+    const sn = slider(bar, { label: 'Key position n', min: 0, max: 200, value: n, onInput: (v) => { n = v; render(); } });
+    const bar2 = ctrlBar(root);
+    select(bar2, 'RoPE base θ', [{ value: '10000', label: '10,000 (Llama 2)' }, { value: '500000', label: '500,000 (Llama 3)' }, { value: '1000000', label: '1,000,000 (Qwen3)' }], '10000', (v) => { base = Number(v); render(); });
+    button(bar2, 'Shift both by +25', () => { const d = Math.min(25, 200 - Math.max(m, n)); m += d; n += d; sm.set(m, false); sn.set(n, false); render(); });
+    button(bar2, 'Shift both by −25', () => { const d = Math.min(25, Math.min(m, n)); m -= d; n -= d; sm.set(m, false); sn.set(n, false); render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Rotation of query and key vectors in four frequency bands' });
+    const say = narration(root);
+    const st = stats(root, ['Distance m − n', 'Score q·k (4 shown pairs)', 'Fastest wavelength', 'Slowest wavelength']);
+
+    function render() {
+      clear(svg);
+      let dot = 0;
+      PAIRS.forEach((p, idx) => {
+        const theta = Math.pow(base, (-2 * p) / D);
+        const cx = 120 + idx * 233, cy = 150;
+        s('circle', { cx, cy, r: R, fill: C.surface2, stroke: C.border }, svg);
+        s('line', { x1: cx - R, y1: cy, x2: cx + R, y2: cy, stroke: C.border }, svg);
+        s('line', { x1: cx, y1: cy - R, x2: cx, y2: cy + R, stroke: C.border }, svg);
+        const q = rot(Q0[idx], m * theta), k = rot(K0[idx], n * theta);
+        dot += q[0] * k[0] + q[1] * k[1];
+        const scale = R * 0.85;
+        const arrowTo = (v: number[], color: string, lbl: string) => {
+          const x = cx + v[0] * scale / 1.1, y = cy - v[1] * scale / 1.1;
+          s('line', { x1: cx, y1: cy, x2: x, y2: y, stroke: color, 'stroke-width': 3, 'stroke-linecap': 'round' }, svg);
+          s('circle', { cx: x, cy: y, r: 5, fill: color }, svg);
+          text(svg, x + (v[0] >= 0 ? 8 : -8), y, lbl, { 'text-anchor': v[0] >= 0 ? 'start' : 'end', class: 't-small t-bold', style: `fill:${color}` });
+        };
+        // angle arc between them
+        const aq = Math.atan2(q[1], q[0]), ak = Math.atan2(k[1], k[0]);
+        let diff = aq - ak; while (diff > Math.PI) diff -= 2 * Math.PI; while (diff < -Math.PI) diff += 2 * Math.PI;
+        const r2 = 26;
+        const x1 = cx + r2 * Math.cos(ak), y1 = cy - r2 * Math.sin(ak), x2 = cx + r2 * Math.cos(aq), y2 = cy - r2 * Math.sin(aq);
+        s('path', { d: `M${x1},${y1} A${r2},${r2} 0 0 ${diff > 0 ? 0 : 1} ${x2},${y2}`, fill: 'none', stroke: C.prefill, 'stroke-width': 2 }, svg);
+        arrowTo(k, C.kv, 'k'); arrowTo(q, C.token, 'q');
+        const wl = (2 * Math.PI) / theta;
+        text(svg, cx, 28, `pair ${p} of 64`, { 'text-anchor': 'middle', class: 't-bold t-small' });
+        text(svg, cx, 46, `θ = ${theta < 0.01 ? theta.toExponential(1) : theta.toFixed(3)} rad/token`, { 'text-anchor': 'middle', class: 't-dim t-small t-mono' });
+        text(svg, cx, H - 32, `angle between: ${((diff * 180) / Math.PI).toFixed(0)}°`, { 'text-anchor': 'middle', class: 't-small t-bold', style: `fill:${C.prefill}` });
+        text(svg, cx, H - 14, `wavelength ≈ ${fmt.num(wl, wl < 100 ? 1 : 0)} tokens`, { 'text-anchor': 'middle', class: 't-faint t-small' });
+      });
+      const fast = 2 * Math.PI / Math.pow(base, 0), slow = 2 * Math.PI / Math.pow(base, (-2 * 63) / D);
+      st.set('Distance m − n', String(m - n), `m = ${m}, n = ${n}`);
+      st.set('Score q·k (4 shown pairs)', dot.toFixed(3), 'changes only when the distance changes', C.prefill);
+      st.set('Fastest wavelength', `${fast.toFixed(1)} tok`, 'pair 0: tracks local order');
+      st.set('Slowest wavelength', `${fmt.num(slow, 0)} tok`, 'pair 63: tracks long range');
+      say(`Each pair of dimensions is rotated by <b>position × θ</b>. Press <b>Shift both</b>: q and k both spin, but the <b>angle between them</b> and the score stay the same. Attention sees only the <b>relative distance</b> ${m - n}.`);
+    }
+    render();
+  });
+</script>

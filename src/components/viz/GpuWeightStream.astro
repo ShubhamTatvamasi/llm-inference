@@ -1,0 +1,118 @@
+---
+/* One decode step = stream every layer's weights HBM → L2 → SMs, do a tiny bit of math, repeat.
+   Two lanes (HBM busy vs tensor cores busy) show who is the bottleneck. */
+---
+<div data-viz="gpu-stream"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, select, segmented, stats, narration, C, fmt } from '../../lib/viz';
+  import { GPUS, getGPU, getModel } from '../../data/hardware';
+
+  const W = 940, H = 330, GROUPS = 8;
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+
+  mountAll('gpu-stream', (root) => {
+    const model = getModel('llama3-8b');
+    let gpu = getGPU('h100');
+    let batch = 1;
+    let g = -1; // current layer group
+
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Weights streaming from HBM to the tensor cores, layer by layer' });
+    const dyn = s('g', {}, svg);
+    // persistent moving packet
+    const packet = s('g', { style: 'transition: transform 0.6s cubic-bezier(.4,0,.2,1)' }, svg);
+    rect(packet, 0, 0, 44, 18, C.weight, { rx: 4 });
+    text(packet, 22, 9.5, 'W', { 'text-anchor': 'middle', class: 't-small t-bold', ...fillStyle('var(--bg)') });
+    packet.style.opacity = '0';
+    const say = narration(root);
+    const st = stats(root, ['Time per decode step', 'HBM busy', 'Tensor cores busy', 'Throughput']);
+
+    const groupBytes = () => (model.params * 2) / GROUPS;
+    const memT = () => groupBytes() / (gpu.bwTBs * 1e12);
+    const compT = () => (2 * (model.params / GROUPS) * batch) / (gpu.bf16TF * 1e12);
+    const slotT = () => Math.max(memT(), compT());
+
+    const HBM_X = 20, L2_X = 360, SM_X = 610;
+    const blockY = (i: number) => 40 + i * 24;
+
+    function reset() { g = -1; packet.style.opacity = '0'; }
+    function step() { g++; return g < GROUPS - 1; }
+
+    function movePacket() {
+      if (g < 0) { packet.style.opacity = '0'; return; }
+      packet.style.transition = 'none';
+      packet.setAttribute('transform', `translate(${HBM_X + 130}, ${blockY(g) + 1})`);
+      packet.style.opacity = '1';
+      // force reflow then animate
+      void (packet as unknown as HTMLElement).getBoundingClientRect();
+      packet.style.transition = 'transform 0.55s cubic-bezier(.4,0,.2,1)';
+      requestAnimationFrame(() => packet.setAttribute('transform', `translate(${SM_X + 136}, ${156})`));
+    }
+
+    function render() {
+      clear(dyn);
+      // HBM column
+      rect(dyn, HBM_X - 6, 14, 190, 226, C.weightSoft, { rx: 12, stroke: C.weight });
+      text(dyn, HBM_X + 4, 28, `HBM · ${gpu.memGB} GB · ${gpu.bwTBs} TB/s`, { class: 't-small t-bold' });
+      for (let i = 0; i < GROUPS; i++) {
+        const done = i < g, cur = i === g;
+        rect(dyn, HBM_X + 4, blockY(i), 120, 20, C.weight, { rx: 4, opacity: cur ? 1 : done ? 0.35 : 0.7 });
+        text(dyn, HBM_X + 10, blockY(i) + 10, `layers ${i * 4 + 1}–${i * 4 + 4}`, { class: 't-small', ...fillStyle('var(--bg)') });
+        text(dyn, HBM_X + 132, blockY(i) + 10, fmt.num(groupBytes() / 1e9, 1) + ' GB', { class: 't-small t-mono t-dim' });
+      }
+      // arrows
+      s('path', { d: `M${HBM_X + 186},128 L${L2_X - 6},128`, stroke: C.border, 'stroke-width': 8, 'stroke-linecap': 'round' }, dyn);
+      s('path', { d: `M${L2_X + 130},128 L${SM_X - 6},128`, stroke: C.border, 'stroke-width': 8, 'stroke-linecap': 'round' }, dyn);
+      text(dyn, (HBM_X + 186 + L2_X) / 2, 112, `${gpu.bwTBs} TB/s`, { 'text-anchor': 'middle', class: 't-small t-mono t-dim' });
+      // L2
+      rect(dyn, L2_X, 84, 130, 88, C.kvSoft, { rx: 10, stroke: C.kv });
+      text(dyn, L2_X + 65, 112, 'L2 cache', { 'text-anchor': 'middle', class: 't-bold t-small' });
+      text(dyn, L2_X + 65, 132, `${gpu.l2MB} MB`, { 'text-anchor': 'middle', class: 't-small t-mono t-dim' });
+      text(dyn, L2_X + 65, 150, 'too small to keep', { 'text-anchor': 'middle', class: 't-faint t-small' });
+      text(dyn, L2_X + 65, 163, 'the weights', { 'text-anchor': 'middle', class: 't-faint t-small' });
+      // SMs
+      rect(dyn, SM_X, 14, 316, 226, C.surface2, { rx: 12, stroke: C.borderStrong });
+      text(dyn, SM_X + 10, 28, `${gpu.sms} SMs · ${gpu.bf16TF} TFLOPS BF16`, { class: 't-small t-bold' });
+      const busy = g >= 0 ? compT() / slotT() : 0;
+      for (let i = 0; i < 24; i++) {
+        const x = SM_X + 12 + (i % 8) * 37, y = 42 + Math.floor(i / 8) * 28;
+        rect(dyn, x, y, 32, 22, C.compute, { rx: 4, opacity: g >= 0 && i / 24 < Math.max(busy, 0.04) ? 1 : 0.18 });
+      }
+      text(dyn, SM_X + 158, 140, 'tensor cores', { 'text-anchor': 'middle', class: 't-faint t-small' });
+      text(dyn, SM_X + 158, 200, g < 0 ? '' : busy < 0.2 ? 'mostly idle: waiting for bytes' : busy < 0.95 ? 'partly busy' : 'saturated: compute-bound', { 'text-anchor': 'middle', class: 't-small t-bold', ...fillStyle(busy < 0.2 ? C.waste : busy < 0.95 ? C.prefill : C.good) });
+      text(dyn, SM_X + 158, 220, `batch = ${batch} token${batch > 1 ? 's' : ''} share each weight load`, { 'text-anchor': 'middle', class: 't-faint t-small' });
+
+      // timeline lanes
+      const TX = 130, TW = W - TX - 20, ty = 262;
+      const total = slotT() * GROUPS;
+      text(dyn, 20, ty + 8, 'HBM busy', { class: 't-small t-dim' });
+      text(dyn, 20, ty + 34, 'Tensor cores', { class: 't-small t-dim' });
+      rect(dyn, TX, ty, TW, 16, C.surface3, { rx: 4 });
+      rect(dyn, TX, ty + 26, TW, 16, C.surface3, { rx: 4 });
+      for (let i = 0; i <= g; i++) {
+        const x0 = TX + (i * slotT() / total) * TW;
+        rect(dyn, x0, ty, (memT() / total) * TW - 1, 16, C.weight, { rx: 2 });
+        rect(dyn, x0, ty + 26, Math.max(1.5, (compT() / total) * TW - 1), 16, C.compute, { rx: 2 });
+      }
+      text(dyn, TX + TW, ty + 58, `one decode step ≈ ${fmt.ms(total * 1000)}`, { 'text-anchor': 'end', class: 't-small t-mono t-dim' });
+
+      // stats
+      const memPct = memT() / slotT(), compPct = compT() / slotT();
+      st.set('Time per decode step', fmt.ms(total * 1000), `${model.name}, BF16, ${fmt.num(model.params * 2 / 1e9, 0)} GB of weights`);
+      st.set('HBM busy', fmt.pct(memPct), 'fraction of the step', memPct > 0.9 ? C.weight : undefined);
+      st.set('Tensor cores busy', fmt.pct(compPct, compPct < 0.1 ? 1 : 0), 'fraction of the step', compPct < 0.2 ? C.waste : C.good);
+      st.set('Throughput', `${fmt.num(batch / total, 0)} tok/s`, `${fmt.num(1 / total, 0)} tok/s per sequence`);
+
+      if (g < 0) say('Press <b>Play</b>. One decode step must pass <b>every weight</b> of every layer through the tensor cores, at least once.');
+      else if (g < GROUPS - 1) say(`Streaming <b>layers ${g * 4 + 1}–${g * 4 + 4}</b>: ${fmt.num(groupBytes() / 1e9, 1)} GB crosses the HBM bus (≈${fmt.ms(memT() * 1000)}). The math for ${batch} token${batch > 1 ? 's' : ''} takes only ≈${fmt.ms(compT() * 1000)}.`);
+      else say(batch === 1 ? '<b>Done: one token.</b> The step was limited by <b>bytes moved</b>, not by FLOPs. Now try batch 64 or 256: the same bytes buy many more tokens.' : `<b>Done: ${batch} tokens</b> for the price of one weight read. Batching is the main lever for decode throughput.`);
+      movePacket();
+    }
+
+    player(bar, root, { step, reset, render, interval: 900, autoplay: true });
+    select(bar, 'GPU', GPUS.map((x) => ({ value: x.id, label: x.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    const bseg = segmented(bar, [1, 16, 64, 256, 1024].map((b) => ({ value: String(b), label: `batch ${b}` })), '1', (v) => { batch = Number(v); render(); });
+    void bseg;
+  });
+</script>

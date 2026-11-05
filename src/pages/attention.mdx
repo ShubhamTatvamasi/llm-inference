@@ -1,0 +1,105 @@
+---
+layout: ../layouts/Chapter.astro
+title: Attention
+description: The one operation that lets tokens read from each other. Q·Kᵀ, scaling, the causal mask and softmax, worked through with real numbers, then the head-sharing tricks (GQA, MQA, MLA) that make serving affordable.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import AttnSteps from '../components/viz/AttnSteps.astro';
+import AttnHeads from '../components/viz/AttnHeads.astro';
+import AttnCost from '../components/viz/AttnCost.astro';
+
+Everything else in a transformer layer processes each token **on its own**. Attention is the only place where information moves **between tokens**. It is how "it" finds out which noun it refers to, and how the next token gets to see the whole prompt.
+
+## Queries, keys and values
+
+For every token, the layer projects the incoming hidden vector $x$ into three new vectors with learned weight matrices:
+
+- a **query** $q = W_Q x$: "what am I looking for?"
+- a **key** $k = W_K x$: "what do I contain?"
+- a **value** $v = W_V x$: "what will I hand over if someone attends to me?"
+
+Each token then scores every allowed token by comparing its query to their keys, and takes a weighted average of their values:
+
+$$
+\text{Attention}(Q,K,V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}} + M\right) V
+$$
+
+Here $M$ is the **causal mask**: $0$ where a token is allowed to look and $-\infty$ where it is not. Watch each piece happen on a 5-token example with real numbers:
+
+<Viz title="Scaled dot-product attention, step by step" label="Live">
+  <AttnSteps />
+  <Fragment slot="caption">
+    <p>Rows are queries; columns are keys. Hover any cell to see exactly how it was computed. Notice the masked upper triangle: "The" can see only itself, while "cache" sees all five tokens.</p>
+  </Fragment>
+</Viz>
+
+### Why each step exists
+
+- **Dot product**: a cheap similarity measure. Vectors that point the same way score high.
+- **÷ √d_k**: dot products of random d-dimensional vectors grow like √d. Without scaling, softmax would saturate to a one-hot choice and gradients would vanish.
+- **Causal mask**: during training the model learns to predict token $t$ from tokens $< t$ only. The mask enforces that, and it is also what makes the [KV cache](../kv-cache/) valid: earlier tokens never change because of later ones.
+- **Softmax**: turns arbitrary scores into positive weights that sum to 1 for each row.
+- **× V**: the output for each token is a blend of the values it attended to.
+
+## Many heads
+
+A single attention pattern can capture one kind of relationship. Models therefore run **many heads in parallel**: Llama 3.1 8B uses 32 query heads, each with $d_\text{head}=128$, per layer. Each head has its own slice of $W_Q$, $W_K$, $W_V$ and learns its own pattern. Heads tend to specialise: some track syntax, some copy recent tokens, and some find matching brackets. Their outputs are concatenated and mixed by an output projection $W_O$.
+
+## The serving problem: K and V must be kept
+
+During generation, every new token's query must be compared with the keys of **all previous tokens**, and must read their values. That is why engines keep the [KV cache](../kv-cache/). In classic multi-head attention (MHA), each head caches its own K and V, so the cache grows with the number of heads. Architects therefore found ways to cache less:
+
+<Viz title="How many K/V heads get cached?" label="Interactive">
+  <AttnHeads />
+  <Fragment slot="caption">
+    <p>Same model shape, four attention designs. GQA is today's default for dense models. MLA, used by DeepSeek-V3, goes further by caching one compressed latent per token and rebuilding per-head K and V from it.</p>
+  </Fragment>
+</Viz>
+
+| Variant | K/V heads | Cache size | Quality | Who uses it |
+|---|---|---|---|---|
+| **MHA** | = query heads | largest | baseline | GPT-2, Llama 2 7B |
+| **GQA** | groups (e.g. 8) | 4–16× smaller | ≈ MHA | Llama 3, Qwen3, Mistral |
+| **MQA** | 1 | smallest | some loss | PaLM, Falcon |
+| **MLA** | 1 latent (~576 dims) | very small | ≈ MHA | DeepSeek-V2/V3 |
+
+<Callout type="key">
+Fewer K/V heads means fewer bytes to **store** and fewer bytes to **read** each decode step. Decode speed is limited by memory reads, so GQA makes models both cheaper to hold and faster to run.
+</Callout>
+
+## The quadratic term
+
+Attention compares every query with every key, so for a prompt of $n$ tokens the score computation grows like $n^2$. The weight matmuls grow only like $n$. For short prompts attention is a rounding error; for long ones it dominates:
+
+<Viz title="Where prefill FLOPs go as prompts get longer" label="Interactive">
+  <AttnCost />
+  <Fragment slot="caption">
+    <p>Prefill compute split between weight matrix multiplications (linear in <i>n</i>) and attention (quadratic in <i>n</i>, already halved by the causal mask). A naively materialised n×n score matrix would also need memory that grows quadratically. <a href="../flash-attention/">FlashAttention</a> avoids ever storing it.</p>
+  </Fragment>
+</Viz>
+
+During **decode** the picture is different. A single new query reads $n$ keys, so attention cost per step is linear in context length, but those keys have to be **read from memory**. That is why long-context decode is limited by memory bandwidth spent on the KV cache, as the [roofline](../roofline/) chapter shows.
+
+<Interview>
+  <Q q="Walk through scaled dot-product attention." level="core">
+    Project tokens into Q, K and V. Compute scores QKᵀ, divide by √d_k, add the causal mask (−∞ above the diagonal), and apply softmax per row to get weights. Multiply the weights by V to get each token's output: a weighted mix of the values of tokens it may see.
+  </Q>
+  <Q q="Why divide by √d_k?" level="core">
+    Dot products of d-dimensional vectors have variance that grows with d. Large scores push softmax into saturation (almost one-hot), which hurts gradients during training and makes attention brittle. Dividing by √d_k keeps the scores at unit scale.
+  </Q>
+  <Q q="What does the causal mask do, and why does it matter for inference?" level="core">
+    It stops token t from attending to tokens after t. That matches how the model generates left to right. It also means a token's K and V never change as more tokens arrive, which is exactly why they can be cached and reused.
+  </Q>
+  <Q q="Compare MHA, GQA and MQA from a serving point of view." level="mid">
+    MHA caches K/V for every query head, giving the largest cache and the most bytes read per decode step. MQA caches one K/V head, the smallest cache but with some quality loss. GQA shares each K/V head across a group of query heads (Llama 3: 8 KV heads for 32 or 64 query heads), cutting the cache 4–8× at almost no quality cost. That means more concurrent users and faster decode.
+  </Q>
+  <Q q="How does MLA reduce the KV cache further than GQA?" level="senior">
+    It caches a single low-rank latent vector per token per layer (512 dims plus a small decoupled RoPE key in DeepSeek-V3) instead of per-head K and V. Per-head keys and values are reconstructed with up-projections, which can be folded into the query and output projections at inference time. The cache becomes several times smaller than GQA's for a model of similar size.
+  </Q>
+  <Q q="Prefill vs decode: how does attention's cost scale in each?" level="senior">
+    Prefill computes an n×n score matrix: O(n²) FLOPs, compute-bound, and dominant for long prompts. Each decode step computes one query against n cached keys: O(n) FLOPs but also O(n) bytes read from the KV cache. Decode attention is therefore memory-bandwidth-bound, and its cost grows with context length.
+  </Q>
+</Interview>

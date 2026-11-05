@@ -1,0 +1,94 @@
+---
+/* How much KV memory each allocation scheme wastes, and the block-size trade-off. */
+---
+<div data-viz="paged-blocksize"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, slider, stats, legend, C, fmt, rng, hatchDefs, uniq } from '../../lib/viz';
+
+  const BSIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+  const MAXLENS = [2048, 4096, 8192, 16384, 32768];
+  const N = 2000;
+  const KV_PER_TOK = 128 * 1024; // Llama 3.1 8B, BF16
+  const BUDGET = 40 * 1024 ** 3; // 40 GiB of KV space
+
+  function gauss(r: () => number) { const u = Math.max(1e-9, r()), v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  mountAll('paged-blocksize', (root) => {
+    let bi = 4, mi = 2, median = 700;
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Block size', min: 0, max: BSIZES.length - 1, value: bi, format: (i) => `${BSIZES[i]} tok`, onInput: (i) => { bi = i; render(); } });
+    slider(bar, { label: 'max_model_len', min: 0, max: MAXLENS.length - 1, value: mi, format: (i) => fmt.num(MAXLENS[i], 0), onInput: (i) => { mi = i; render(); } });
+    slider(bar, { label: 'Typical sequence', min: 100, max: 4000, step: 100, value: median, format: (v) => `${v} tok`, onInput: (v) => { median = v; render(); } });
+
+    const W = 940, H = 300;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Memory waste for contiguous versus paged allocation and block size trade-off' });
+    const hatch = hatchDefs(svg, uniq('pbh'), C.waste);
+    const g = s('g', {}, svg);
+    const st = stats(root, ['Contiguous waste', 'Paged waste', 'Seqs in 40 GiB (contig)', 'Seqs in 40 GiB (paged)']);
+    legend(root, [['KV actually used', C.kv], ['Reserved / allocated but empty', C.waste]]);
+
+    function lengths() {
+      const r = rng(3);
+      const maxLen = MAXLENS[mi];
+      return Array.from({ length: N }, () => Math.round(Math.min(maxLen, Math.max(16, median * Math.exp(0.8 * gauss(r))))));
+    }
+
+    function render() {
+      clear(g);
+      const L = lengths();
+      const used = L.reduce((a, b) => a + b, 0);
+      const maxLen = MAXLENS[mi];
+      const contig = N * maxLen;
+      const pagedFor = (B: number) => L.reduce((a, l) => a + Math.ceil(l / B) * B, 0);
+      const paged = pagedFor(BSIZES[bi]);
+
+      // Panel 1: two bars
+      const X0 = 150, X1 = 520;
+      text(g, 0, 14, 'Memory for 2,000 live sequences', { class: 't-small t-bold t-dim' });
+      const rows: [string, number][] = [['Contiguous', contig], [`Paged (${BSIZES[bi]}-tok blocks)`, paged], ['Ideal', used]];
+      const mx = contig;
+      rows.forEach(([name, tot], k) => {
+        const y = 36 + k * 58;
+        text(g, 0, y + 14, name, { class: 't-small t-bold' });
+        text(g, 0, y + 30, fmt.bytes(tot * KV_PER_TOK, 0), { class: 't-small t-mono t-dim' });
+        const wTot = Math.max(2, ((X1 - X0) * tot) / mx);
+        const wUsed = ((X1 - X0) * used) / mx;
+        rect(g, X0, y, wTot, 34, hatch, { rx: 6, stroke: C.waste, 'stroke-width': 1 });
+        rect(g, X0, y, Math.min(wUsed, wTot), 34, C.kv, { rx: 6 });
+        text(g, X0 + wTot + 8, y + 17, `${fmt.pct(1 - used / tot, tot === used ? 0 : 1)} wasted`, { class: 't-small t-mono', fill: tot === used ? C.dim : C.waste });
+      });
+
+      // Panel 2: trade-off curve
+      const PX0 = 640, PX1 = W - 16, PT = 30, PB = H - 50;
+      text(g, PX0 - 30, 14, 'Block-size trade-off', { class: 't-small t-bold t-dim' });
+      const wastes = BSIZES.map((B) => 1 - used / pagedFor(B));
+      const entries = BSIZES.map((B) => L.reduce((a, l) => a + Math.ceil(l / B), 0) / N);
+      const xs = (i: number) => PX0 + (i / (BSIZES.length - 1)) * (PX1 - PX0);
+      const wMax = Math.max(0.05, ...wastes) * 1.1;
+      const eMax = Math.max(...entries);
+      const yw = (v: number) => PB - (v / wMax) * (PB - PT);
+      const ye = (v: number) => PB - (Math.log2(v + 1) / Math.log2(eMax + 1)) * (PB - PT);
+      s('line', { x1: PX0, y1: PB, x2: PX1, y2: PB, stroke: C.borderStrong }, g);
+      let d1 = '', d2 = '';
+      BSIZES.forEach((_, i) => { d1 += `${i ? 'L' : 'M'}${xs(i)},${yw(wastes[i])}`; d2 += `${i ? 'L' : 'M'}${xs(i)},${ye(entries[i])}`; });
+      s('path', { d: d1, fill: 'none', stroke: C.waste, 'stroke-width': 2.4 }, g);
+      s('path', { d: d2, fill: 'none', stroke: C.decode, 'stroke-width': 2.4, 'stroke-dasharray': '5 4' }, g);
+      BSIZES.forEach((B, i) => text(g, xs(i), PB + 14, String(B), { 'text-anchor': 'middle', class: 't-small t-mono' + (i === bi ? ' t-bold' : ' t-faint') }));
+      s('line', { x1: xs(bi), y1: PT - 6, x2: xs(bi), y2: PB, stroke: C.accent, 'stroke-dasharray': '3 3' }, g);
+      s('circle', { cx: xs(bi), cy: yw(wastes[bi]), r: 5, fill: C.waste }, g);
+      s('circle', { cx: xs(bi), cy: ye(entries[bi]), r: 5, fill: C.decode }, g);
+      text(g, PX0, PB + 32, 'tail waste ↑ with block size', { class: 't-small', fill: C.waste });
+      text(g, PX1, PB + 32, 'table entries ↓', { 'text-anchor': 'end', class: 't-small', fill: C.decode });
+      text(g, xs(bi) + 8, PT, `${entries[bi].toFixed(0)} entries/seq`, { class: 't-small t-mono' });
+
+      const fitC = Math.floor(BUDGET / (maxLen * KV_PER_TOK));
+      const fitP = Math.floor(BUDGET / ((paged / N) * KV_PER_TOK));
+      st.set('Contiguous waste', fmt.pct(1 - used / contig), `reserves ${fmt.num(maxLen, 0)} tokens per sequence`, C.waste);
+      st.set('Paged waste', fmt.pct(1 - used / paged, 1), `≤ ${BSIZES[bi] - 1} empty slots per sequence`, C.good);
+      st.set('Seqs in 40 GiB (contig)', fmt.int(fitC), 'Llama 3.1 8B, BF16 KV');
+      st.set('Seqs in 40 GiB (paged)', fmt.int(fitP), `${(fitP / Math.max(1, fitC)).toFixed(1)}× more`, C.good);
+    }
+    render();
+  });
+</script>

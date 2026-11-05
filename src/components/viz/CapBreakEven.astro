@@ -1,0 +1,83 @@
+---
+/* Managed API (pay per token) vs self-hosted (pay per GPU-hour, in whole replicas) across
+   monthly volume. Log-log chart with the break-even point. */
+---
+<div data-viz="cap-breakeven"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, slider, select, stats, legend, narration, C, fmt } from '../../lib/viz';
+  import { money } from './capacityModel';
+
+  const PRICES = [0.1, 0.2, 0.4, 0.6, 1, 1.5, 2, 3, 5, 8, 10, 15, 20];
+  const TPUT = [250, 500, 1000, 2000, 4000, 8000, 16000];
+  const HRS = 730;
+  const W = 940, H = 300, X0 = 70, X1 = 910, Y0 = 34, Y1 = 250;
+  const LX0 = 6, LX1 = 12, LY0 = 0, LY1 = 7; // 1M..1T tokens/month; $1..$10M/month
+
+  mountAll('cap-breakeven', (root) => {
+    const S = { pI: 6, gpuPrice: 2.5, gpus: 1, tI: 3, util: 0.5, ops: 5000 };
+    const b1 = ctrlBar(root);
+    slider(b1, { label: 'Managed API price', min: 0, max: PRICES.length - 1, value: S.pI, format: (i) => `$${PRICES[i]}/M out`, onInput: (i) => { S.pI = i; render(); } });
+    slider(b1, { label: 'Ops overhead', min: 0, max: 40000, step: 1000, value: S.ops, format: (v) => `$${fmt.num(v, 0)}/mo`, onInput: (v) => { S.ops = v; render(); } });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'GPU price', min: 0.5, max: 8, step: 0.25, value: S.gpuPrice, format: (v) => `$${v.toFixed(2)}/h`, onInput: (v) => { S.gpuPrice = v; render(); } });
+    select(b2, 'GPUs / replica', [1, 2, 4, 8].map((n) => ({ value: String(n), label: String(n) })), '1', (v) => { S.gpus = Number(v); render(); });
+    slider(b2, { label: 'Replica throughput', min: 0, max: TPUT.length - 1, value: S.tI, format: (i) => `${fmt.num(TPUT[i], 0)} tok/s`, onInput: (i) => { S.tI = i; render(); } });
+    slider(b2, { label: 'Avg utilisation', min: 0.1, max: 0.9, step: 0.05, value: S.util, format: (v) => `${Math.round(v * 100)}%`, onInput: (v) => { S.util = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Monthly cost of a managed API vs self-hosting as volume grows' });
+    legend(root, [['Managed API (per token)', C.decode], ['Self-hosted (whole replicas + ops)', C.prefill], ['Self-hosting is cheaper', C.kvSoft]]);
+    const st = stats(root, ['Break-even volume', 'Self-hosted $/M at 10B tok/mo', 'Tokens per replica-month']);
+    const say = narration(root);
+
+    const sx = (tok: number) => X0 + ((Math.log10(tok) - LX0) / (LX1 - LX0)) * (X1 - X0);
+    const sy = (usd: number) => Y1 - ((Math.log10(Math.max(10 ** LY0, Math.min(10 ** LY1, usd))) - LY0) / (LY1 - LY0)) * (Y1 - Y0);
+
+    function render() {
+      clear(svg);
+      const price = PRICES[S.pI];
+      const perRep = TPUT[S.tI] * 3600 * HRS * S.util; // output tokens one replica serves per month at this utilisation
+      const managed = (tok: number) => (tok / 1e6) * price;
+      const selfh = (tok: number) => S.ops + Math.max(1, Math.ceil(tok / perRep)) * S.gpus * S.gpuPrice * HRS;
+
+      // grid
+      for (let e = LX0; e <= LX1; e++) {
+        line(svg, sx(10 ** e), Y0, sx(10 ** e), Y1, C.border, { 'stroke-width': 1 });
+        text(svg, sx(10 ** e), Y1 + 16, ['1M', '10M', '100M', '1B', '10B', '100B', '1T'][e - LX0], { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      }
+      for (let e = LY0; e <= LY1; e++) {
+        line(svg, X0, sy(10 ** e), X1, sy(10 ** e), C.border, { 'stroke-width': 1 });
+        text(svg, X0 - 8, sy(10 ** e), ['$1', '$10', '$100', '$1k', '$10k', '$100k', '$1M', '$10M'][e - LY0], { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      }
+      text(svg, (X0 + X1) / 2, Y1 + 36, 'output tokens per month (log)', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      text(svg, X0 - 60, Y0 - 16, 'cost / month (log)', { class: 't-small t-dim' });
+
+      const N = 240; const xs: number[] = [];
+      for (let i = 0; i <= N; i++) xs.push(10 ** (LX0 + (i / N) * (LX1 - LX0)));
+      // shade where self-hosting wins
+      let be = -1;
+      xs.forEach((x, i) => {
+        if (i === N) return;
+        const cheaper = selfh(x) < managed(x);
+        if (cheaper) { rect(svg, sx(x), Y0, sx(xs[i + 1]) - sx(x) + 0.5, Y1 - Y0, C.kvSoft, { rx: 0 }); if (be < 0) be = x; }
+      });
+      s('path', { d: xs.map((x, i) => `${i ? 'L' : 'M'}${sx(x)},${sy(managed(x))}`).join(' '), fill: 'none', stroke: C.decode, 'stroke-width': 2.4 }, svg);
+      s('path', { d: xs.map((x, i) => `${i ? 'L' : 'M'}${sx(x)},${sy(selfh(x))}`).join(' '), fill: 'none', stroke: C.prefill, 'stroke-width': 2.4 }, svg);
+      text(svg, sx(3e6), sy(managed(3e6)) + 14, 'managed API', { class: 't-small t-bold', fill: C.decode });
+      text(svg, sx(3e6), sy(selfh(3e6)) - 12, 'self-hosted', { class: 't-small t-bold', fill: C.prefill });
+      if (be > 0) {
+        s('circle', { cx: sx(be), cy: sy(managed(be)), r: 5, fill: 'none', stroke: C.text, 'stroke-width': 2 }, svg);
+        text(svg, sx(be) + 8, sy(managed(be)) - 12, `break-even ≈ ${fmt.num(be, 1)} tok/mo`, { class: 't-small t-bold' });
+      }
+
+      const at10B = selfh(1e10) / 1e4;
+      st.set('Break-even volume', be > 0 ? `${fmt.num(be, 1)} tok/mo` : 'never (in range)', be > 0 ? `≈ ${fmt.num(be / (30 * 86400), 1)} output tok/s average` : 'managed stays cheaper', be > 0 ? C.kv : C.decode);
+      st.set('Self-hosted $/M at 10B tok/mo', money(at10B), `vs managed $${price}/M`);
+      st.set('Tokens per replica-month', fmt.num(perRep, 1), `${fmt.num(TPUT[S.tI], 0)} tok/s × ${Math.round(S.util * 100)}% × 730 h`);
+      say(be > 0
+        ? `Below the break-even, a managed API wins: you pay only for tokens used, and an idle self-hosted GPU still costs <b>${money(S.gpus * S.gpuPrice * HRS)}/month</b> per replica. Above it, self-hosting wins, <b>if</b> you keep utilisation high. Drop utilisation to 20% and watch the break-even move right.`
+        : `With these inputs the managed API is cheaper at every volume shown. Self-hosting only pays when replicas are busy, GPUs are cheap, or the per-token price is high. Data residency, control or customisation can still justify it.`);
+    }
+    render();
+  });
+</script>

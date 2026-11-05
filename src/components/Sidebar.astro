@@ -1,0 +1,80 @@
+---
+import { chapters, parts } from '../data/chapters';
+import { u, chapterUrl } from '../lib/url';
+interface Props { current?: string }
+const { current } = Astro.props;
+---
+<div class="nav-scrim" data-nav-close></div>
+<nav class="sidebar" aria-label="Chapters">
+  <div class="sb-inner">
+    <a class={`sb-home ${!current ? 'on' : ''}`} href={u()}>
+      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 9.5 10 3.5l7 6V16a1 1 0 0 1-1 1h-3.5v-4.5h-5V17H4a1 1 0 0 1-1-1Z"/></svg>
+      The full lifecycle
+    </a>
+    <div class="sb-progress"><div class="sb-pbar"><i data-progress-fill></i></div><span data-progress-text>0 / {chapters.length} explored</span></div>
+    {parts.map((p) => (
+      <div class="sb-part">
+        <div class="sb-ph"><span class="sb-pn">{p.num}</span>{p.title}</div>
+        <ul>
+          {chapters.filter((c) => c.part === p.id).map((c) => {
+            const n = chapters.indexOf(c) + 1;
+            return (
+              <li>
+                <a href={chapterUrl(c.slug)} class={c.slug === current ? 'on' : ''} data-slug={c.slug} aria-current={c.slug === current ? 'page' : undefined}>
+                  <span class="sb-n">{String(n).padStart(2, '0')}</span>
+                  <span class="sb-t">{c.short}</span>
+                  <span class="sb-dot" aria-hidden="true"></span>
+                </a>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    ))}
+  </div>
+</nav>
+<script>
+  try {
+    const seen = new Set<string>(JSON.parse(localStorage.getItem('tbt-visited') || '[]'));
+    const main = document.querySelector<HTMLElement>('[data-chapter]');
+    if (main?.dataset.chapter) seen.add(main.dataset.chapter);
+    const links = document.querySelectorAll<HTMLElement>('.sidebar [data-slug]');
+    let n = 0;
+    links.forEach((a) => { if (seen.has(a.dataset.slug!)) { a.classList.add('seen'); n++; } });
+    const fill = document.querySelector<HTMLElement>('[data-progress-fill]');
+    const txt = document.querySelector<HTMLElement>('[data-progress-text]');
+    if (fill) fill.style.width = `${(n / links.length) * 100}%`;
+    if (txt) txt.textContent = `${n} / ${links.length} explored`;
+    document.querySelector('.sidebar a.on')?.scrollIntoView({ block: 'center' });
+  } catch {}
+</script>
+<style>
+  .sidebar { position: sticky; top: var(--header-h); height: calc(100vh - var(--header-h)); overflow-y: auto; border-right: 1px solid var(--border); scrollbar-width: thin; scrollbar-color: var(--surface-3) transparent; }
+  .sb-inner { padding: 22px 14px 40px 20px; }
+  .sb-home { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 10px; color: var(--text); font-weight: 600; font-size: 0.9rem; background: none; border: 1px solid var(--border); }
+  .sb-home svg { width: 16px; height: 16px; color: var(--accent); }
+  .sb-home:hover, .sb-home.on { border-color: var(--accent); background: var(--accent-soft); }
+  .sb-progress { display: flex; align-items: center; gap: 10px; margin: 14px 4px 6px; font-size: 0.72rem; color: var(--text-faint); font-family: var(--font-mono); }
+  .sb-pbar { flex: 1; height: 4px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
+  .sb-pbar i { display: block; height: 100%; width: 0; background: var(--accent-grad); border-radius: 4px; transition: width 0.6s; }
+  .sb-part { margin-top: 20px; }
+  .sb-ph { display: flex; align-items: center; gap: 8px; font-size: 0.7rem; font-weight: 650; text-transform: uppercase; letter-spacing: 0.09em; color: var(--text-faint); margin: 0 4px 6px; }
+  .sb-pn { font-family: var(--font-mono); color: var(--accent); font-size: 0.68rem; min-width: 1.6em; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li a { position: relative; display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-radius: 8px; color: var(--text-dim); font-size: 0.88rem; line-height: 1.35; background: none; transition: background 0.15s, color 0.15s; }
+  li a:hover { color: var(--text); background: var(--surface-2); }
+  li a.on { color: var(--text); background: var(--accent-soft); font-weight: 560; }
+  li a.on::before { content: ''; position: absolute; left: -6px; top: 7px; bottom: 7px; width: 2px; border-radius: 2px; background: var(--accent-grad); }
+  .sb-n { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); width: 18px; flex: none; }
+  li a.on .sb-n { color: var(--accent); }
+  .sb-t { flex: 1; }
+  .sb-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
+  li a.seen .sb-dot { background: var(--c-kv); box-shadow: 0 0 8px var(--c-kv); opacity: 0.8; }
+  .nav-scrim { display: none; }
+  @media (max-width: 960px) {
+    .sidebar { position: fixed; z-index: 70; top: 0; left: 0; bottom: 0; height: 100vh; width: min(310px, 86vw); background: var(--surface-solid); transform: translateX(-102%); transition: transform 0.25s cubic-bezier(.2,.8,.2,1); box-shadow: 20px 0 60px rgba(0,0,0,0.4); }
+    :global(body.nav-open) .sidebar { transform: none; }
+    :global(body.nav-open) .nav-scrim { display: block; position: fixed; inset: 0; z-index: 65; background: rgba(4,6,12,0.55); backdrop-filter: blur(3px); }
+    :global(.nav-toggle) { display: grid !important; }
+  }
+</style>

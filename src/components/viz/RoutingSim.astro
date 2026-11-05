@@ -1,0 +1,191 @@
+---
+/* Four replicas, one request trace, four routing policies.
+   Requests share 8 system-prompt prefixes (A–H, Zipf popularity). Each replica's prefix
+   cache holds 3 prefixes (LRU). A cache hit makes prefill ~4× shorter. 1 tick = 100 ms. */
+---
+<div data-viz="routing-sim"></div>
+
+<script>
+  import { mountAll, h, svgRoot, s, rect, text, line, clear, ctrlBar, player, segmented, stats, narration, C, rng, SERIES, arrowDefs, uniq } from '../../lib/viz';
+
+  const NREP = 4, SLOTS = 4, CACHE = 3, NPFX = 8;
+  const LET = 'ABCDEFGH';
+  type Policy = 'rr' | 'lo' | 'hash' | 'pa';
+  interface TReq { id: number; arr: number; pfx: number; miss: number; hit: number; dec: number; }
+  interface Req extends TReq { rep: number; left: number; total: number; phase: 'q' | 'p' | 'd' | 'x'; ttft: number; isHit: boolean; }
+  interface Rep { cache: number[]; run: Req[]; q: Req[]; }
+
+  function makeTrace(n = 420, rate = 0.6, seed = 5): TReq[] {
+    const r = rng(seed); const out: TReq[] = []; let t = 0;
+    const w = Array.from({ length: NPFX }, (_, i) => 1 / Math.pow(i + 1, 0.9)); const ws = w.reduce((a, b) => a + b, 0);
+    for (let i = 0; i < n; i++) {
+      t += -Math.log(1 - r()) / rate;
+      let u = r() * ws, p = 0; while (u > w[p]) { u -= w[p]; p++; }
+      out.push({ id: i, arr: Math.floor(t), pfx: p, miss: 9 + Math.floor(r() * 7), hit: 2 + Math.floor(r() * 2), dec: 4 + Math.floor(Math.pow(r(), 2) * 55) });
+    }
+    return out;
+  }
+
+  function makeSim(trace: TReq[], policy: Policy) {
+    const reps: Rep[] = Array.from({ length: NREP }, () => ({ cache: [], run: [], q: [] }));
+    let tick = 0, ti = 0, rr = 0, hits = 0, served = 0, maxQ = 0;
+    const done: Req[] = [];
+    let last: Req | null = null;
+    const load = (rp: Rep) => rp.q.length + rp.run.length;
+    const affinity = (rp: Rep, p: number) => rp.cache.includes(p) || rp.q.some((x) => x.pfx === p) || rp.run.some((x) => x.pfx === p);
+    function route(req: Req) {
+      if (policy === 'rr') return rr++ % NREP;
+      if (policy === 'hash') return req.pfx % NREP;
+      if (policy === 'lo') { let b = 0; for (let i = 1; i < NREP; i++) if (load(reps[i]) < load(reps[b])) b = i; return b; }
+      let b = 0, bs = Infinity; // prefix-aware: load score minus a bonus for cache affinity
+      for (let i = 0; i < NREP; i++) { const sc = load(reps[i]) - (affinity(reps[i], req.pfx) ? 4 : 0); if (sc < bs) { bs = sc; b = i; } }
+      return b;
+    }
+    function step() {
+      while (ti < trace.length && trace[ti].arr <= tick) {
+        const req: Req = { ...trace[ti++], rep: -1, left: 0, total: 0, phase: 'q', ttft: -1, isHit: false };
+        req.rep = route(req); reps[req.rep].q.push(req); last = req;
+      }
+      for (const rp of reps) {
+        for (const x of rp.run) {
+          x.left--;
+          if (x.left <= 0) {
+            if (x.phase === 'p') { x.phase = 'd'; x.left = x.dec; x.total = x.dec; x.ttft = tick - x.arr; }
+            else { x.phase = 'x'; done.push(x); }
+          }
+        }
+        rp.run = rp.run.filter((x) => x.phase !== 'x');
+        while (rp.run.length < SLOTS && rp.q.length) {
+          const x = rp.q.shift()!; x.phase = 'p';
+          x.isHit = rp.cache.includes(x.pfx);
+          if (x.isHit) { hits++; rp.cache = rp.cache.filter((c) => c !== x.pfx); }
+          rp.cache.unshift(x.pfx); if (rp.cache.length > CACHE) rp.cache.pop();
+          x.left = x.isHit ? x.hit : x.miss; x.total = x.left; served++; rp.run.push(x);
+        }
+        maxQ = Math.max(maxQ, rp.q.length);
+      }
+      tick++;
+    }
+    const finished = () => ti >= trace.length && reps.every((r) => !r.q.length && !r.run.length);
+    return { reps, step, done, finished, get tick() { return tick; }, get hits() { return hits; }, get served() { return served; }, get maxQ() { return maxQ; }, get last() { return last; } };
+  }
+
+  const summarize = (sim: ReturnType<typeof makeSim>) => {
+    const tt = sim.done.map((x) => x.ttft).sort((a, b) => a - b);
+    const mean = tt.length ? tt.reduce((a, b) => a + b, 0) / tt.length : 0;
+    return { hit: sim.served ? sim.hits / sim.served : 0, mean: mean / 10, p95: tt.length ? tt[Math.floor(tt.length * 0.95)] / 10 : 0, maxQ: sim.maxQ };
+  };
+
+  const NAMES: Record<Policy, string> = { rr: 'Round-robin', lo: 'Least outstanding', hash: 'Prefix hash only', pa: 'Prefix-aware + load' };
+  const W = 940, H = 372, ROW = 84, Y0 = 24;
+
+  mountAll('routing-sim', (root) => {
+    const trace = makeTrace();
+    // full-run comparison for the table
+    const full = (Object.keys(NAMES) as Policy[]).map((p) => { const sm = makeSim(trace, p); let guard = 0; while (!sm.finished() && guard++ < 5000) sm.step(); return { p, ...summarize(sm) }; });
+
+    let policy: Policy = 'rr';
+    let sim = makeSim(trace, policy);
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Router sending requests to four replicas with prefix caches and queues' });
+    const say = narration(root);
+    const st = stats(root, ['Prefix-cache hit rate', 'Mean TTFT', 'p95 TTFT', 'Longest queue']);
+    const tbl = h('div', { class: 'rsim-tbl' }, root);
+    const arrowId = uniq('rs-arr');
+
+    function renderTable() {
+      const best = { mean: Math.min(...full.map((f) => f.mean)), hit: Math.max(...full.map((f) => f.hit)) };
+      tbl.innerHTML = `<table><thead><tr><th>Policy (full run, ${trace.length} requests)</th><th>Cache hit</th><th>Mean TTFT</th><th>p95 TTFT</th><th>Longest queue</th></tr></thead><tbody>${full
+        .map((f) => `<tr class="${f.p === policy ? 'on' : ''}"><td>${NAMES[f.p]}</td><td class="${f.hit === best.hit ? 'best' : ''}">${Math.round(f.hit * 100)}%</td><td class="${f.mean === best.mean ? 'best' : ''}">${f.mean.toFixed(1)} s</td><td>${f.p95.toFixed(1)} s</td><td>${f.maxQ}</td></tr>`)
+        .join('')}</tbody></table>`;
+    }
+
+    // start already warm (~8 s into the trace) so the first frame shows a busy cluster
+    function reset() { sim = makeSim(trace, policy); for (let i = 0; i < 80; i++) sim.step(); }
+    function step() { sim.step(); return !sim.finished(); }
+
+    function render() {
+      clear(svg);
+      const arrow = arrowDefs(svg, arrowId, C.accent);
+      // router
+      const RX = 14, RW = 150, RY = Y0 + 2 * ROW - 52;
+      rect(svg, RX, RY, RW, 104, C.accentSoft, { rx: 12, stroke: C.accent });
+      text(svg, RX + RW / 2, RY + 20, 'Router', { 'text-anchor': 'middle', class: 't-bold' });
+      text(svg, RX + RW / 2, RY + 38, NAMES[policy], { 'text-anchor': 'middle', class: 't-small', fill: C.accent });
+      text(svg, RX + RW / 2, RY + 60, `t = ${(sim.tick / 10).toFixed(1)} s`, { 'text-anchor': 'middle', class: 't-small t-mono t-dim' });
+      const last = sim.last;
+      if (last && sim.tick - last.arr < 3) {
+        rect(svg, RX + RW / 2 - 13, RY + 72, 26, 22, SERIES[last.pfx], { rx: 5 });
+        text(svg, RX + RW / 2, RY + 83, LET[last.pfx], { 'text-anchor': 'middle', class: 't-bold', fill: 'var(--bg)' });
+        const ty = Y0 + last.rep * ROW + 34;
+        s('path', { d: `M${RX + RW},${RY + 52} C${RX + RW + 30},${RY + 52} ${RX + RW + 10},${ty} 196,${ty}`, fill: 'none', stroke: C.accent, 'stroke-width': 1.6, 'marker-end': arrow }, svg);
+      }
+
+      sim.reps.forEach((rp, i) => {
+        const y = Y0 + i * ROW;
+        rect(svg, 200, y, W - 206, ROW - 10, C.surface2, { rx: 10, stroke: C.border });
+        text(svg, 214, y + 18, `Replica ${i + 1}`, { class: 't-bold t-small' });
+        text(svg, 214, y + 36, 'prefix cache', { class: 't-faint t-small' });
+        for (let c = 0; c < CACHE; c++) {
+          const p = rp.cache[c];
+          const cx = 214 + c * 26;
+          rect(svg, cx, y + 46, 22, 20, p === undefined ? 'transparent' : SERIES[p], { rx: 5, stroke: p === undefined ? C.border : 'none', 'stroke-dasharray': p === undefined ? '2 2' : null });
+          if (p !== undefined) text(svg, cx + 11, y + 56.5, LET[p], { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+        }
+        // running slots
+        for (let k = 0; k < SLOTS; k++) {
+          const x = 318 + k * 92;
+          const r = rp.run[k];
+          rect(svg, x, y + 10, 84, 54, r ? C.surface3 : 'transparent', { rx: 8, stroke: r ? 'none' : C.border, 'stroke-dasharray': r ? null : '3 3' });
+          if (!r) { text(svg, x + 42, y + 37, 'free', { 'text-anchor': 'middle', class: 't-faint t-small' }); continue; }
+          rect(svg, x, y + 10, 6, 54, SERIES[r.pfx], { rx: 3 });
+          text(svg, x + 14, y + 24, LET[r.pfx], { class: 't-bold' });
+          text(svg, x + 78, y + 24, r.isHit ? '✓ hit' : '✗ miss', { 'text-anchor': 'end', class: 't-small t-bold', fill: r.isHit ? C.good : C.waste });
+          text(svg, x + 14, y + 42, r.phase === 'p' ? 'prefill' : 'decode', { class: 't-small', fill: r.phase === 'p' ? C.prefill : C.decode });
+          const prog = 1 - r.left / Math.max(1, r.total);
+          rect(svg, x + 12, y + 52, 66, 5, C.border, { rx: 2.5 });
+          rect(svg, x + 12, y + 52, 66 * prog, 5, r.phase === 'p' ? C.prefill : C.decode, { rx: 2.5 });
+        }
+        // queue
+        const QX = 696;
+        text(svg, QX, y + 18, `queue: ${rp.q.length}`, { class: 't-small t-bold', fill: rp.q.length > 6 ? C.waste : C.dim });
+        rp.q.slice(0, 26).forEach((x, k) => {
+          const qx = QX + (k % 13) * 17, qy = y + 30 + Math.floor(k / 13) * 18;
+          rect(svg, qx, qy, 14, 14, SERIES[x.pfx], { rx: 3, opacity: 0.9 });
+        });
+        if (rp.q.length > 26) text(svg, W - 12, y + 18, `+${rp.q.length - 26}`, { 'text-anchor': 'end', class: 't-small t-bold', fill: C.waste });
+      });
+      line(svg, 200, H - 14, 200, H - 14, C.border);
+      text(svg, 200, H - 10, 'Colour/letter = which shared prefix (system prompt) the request starts with. Cache hit → prefill ~4× shorter.', { class: 't-small t-faint' });
+
+      const sm = summarize(sim);
+      st.set('Prefix-cache hit rate', `${Math.round(sm.hit * 100)}%`, 'requests that reused a cached prefix', sm.hit > 0.8 ? C.good : undefined);
+      st.set('Mean TTFT', `${sm.mean.toFixed(2)} s`, 'so far');
+      st.set('p95 TTFT', `${sm.p95.toFixed(2)} s`);
+      st.set('Longest queue', `${sm.maxQ}`, 'on any replica so far', sm.maxQ > 10 ? C.waste : undefined);
+
+      const story: Record<Policy, string> = {
+        rr: '<b>Round-robin</b> ignores both load and cache. A replica that drew a few long requests builds a queue, and the shared prefixes scatter, so the hit rate stays near 50%.',
+        lo: '<b>Least outstanding</b> fixes the load imbalance, but stays blind to the cache. Prefixes still scatter, so most prefills are full-length misses.',
+        hash: '<b>Prefix hash only</b> sends each prefix to one replica, so nearly every request hits the cache. But popular prefixes all land on the same replica, which <b>hot-spots</b> and queues badly.',
+        pa: '<b>Prefix-aware + load</b> scores each replica as load minus a cache-affinity bonus. Requests mostly go where their prefix is cached, but spill to idle replicas when that one is busy. The result is a high hit rate <i>and</i> short queues.',
+      };
+      say(story[policy]);
+    }
+
+    player(bar, root, { step, reset, render, interval: 110, autoplay: true, speeds: [1, 2, 4, 8] });
+    segmented(bar, (Object.keys(NAMES) as Policy[]).map((p) => ({ value: p, label: NAMES[p] })), policy, (v) => { policy = v as Policy; reset(); render(); renderTable(); });
+    renderTable();
+  });
+</script>
+
+<style is:global>
+  [data-viz='routing-sim'] .seg { flex-wrap: wrap; }
+  .rsim-tbl { margin-top: 14px; overflow-x: auto; }
+  .viz .rsim-tbl table { display: table; width: 100%; border-collapse: collapse; font-size: 0.84rem; margin: 0; border: 0; background: none; }
+  .rsim-tbl th { text-align: left; font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-faint); font-weight: 600; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  .rsim-tbl td { padding: 6px 10px; border-bottom: 1px solid var(--border); font-family: var(--font-mono); font-size: 0.8rem; }
+  .rsim-tbl td:first-child { font-family: var(--font-sans); font-weight: 560; }
+  .rsim-tbl tr.on td { background: var(--accent-soft); }
+  .rsim-tbl td.best { color: var(--c-good); font-weight: 650; }
+</style>

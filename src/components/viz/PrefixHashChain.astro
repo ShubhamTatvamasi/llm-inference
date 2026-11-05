@@ -1,0 +1,142 @@
+---
+/* Block-level automatic prefix caching: each FULL block is identified by a hash of
+   (parent block hash, its tokens). Lookups walk the chain until the first miss. */
+---
+<div data-viz="prefix-hash"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, stats, legend, narration, C, arrowDefs, uniq } from '../../lib/viz';
+
+  const BS = 4, CAP = 12;
+  const SYS = ['You', 'are', 'Acme', 'Bot', '.', 'Be', 'brief', 'and', 'cite', 'policy', 'when', 'asked'];
+  const R1 = [...SYS, 'How', 'do', 'I', 'reset', 'my', 'password', '?'];
+  const R1_OUT = ['Click', 'Forgot', 'link', '.', 'Done'];
+  const REQS: { name: string; toks: string[]; out?: string[]; note: string }[] = [
+    { name: 'R1 · first user', toks: R1, out: R1_OUT, note: 'Cold cache: every full block is a <b>miss</b> and must be prefilled. Afterwards its full blocks, including the ones filled by the generated answer, are stored under their hashes.' },
+    { name: 'R2 · same system prompt', toks: [...SYS, 'Where', 'is', 'my', 'order', '?'], note: 'The first 3 blocks hash to exactly the same values, so they are <b>hits</b>: their K/V is reused and prefill only runs on the rest.' },
+    { name: 'R3 · timestamp first', toks: ['[10:42]', ...SYS, 'Where', 'is', 'my', 'order', '?'], note: 'One extra token at the <b>start</b> shifts every block boundary, so every hash changes and nothing hits. Put variable content at the <b>end</b> of prompts.' },
+    { name: 'R4 · next chat turn', toks: [...R1, ...R1_OUT, 'And', 'my', 'email', '?'], note: 'Multi-turn chat: the new prompt is the whole previous conversation plus one question. Everything up to the last full block of turn 1, prompt <i>and</i> answer, is a hit.' },
+    { name: 'R5 · different app', toks: ['You', 'are', 'a', 'poet', '.', 'Write', 'only', 'haiku', '.', 'Topic', ':', 'rain', '!'], note: 'Cache is full (12 blocks). New blocks evict the <b>least-recently-used</b> blocks whose ref count is 0. R2’s and R3’s private blocks go first; the hot system-prompt blocks survive.' },
+  ];
+
+  function h4(str: string) {
+    let x = 2166136261;
+    for (let i = 0; i < str.length; i++) { x ^= str.charCodeAt(i); x = Math.imul(x, 16777619); }
+    return ((x >>> 0) & 0xffff).toString(16).padStart(4, '0');
+  }
+  function chain(toks: string[]) {
+    const out: { toks: string[]; hash: string | null }[] = [];
+    let parent = '∅';
+    for (let i = 0; i < toks.length; i += BS) {
+      const b = toks.slice(i, i + BS);
+      if (b.length < BS) { out.push({ toks: b, hash: null }); break; }
+      const hh = h4(parent + '|' + b.join(' '));
+      out.push({ toks: b, hash: hh });
+      parent = hh;
+    }
+    return out;
+  }
+
+  mountAll('prefix-hash', (root) => {
+    let step = -1;
+    let cache: { hash: string; label: string; phys: number; last: number }[] = [];
+    let cur: { toks: string[]; hash: string | null; hit: boolean }[] = [];
+    let evicted: string[] = [];
+    let totHit = 0, totTok = 0;
+    let nextPhys = 0;
+
+    const bar = ctrlBar(root);
+    const W = 940, H = 330;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Prefix cache lookups by chained block hashes' });
+    const arrow = arrowDefs(svg, uniq('pha'), 'var(--text-faint)');
+    const g = s('g', {}, svg);
+    const say = narration(root);
+    const st = stats(root, ['This request', 'Prefill computed', 'Overall hit rate', 'Cache']);
+    legend(root, [['Hit: K/V reused', C.kv], ['Miss: prefill computes it', C.prefill], ['Partial block (never cached)', C.surface3], ['Evicted (LRU)', C.waste]]);
+
+    function reset() { step = -1; cache = []; cur = []; evicted = []; totHit = 0; totTok = 0; nextPhys = 0; }
+    function doStep() {
+      if (step >= REQS.length - 1) return false;
+      step++;
+      evicted = [];
+      const r = REQS[step];
+      const ch = chain(r.toks);
+      let stillHitting = true;
+      cur = ch.map((b) => {
+        const e = b.hash ? cache.find((c) => c.hash === b.hash) : undefined;
+        const hit = !!(stillHitting && e);
+        if (!hit) stillHitting = false;
+        if (e && hit) e.last = step;
+        return { ...b, hit };
+      });
+      const hitTok = cur.filter((b) => b.hit).length * BS;
+      totHit += hitTok; totTok += r.toks.length;
+      // insert new full blocks (prompt + generated output)
+      const all = chain([...r.toks, ...(r.out ?? [])]);
+      for (const b of all) {
+        if (!b.hash || cache.find((c) => c.hash === b.hash)) continue;
+        if (cache.length >= CAP) {
+          const victim = cache.filter((c) => c.last < step).sort((a, b2) => a.last - b2.last)[0];
+          if (victim) { evicted.push(victim.label); cache = cache.filter((c) => c !== victim); }
+        }
+        cache.push({ hash: b.hash, label: b.toks.join(' '), phys: nextPhys++ % 99, last: step });
+      }
+      return step < REQS.length - 1;
+    }
+
+    function render() {
+      clear(g);
+      if (step < 0) {
+        text(g, 20, 40, 'Five requests will arrive one after another. Watch which blocks hit the cache.', { class: 't-dim' });
+        say('Press <b>Play</b>. Each full block of 4 tokens gets a hash that also covers <b>every block before it</b>: h<sub>i</sub> = hash(h<sub>i−1</sub>, tokens<sub>i</sub>).');
+        st.set('This request', '–'); st.set('Prefill computed', '–'); st.set('Overall hit rate', '–'); st.set('Cache', `0 / ${CAP} blocks`);
+        return;
+      }
+      const r = REQS[step];
+      text(g, 20, 12, `Request ${r.name}`, { class: 't-bold' });
+      const n = cur.length;
+      const bw = Math.min(124, (W - 40) / n);
+      cur.forEach((b, i) => {
+        const x = 20 + i * bw;
+        const fill = !b.hash ? C.surface3 : b.hit ? C.kv : C.prefill;
+        rect(g, x, 26, bw - 10, 52, b.hash ? fill : 'transparent', { rx: 8, opacity: b.hash ? 0.9 : 1, stroke: b.hash ? 'none' : C.borderStrong, 'stroke-dasharray': b.hash ? null : '3 3' });
+        const l1 = b.toks.slice(0, 2).join(' '), l2 = b.toks.slice(2).join(' ');
+        const tf = b.hash ? 'var(--bg)' : 'var(--text-dim)';
+        text(g, x + (bw - 10) / 2, 44, l1, { 'text-anchor': 'middle', class: 't-small t-bold', fill: tf });
+        text(g, x + (bw - 10) / 2, 61, l2, { 'text-anchor': 'middle', class: 't-small t-bold', fill: tf });
+        text(g, x + (bw - 10) / 2, 92, b.hash ? `#${b.hash}` : 'partial', { 'text-anchor': 'middle', class: 't-small t-mono' + (b.hash ? '' : ' t-faint') });
+        text(g, x + (bw - 10) / 2, 107, b.hash ? (b.hit ? 'HIT' : 'miss') : '', { 'text-anchor': 'middle', class: 't-small t-bold', fill: b.hit ? C.kv : C.prefill });
+        if (i > 0 && b.hash) s('line', { x1: x - 10, y1: 52, x2: x - 1, y2: 52, stroke: C.faint, 'stroke-width': 1.2, 'marker-end': arrow }, g);
+      });
+
+      // cache table
+      const TY = 140;
+      text(g, 20, TY, `Prefix cache · hash → KV block · LRU order (capacity ${CAP} blocks)`, { class: 't-small t-bold t-dim' });
+      const sorted = [...cache].sort((a, b2) => b2.last - a.last);
+      sorted.forEach((c, i) => {
+        const col = i % 4, row = Math.floor(i / 4);
+        const x = 20 + col * 228, y = TY + 14 + row * 44;
+        const hitNow = cur.some((b) => b.hit && b.hash === c.hash);
+        const isNew = c.last === step && !hitNow;
+        rect(g, x, y, 218, 36, C.surface2, { rx: 7, stroke: hitNow ? C.kv : isNew ? C.prefill : C.border, 'stroke-width': hitNow || isNew ? 2 : 1 });
+        text(g, x + 10, y + 12, `#${c.hash}`, { class: 't-small t-mono t-bold' });
+        text(g, x + 208, y + 12, `used @R${c.last + 1}`, { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+        text(g, x + 10, y + 27, c.label.length > 30 ? c.label.slice(0, 29) + '…' : c.label, { class: 't-small t-dim' });
+      });
+      evicted.forEach((lbl, i) => {
+        const x = 20 + i * 228, y = H - 22;
+        rect(g, x, y - 12, 218, 24, C.wasteSoft, { rx: 6, stroke: C.waste, 'stroke-dasharray': '3 2' });
+        text(g, x + 10, y, `evicted: ${lbl.slice(0, 22)}`, { class: 't-small', fill: C.waste });
+      });
+
+      const hitTok = cur.filter((b) => b.hit).length * BS;
+      st.set('This request', `${hitTok} / ${r.toks.length} tokens cached`, '', hitTok ? C.kv : C.prefill);
+      st.set('Prefill computed', `${r.toks.length - hitTok} tokens`, hitTok ? `saved ${Math.round((hitTok / r.toks.length) * 100)}%` : 'nothing reused');
+      st.set('Overall hit rate', `${Math.round((totHit / Math.max(1, totTok)) * 100)}%`, 'of prompt tokens so far');
+      st.set('Cache', `${cache.length} / ${CAP} blocks`, evicted.length ? `${evicted.length} evicted` : '');
+      say(r.note);
+    }
+
+    const pp = player(bar, root, { step: doStep, reset, render, interval: 3200, autoplay: true });
+  });
+</script>

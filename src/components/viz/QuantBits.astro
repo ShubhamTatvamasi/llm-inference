@@ -1,0 +1,173 @@
+---
+/* Number-format explorer: see the sign / exponent / mantissa bits of a value in
+   FP32, BF16, FP16, FP8 (E4M3, E5M2), FP4 (E2M1), INT8 and INT4, and the rounding error. */
+---
+<div data-viz="quant-bits"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, segmented, slider, button, group, stats, legend, C, s, h } from '../../lib/viz';
+
+  type Fmt = { id: string; label: string; kind: 'float' | 'int'; E: number; M: number; bias: number; mode?: 'ieee' | 'fn' | 'none'; bits: number };
+  const FMTS: Fmt[] = [
+    { id: 'fp32', label: 'FP32', kind: 'float', E: 8, M: 23, bias: 127, mode: 'ieee', bits: 32 },
+    { id: 'bf16', label: 'BF16', kind: 'float', E: 8, M: 7, bias: 127, mode: 'ieee', bits: 16 },
+    { id: 'fp16', label: 'FP16', kind: 'float', E: 5, M: 10, bias: 15, mode: 'ieee', bits: 16 },
+    { id: 'e4m3', label: 'FP8 E4M3', kind: 'float', E: 4, M: 3, bias: 7, mode: 'fn', bits: 8 },
+    { id: 'e5m2', label: 'FP8 E5M2', kind: 'float', E: 5, M: 2, bias: 15, mode: 'ieee', bits: 8 },
+    { id: 'int8', label: 'INT8', kind: 'int', E: 0, M: 0, bias: 0, bits: 8 },
+    { id: 'e2m1', label: 'FP4 E2M1', kind: 'float', E: 2, M: 1, bias: 1, mode: 'none', bits: 4 },
+    { id: 'int4', label: 'INT4', kind: 'int', E: 0, M: 0, bias: 0, bits: 4 },
+  ];
+
+  function floatInfo(f: Fmt) {
+    const maxExpField = f.mode === 'ieee' ? 2 ** f.E - 2 : 2 ** f.E - 1;
+    const maxMan = f.mode === 'fn' ? 2 ** f.M - 2 : 2 ** f.M - 1;
+    const max = (1 + maxMan / 2 ** f.M) * 2 ** (maxExpField - f.bias);
+    const minNormal = 2 ** (1 - f.bias);
+    const minSub = 2 ** (1 - f.bias - f.M);
+    return { maxExpField, maxMan, max, minNormal, minSub };
+  }
+  const decodeF = (f: Fmt, ef: number, m: number) => (ef === 0 ? (m / 2 ** f.M) * 2 ** (1 - f.bias) : (1 + m / 2 ** f.M) * 2 ** (ef - f.bias));
+
+  function encodeFloat(f: Fmt, v: number) {
+    const info = floatInfo(f);
+    const sign = v < 0 || Object.is(v, -0) ? 1 : 0;
+    const a = Math.abs(v);
+    let ef = 0, m = 0, note = '';
+    if (a === 0) return { sign, ef, m, val: 0, note };
+    let e = Math.floor(Math.log2(a));
+    if (e < 1 - f.bias) {
+      m = Math.round((a / 2 ** (1 - f.bias)) * 2 ** f.M);
+      if (m >= 2 ** f.M) { ef = 1; m = 0; } else { ef = 0; note = m === 0 ? 'underflow → 0' : 'subnormal'; }
+    } else {
+      m = Math.round((a / 2 ** e - 1) * 2 ** f.M);
+      if (m === 2 ** f.M) { m = 0; e++; }
+      ef = e + f.bias;
+    }
+    if (ef > info.maxExpField || (ef === info.maxExpField && m > info.maxMan)) {
+      if (f.mode === 'ieee') { return { sign, ef: 2 ** f.E - 1, m: 0, val: sign ? -Infinity : Infinity, note: 'overflow → ±∞' }; }
+      ef = info.maxExpField; m = info.maxMan; note = 'overflow → saturated to max';
+    }
+    const val = (sign ? -1 : 1) * decodeF(f, ef, m);
+    return { sign, ef, m, val, note };
+  }
+
+  const W = 940, H = 250;
+
+  mountAll('quant-bits', (root) => {
+    let fmt = FMTS[0];
+    let value = 3.14159;
+    let intRange = 4; // symmetric clip range for INT formats: scale = range / qmax
+
+    const bar = ctrlBar(root);
+    segmented(bar, FMTS.map((f) => ({ value: f.id, label: f.label })), fmt.id, (v) => { fmt = FMTS.find((f) => f.id === v)!; render(); });
+    const bar2 = ctrlBar(root);
+    const g = group(bar2);
+    const lab = h('label', { class: 'field' }, g);
+    h('span', { text: 'Value' }, lab);
+    const inp = h('input', { type: 'number', step: 'any', value: String(value) }, lab) as HTMLInputElement;
+    inp.style.width = '120px';
+    inp.addEventListener('input', () => { const v = Number(inp.value); if (Number.isFinite(v)) { value = v; render(); } });
+    for (const pv of [0.1, 3.14159, -0.0123, 300, 70000, 1e-6]) button(g, String(pv), () => { value = pv; inp.value = String(pv); render(); });
+    const intCtl = ctrlBar(root);
+    slider(intCtl, { label: 'INT clip range ±R (sets the scale)', min: 0.5, max: 16, step: 0.5, value: intRange, onInput: (v) => { intRange = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Bit layout of the chosen number format' });
+    const st = stats(root, ['Stored value', 'Rounding error', 'Largest value', 'Precision']);
+    legend(root, [['Sign', C.weight], ['Exponent (range)', C.decode], ['Mantissa (precision)', C.kv], ['Integer bits', C.token]]);
+
+    function render() {
+      clear(svg);
+      intCtl.style.display = fmt.kind === 'int' ? '' : 'none';
+      const n = fmt.bits;
+      const bw = Math.min(46, Math.floor((W - 40) / n) - 2);
+      const total = n * (bw + 2);
+      const x0 = (W - total) / 2;
+      let bits: number[] = [], fields: ('s' | 'e' | 'm' | 'i')[] = [];
+      let stored = 0, note = '', formula = '';
+      let maxV = 0, precision = '';
+
+      if (fmt.kind === 'float') {
+        const r = encodeFloat(fmt, value);
+        const info = floatInfo(fmt);
+        bits.push(r.sign); fields.push('s');
+        for (let i = fmt.E - 1; i >= 0; i--) { bits.push((r.ef >> i) & 1); fields.push('e'); }
+        for (let i = fmt.M - 1; i >= 0; i--) { bits.push(Math.floor(r.m / 2 ** i) % 2); fields.push('m'); }
+        stored = r.val; note = r.note; maxV = info.max;
+        precision = `${fmt.M} mantissa bits ≈ ${Math.max(1, Math.round(fmt.M * Math.log10(2) + 1))} sig. digit${fmt.M > 3 ? 's' : ''}`;
+        formula = r.ef === 0
+          ? `(−1)^${r.sign} × 0.${r.m.toString(2).padStart(fmt.M, '0')}₂ × 2^${1 - fmt.bias}`
+          : Number.isFinite(r.val) ? `(−1)^${r.sign} × 1.${r.m.toString(2).padStart(fmt.M, '0').slice(0, 10)}${fmt.M > 10 ? '…' : ''}₂ × 2^(${r.ef} − ${fmt.bias})` : '∞';
+      } else {
+        const qmax = 2 ** (n - 1) - 1;
+        const scale = intRange / qmax;
+        let q = Math.round(value / scale);
+        if (q > qmax) { q = qmax; note = 'clipped to +R'; } else if (q < -qmax - 1) { q = -qmax - 1; note = 'clipped to −R'; }
+        const u = q < 0 ? q + 2 ** n : q;
+        for (let i = n - 1; i >= 0; i--) { bits.push((u >> i) & 1); fields.push(i === n - 1 ? 's' : 'i'); }
+        stored = q * scale; maxV = intRange;
+        precision = `uniform step = R / ${qmax} = ${scale.toPrecision(3)}`;
+        formula = `q = round(x / s) = ${q},  s = R / ${qmax} = ${scale.toPrecision(3)},  x̂ = q × s`;
+      }
+
+      // bit boxes
+      const y0 = 26;
+      bits.forEach((b, i) => {
+        const f = fields[i];
+        const col = f === 's' ? C.weight : f === 'e' ? C.decode : f === 'm' ? C.kv : C.token;
+        rect(svg, x0 + i * (bw + 2), y0, bw, 38, col, { rx: 5, opacity: b ? 1 : 0.28 });
+        text(svg, x0 + i * (bw + 2) + bw / 2, y0 + 19, String(b), { 'text-anchor': 'middle', class: 't-mono t-bold', fill: b ? 'var(--bg)' : C.text, 'font-size': bw < 22 ? 11 : 14 });
+      });
+      // field labels
+      const span = (from: number, to: number, label: string, col: string) => {
+        if (to < from) return;
+        const xa = x0 + from * (bw + 2), xb = x0 + (to + 1) * (bw + 2) - 2;
+        s('path', { d: `M${xa},${y0 + 46} v6 H${xb} v-6`, fill: 'none', stroke: col, 'stroke-width': 1.5 }, svg);
+        text(svg, (xa + xb) / 2, y0 + 66, label, { 'text-anchor': 'middle', class: 't-small t-bold', fill: col });
+      };
+      if (fmt.kind === 'float') {
+        span(0, 0, 'S', C.weight);
+        span(1, fmt.E, `exponent · ${fmt.E} bits`, C.decode);
+        span(fmt.E + 1, fmt.E + fmt.M, `mantissa · ${fmt.M} bits`, C.kv);
+      } else {
+        span(0, n - 1, `${n}-bit two’s-complement integer (+ one shared scale per tensor / channel / group)`, C.token);
+      }
+      text(svg, W / 2, y0 + 92, formula, { 'text-anchor': 'middle', class: 't-mono', 'font-size': 12.5 });
+
+      // representable positive values (number line) for ≤ 8-bit formats
+      const LY = 176;
+      if (n <= 8) {
+        const vals: number[] = [];
+        if (fmt.kind === 'float') {
+          const info = floatInfo(fmt);
+          for (let ef = 0; ef <= info.maxExpField; ef++) for (let m = 0; m < 2 ** fmt.M; m++) {
+            if (ef === info.maxExpField && m > info.maxMan) continue;
+            vals.push(decodeF(fmt, ef, m));
+          }
+        } else { const qmax = 2 ** (n - 1) - 1; for (let q = 0; q <= qmax; q++) vals.push((q * intRange) / qmax); }
+        const vmax = Math.max(...vals);
+        const X0 = 40, X1 = W - 40;
+        const lx = (v: number) => X0 + (v / vmax) * (X1 - X0);
+        s('line', { x1: X0, x2: X1, y1: LY, y2: LY, stroke: C.borderStrong }, svg);
+        for (const v of vals) s('line', { x1: lx(v), x2: lx(v), y1: LY - 9, y2: LY + 9, stroke: fmt.kind === 'float' ? C.decode : C.token, 'stroke-width': 1.2, opacity: 0.85 }, svg);
+        text(svg, X0, LY + 24, '0', { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+        text(svg, X1, LY + 24, String(+vmax.toPrecision(4)), { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+        text(svg, X0, LY - 22, `all ${vals.length} non-negative values on a linear axis: ${fmt.kind === 'float' ? 'dense near 0, sparse near max' : 'evenly spaced'}`, { class: 't-small t-dim' });
+        const av = Math.abs(stored);
+        if (Number.isFinite(av) && av <= vmax) {
+          s('circle', { cx: lx(av), cy: LY, r: 5, fill: C.prefill, stroke: 'var(--bg)', 'stroke-width': 1.5 }, svg);
+        }
+      } else {
+        text(svg, W / 2, LY, `${(2 ** n).toLocaleString('en-US')} bit patterns: too many to draw. Pick an 8-bit or 4-bit format to see the grid of representable values.`, { 'text-anchor': 'middle', class: 't-small t-faint' });
+      }
+
+      const err = Math.abs(stored - value);
+      const rel = value !== 0 ? err / Math.abs(value) : 0;
+      st.set('Stored value', Number.isFinite(stored) ? String(+stored.toPrecision(8)) : String(stored), note || `${n} bits = ${n / 8} byte${n === 8 ? '' : 's'}`, note ? C.waste : undefined);
+      st.set('Rounding error', Number.isFinite(err) ? (err === 0 ? '0 (exact)' : `${(rel * 100).toPrecision(3)}%`) : '∞', Number.isFinite(err) ? `absolute ${+err.toPrecision(3)}` : '', rel > 0.05 || !Number.isFinite(err) ? C.waste : C.good);
+      st.set('Largest value', String(+maxV.toPrecision(5)), fmt.kind === 'float' ? `smallest normal ${+floatInfo(fmt).minNormal.toPrecision(3)}` : 'set by the scale');
+      st.set('Precision', fmt.kind === 'float' ? `±${(100 / 2 ** (fmt.M + 1)).toPrecision(2)}%` : 'absolute', precision);
+    }
+    render();
+  });
+</script>

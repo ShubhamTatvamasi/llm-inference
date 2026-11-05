@@ -1,0 +1,113 @@
+---
+layout: ../layouts/Chapter.astro
+title: Prefix Caching
+description: Most prompts start with text the engine has already seen. Reusing that KV cache skips prefill work, cuts time-to-first-token and saves GPU compute.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import PrefixHashChain from '../components/viz/PrefixHashChain.astro';
+import PrefixRadix from '../components/viz/PrefixRadix.astro';
+import PrefixPlayground from '../components/viz/PrefixPlayground.astro';
+
+Look at real traffic to an LLM service and the same text appears again and again:
+
+- **System prompts** that are identical for every user of an app, often thousands of tokens.
+- **Multi-turn chat**: each new turn resends the entire conversation so far.
+- **Agents and tool loops**: the same tool definitions and growing transcripts, call after call.
+- **RAG and document Q&A**: many questions asked about the same retrieved document.
+- **Few-shot examples** pasted in front of every request.
+
+The [KV cache](../kv-cache/) for a token depends only on **that token and everything before it**. If two prompts start with the same tokens, their K/V for that shared prefix is identical, so it can be computed once and reused. That is **prefix caching**.
+
+## Block hashing: content-addressed KV blocks
+
+With [PagedAttention](../paged-attention/), the KV cache already lives in fixed-size blocks. To make a full block reusable, the engine gives it an identity that captures **its tokens and the entire prefix before it**:
+
+$$
+h_i = \operatorname{hash}\big(h_{i-1},\ \text{tokens in block } i\ (,\ \text{extra keys})\big)
+$$
+
+The "extra keys" cover anything else that changes the K/V, such as a LoRA adapter id or multimodal inputs. The chained hash matters: an identical block in a different position, or after a different prefix, gets a **different** hash, because its K/V really is different.
+
+When a request arrives, the scheduler walks its blocks from the start, looks up each hash, and stops at the **first miss**. Every block before that point is reused; prefill runs only on the rest.
+
+<Viz title="Chained block hashes: hits, misses and LRU eviction" label="Live">
+  <PrefixHashChain />
+  <Fragment slot="caption">
+    <p>Blocks are 4 tokens here (16 in practice). Only <b>full</b> blocks are hashed and cached; the trailing partial block is always recomputed. Blocks still in use by a running request have a reference count above zero and cannot be evicted. Idle cached blocks sit in an LRU free queue until their memory is needed.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="warn" title="Matching is exact and positional">
+A single different token early in the prompt, such as a timestamp, a request id or a reordered tool list, changes **every** later hash and kills reuse. Put **stable content first** and **variable content last**.
+</Callout>
+
+## The radix-tree view
+
+SGLang's **RadixAttention** organizes cached prefixes as a **radix tree** (a compressed trie) keyed by token sequences. Each edge holds a run of tokens and points at their KV in memory:
+
+- **Lookup**: walk down from the root as far as the new prompt matches. The depth reached is the reusable prefix.
+- **Insert**: add the unmatched suffix as a new edge, **splitting** an existing edge where the prompts diverge.
+- **Evict**: when memory is needed, remove the **least-recently-used leaf**. Shared interior nodes are used by many requests, so they naturally survive longer.
+
+<Viz title="Radix tree: shared prefixes stored once" label="Live">
+  <PrefixRadix />
+  <Fragment slot="caption">
+    <p>Each box is an edge of cached tokens; the label above it shows token count and last access time. Hash-chained blocks and radix trees are two data structures for the same idea: find the longest cached prefix, compute only the rest.</p>
+  </Fragment>
+</Viz>
+
+The two engines' approaches converge in practice:
+
+| | vLLM automatic prefix caching | SGLang RadixAttention |
+|---|---|---|
+| Index | Hash table of full-block hashes | Radix tree over token sequences |
+| Granularity | Full blocks (e.g. 16 tokens) | Token-level edges (page-aligned in practice) |
+| Eviction | LRU over blocks with ref count 0 | LRU over leaves with no active users |
+| Default | On | On |
+
+## How much does it save?
+
+Prefill cost grows with the number of **uncached** tokens, so time-to-first-token shrinks almost proportionally to the hit rate. Explore how prompt structure changes the outcome:
+
+<Viz title="Prompt structure → cache hits → TTFT" label="Explore">
+  <PrefixPlayground />
+  <Fragment slot="caption">
+    <p>Prefill speed is assumed to be about 12k tokens/s, roughly an 8B model on one H100. In <b>multi-turn chat</b> the prompt grows every turn, but almost all of it is cached from the previous turn. Compare <b>timestamp at start</b> with <b>timestamp at end</b>: the same information in a different place changes the hit rate from 0% to nearly 100%.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key">
+Prefix caching saves **compute** (no repeated prefill), **TTFT**, and **memory**, because concurrent requests share the same physical blocks. It does not speed up decode.
+</Callout>
+
+## Engine caches vs provider prompt caching
+
+Hosted APIs advertise "prompt caching" with discounted cached input tokens. That is the same mechanism exposed as a pricing feature. When you run the engine yourself, a few differences matter:
+
+- **The cache lives in one replica's GPU memory.** Two replicas behind a round-robin load balancer each keep their own cache, so hit rates drop as you add replicas. That is why **cache-aware routing** exists: send requests with the same prefix to the replica that already holds it. See [routing & autoscaling](../routing-autoscaling/).
+- **It competes with running requests.** Cached-but-idle blocks are the first thing evicted when active sequences need memory, so a busy server keeps less history.
+- **It can be tiered.** KV-offload layers can spill evicted blocks to CPU RAM or local SSD and reload them later. That pays off when reloading is faster than recomputing; see the [scheduler chapter](../scheduler/).
+
+<Interview>
+  <Q q="How does automatic prefix caching decide that two prompts share K/V?" level="core">
+    Each full KV block gets a hash of the parent block's hash plus this block's tokens, plus extra keys such as LoRA id or images. A new prompt's blocks are hashed the same way and looked up in order; every consecutive hit is reused, and prefill starts at the first miss. Because the hash covers the whole prefix, equal hashes imply identical K/V.
+  </Q>
+  <Q q="Why does putting a timestamp at the start of the system prompt destroy cache hits?" level="core">
+    Matching is exact and positional. One different token in block 1 changes hash h₁, which changes every later hash in the chain, so nothing matches. Put variable content after the stable prefix.
+  </Q>
+  <Q q="What does prefix caching speed up, and what does it not?" level="mid">
+    It removes prefill work for the cached prefix, which lowers TTFT and saves compute, and lets concurrent requests share physical KV blocks. It does nothing for decode speed (TPOT/ITL), because every generated token is still new.
+  </Q>
+  <Q q="You scaled from 2 to 8 replicas and the prefix cache hit rate fell sharply. Why, and what do you do?" level="senior">
+    Each replica has its own cache, and a load balancer that ignores prefixes spreads requests sharing a prefix across all 8, so each cache sees fewer repeats and new replicas start cold. Fix it with prefix- or KV-cache-aware routing (for example consistent hashing on a prefix key, or an endpoint picker that knows which replica holds which prefixes) combined with load awareness. Consider a shared, tiered KV cache for very hot prefixes.
+  </Q>
+  <Q q="Compare block-hash prefix caching with a radix tree." level="mid">
+    Both find the longest cached prefix. Block hashing uses a flat hash table of chained full-block hashes; it is simple, works at block granularity, and evicts blocks LRU. A radix tree stores token runs as edges, splits on divergence, evicts LRU leaves, and makes prefix structure explicit, which helps cache-aware scheduling.
+  </Q>
+  <Q q="Can a cached block be evicted while a request is using it?" level="senior">
+    No. Blocks referenced by a running request have a reference count above zero. Only blocks with ref count 0, which are cached but idle, are candidates, and they are evicted in LRU order when the allocator needs space. Under memory pressure, idle cached blocks are sacrificed before any running request is preempted.
+  </Q>
+</Interview>

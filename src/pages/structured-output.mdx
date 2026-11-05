@@ -1,0 +1,103 @@
+---
+layout: ../layouts/Chapter.astro
+title: Structured Output
+description: Guarantee that the model emits valid JSON, a regex match or one of a fixed set of choices, by masking invalid tokens before each sampling step.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import StructFSM from '../components/viz/StructFSM.astro';
+import StructMaskCost from '../components/viz/StructMaskCost.astro';
+import StructTruncate from '../components/viz/StructTruncate.astro';
+
+Applications need machine-readable output: a JSON object that matches a schema, a date in a fixed format, a label from a known list, or a tool call with typed arguments. Prompting with "please reply in JSON" works *most* of the time. **Constrained decoding** (also called guided decoding or structured output) makes it work *every* time by changing the sampling step itself.
+
+## The idea: mask the logits
+
+At every decode step the model outputs a score (logit) for every token in its vocabulary (see [sampling](../sampling/)). Before sampling, the engine asks one question per token: *if I append this token, can the output still become valid?* Every token that would break the format gets its logit set to $-\infty$, which makes its probability exactly zero:
+
+$$
+\tilde z_i = \begin{cases} z_i & \text{if } \text{output} + \text{token}_i \text{ is a valid prefix} \\ -\infty & \text{otherwise} \end{cases}
+\qquad p = \mathrm{softmax}(\tilde z / T)
+$$
+
+The constraint (JSON Schema, regex, choice list, or a full context-free grammar) is compiled once into an **automaton**. The automaton tracks where in the format the output currently is.
+
+<Viz title="Constrained decoding, token by token" label="Live">
+  <StructFSM />
+  <Fragment slot="caption">
+    <p>Grey bars are the model's raw probabilities; coloured bars are the probabilities after masking and renormalizing. In the JSON case the model first wants to say <code>Sure</code>, and later wants to write the age as a <i>string</i>. The mask blocks both. In the <b>Choice</b> case, the token <code>ne</code> keeps two branches alive (<i>negative</i>, <i>neutral</i>) until the next token decides.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key" title="Tokens ≠ grammar symbols">
+Tokenizers don't respect your grammar. One token like `",` closes a string *and* starts the next literal, and `-07` is a separator plus two digits. The mask therefore has to walk each candidate token **character by character** through the automaton, from the current state. This is what makes structured output harder than it looks.
+</Callout>
+
+## Making the mask fast
+
+A modern vocabulary has 128k–200k tokens. Checking every one, for every sequence, at every step, can take longer than the GPU's whole forward pass. Engines like **xgrammar**, **llguidance** and **Outlines** use a few tricks:
+
+- **Precompute context-independent tokens.** For most automaton positions, whether a token is valid depends only on the position, not on the stack history. Those masks are computed once at compile time and cached. Only a small set of context-dependent tokens is checked at runtime.
+- **Token tries.** Tokens that share a prefix share the work: if `"abc` fails at `"`, every token starting with `"` fails too.
+- **Overlap with the GPU.** The CPU computes step *t*'s mask while the GPU runs step *t*'s forward pass, so the mask is ready when the logits arrive.
+- **Cache compiled grammars** per schema, because compiling a large schema can take tens to hundreds of milliseconds.
+
+<Viz title="Can the mask keep up with the GPU?" label="Calculator">
+  <StructMaskCost />
+  <Fragment slot="caption">
+    <p>With a 128k vocabulary and a modest batch, naive mask computation exceeds the GPU step and stalls generation. With precomputation, only a few percent of tokens need runtime checks and the work hides inside the forward pass. Grammar compilation is a separate one-time cost on first use.</p>
+  </Fragment>
+</Viz>
+
+## What can still go wrong
+
+Constrained decoding guarantees **every prefix is valid**, not that the output is **finished** or **correct**.
+
+<Viz title="Truncation: valid prefix, broken object" label="Explore">
+  <StructTruncate />
+  <Fragment slot="caption">
+    <p>If <code>max_tokens</code> runs out before the automaton reaches ACCEPT, you get a syntactically incomplete object and <code>finish_reason = "length"</code>. Always check the finish reason, and size limits from real output-length data.</p>
+  </Fragment>
+</Viz>
+
+| Pitfall | Symptom | Mitigation |
+|---|---|---|
+| **Truncation** at `max_tokens` or a stop string | Unparseable JSON, `finish_reason: length` | Bound array and string lengths in the schema; raise limits; validate and retry |
+| **Compile cost** | First request with a new schema is slow | Warm up every schema at startup; cache compiled grammars |
+| **Valid but wrong** | Correct shape, hallucinated values | Still validate semantics server-side; give examples in the prompt |
+| **Quality drift** | Forcing an unnatural format makes answers worse | Let the model "think" in a free-text field before the constrained part, or describe the schema in the prompt so the mask rarely fires |
+| **Whitespace freedom** | Model spends tokens on indentation and newlines | Use a compact JSON grammar without optional whitespace |
+| **Speculative decoding** | Drafts must also respect the grammar | Engines mask during verification and roll back the automaton for rejected tokens |
+
+<Callout type="tip" title="When the mask rarely fires, you get it almost for free">
+If the prompt already describes the format well, the model's top token is usually valid and the mask changes nothing. Then constrained decoding costs only the mask computation. The more the mask fights the model, the more output quality can suffer. Good prompts and good constraints work together.
+</Callout>
+
+## Where it shows up in a serving stack
+
+- **OpenAI-compatible APIs** expose it as `response_format` (JSON schema) or tool/function calling. vLLM and SGLang also accept regex, choice and grammar options.
+- **Tool calling** is structured output: the model must emit a tool name from a fixed set plus arguments that match that tool's schema.
+- **Batching**: each sequence in a [continuous batch](../batching/) can have a *different* constraint, so masks are computed per sequence and applied in a fused kernel right before sampling.
+
+<Interview>
+  <Q q="How does an engine guarantee valid JSON output?" level="core">
+    It compiles the JSON schema into an automaton (a grammar or state machine). At each step it masks the logits of every token that would make the output an invalid prefix, setting them to −∞, then samples from the rest. EOS is only allowed once the automaton is in an accepting state.
+  </Q>
+  <Q q="Why can't the mask be computed per grammar symbol instead of per token?" level="mid">
+    BPE tokens don't align with grammar symbols: one token can span a closing quote, a comma and a space, or several digits. The engine has to run each token's characters through the automaton from the current state, so the mask depends on the tokenizer as well as the grammar.
+  </Q>
+  <Q q="Some outputs are invalid JSON despite guided decoding. Why?" level="mid">
+    Almost always truncation: the generation hit `max_tokens` or a stop sequence before the object closed, so `finish_reason` is `length` or `stop` with a partial object. Constrained decoding guarantees a valid prefix, not completion. Raise limits based on real length distributions, bound array and string sizes, and validate with retry.
+  </Q>
+  <Q q="The first request after each deploy is slow when using JSON schemas. What's happening?" level="mid">
+    Grammar compilation and building the mask cache for that schema happen on first use. Warm up each schema at startup, before the replica reports ready, and keep a compiled-grammar cache.
+  </Q>
+  <Q q="How do modern grammar engines keep mask computation off the critical path?" level="senior">
+    They precompute masks for context-independent tokens at each automaton position, so only a small fraction of the vocabulary needs runtime checking. They use tries to share work across tokens with common prefixes, and they overlap CPU mask computation with the GPU forward pass so the mask is ready when the logits are.
+  </Q>
+  <Q q="Can constrained decoding hurt answer quality?" level="senior">
+    Yes. If the mask frequently overrides the model's preferred tokens, the output is pushed into regions the model considers unlikely, and values can get worse. Mitigations: describe the schema in the prompt, allow a free-text reasoning field before the constrained fields, avoid overly tight constraints, and evaluate with and without constraints.
+  </Q>
+</Interview>

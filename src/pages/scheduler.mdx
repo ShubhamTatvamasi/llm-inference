@@ -1,0 +1,115 @@
+---
+layout: ../layouts/Chapter.astro
+title: Scheduler & Preemption
+description: Every iteration the scheduler decides who runs, who waits and who gets evicted. Here is how admission, preemption, swapping and KV offload work, and which knobs control them.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import SchedulerSim from '../components/viz/SchedulerSim.astro';
+import SchedulerKnobs from '../components/viz/SchedulerKnobs.astro';
+import SchedulerOffload from '../components/viz/SchedulerOffload.astro';
+
+The scheduler is the engine's brain. It runs **before every forward pass** and answers three questions:
+
+1. **Who runs this iteration?** Which running sequences decode, and which waiting requests get admitted, possibly as [prefill chunks](../chunked-prefill/).
+2. **Is there memory for them?** Every token needs [KV-cache](../kv-cache/) space, allocated in [blocks](../paged-attention/).
+3. **What gives when memory runs out?** Someone must be paused: **preempted**.
+
+## The queues
+
+A request is always in exactly one state:
+
+| State | Meaning | Holds GPU KV blocks? |
+|---|---|---|
+| **Waiting** | Arrived, not yet admitted (or preempted and re-queued) | No |
+| **Running** | In the batch: prefilling or decoding | Yes, and growing |
+| **Swapped** | Paused; its KV blocks were copied to CPU memory | No (on CPU) |
+| **Finished** | Hit EOS / stop / `max_tokens`; blocks freed (or kept as [prefix cache](../prefix-caching/)) | No |
+
+Each iteration, a typical scheduler:
+
+1. Gives every **running** sequence one more token. If a sequence's last block is full, it needs a new block; if none are free, it **preempts** the lowest-priority running sequence, usually the most recently admitted.
+2. **Resumes** swapped sequences if space is available. They get priority over new arrivals so that they don't starve.
+3. **Admits** waiting requests in FIFO order (or by priority) while there are free blocks (keeping a small *watermark* in reserve) and the batch is below `max_num_seqs` and within the [token budget](../chunked-prefill/).
+
+<Viz title="The scheduler under memory pressure" label="Live">
+  <SchedulerSim />
+  <Fragment slot="caption">
+    <p>Requests arrive over time, get admitted while blocks are free, and grow by one token per step. When the 24-block pool runs dry, the newest running sequence is preempted. In <b>recompute</b> mode its KV is thrown away and the prefill is redone later (red counter). In <b>swap</b> mode its blocks move to CPU memory and come back when space frees up. A red dot marks a request that has been preempted.</p>
+  </Fragment>
+</Viz>
+
+## Recompute vs swap
+
+When a sequence is preempted, its KV cache has to go somewhere:
+
+- **Recompute**: drop it. When the request is rescheduled, the engine runs prefill again over prompt + tokens generated so far. This costs **compute**, but prefill is fast and parallel. It needs no extra memory or PCIe traffic. Modern vLLM defaults to recompute.
+- **Swap**: copy the blocks to **CPU memory** and copy them back later. This costs **PCIe bandwidth** and CPU RAM in both directions, but does no recomputation. It is useful for very long sequences, where recomputation is expensive.
+
+<Callout type="warn" title="Preemption is a symptom">
+Occasional preemption is fine. Constant preemption means you are **over-admitting** relative to KV capacity: every preempted request pays extra latency, and recompute wastes GPU time on work it already did. Watch the engine's preemption counter and KV-usage gauge. If both are high, reduce `max_num_seqs`, shorten `max_model_len`, quantize the KV cache, or add GPUs.
+</Callout>
+
+## The knobs that matter
+
+| Knob (vLLM name) | What it controls | Turn it up → | Turn it down → |
+|---|---|---|---|
+| `gpu_memory_utilization` | Fraction of VRAM the engine claims (weights + activations + KV) | Bigger KV pool, more concurrency | Headroom for other processes and spikes |
+| `max_model_len` | Longest sequence allowed; at startup **one max-length sequence must fit** in the KV pool | Longer contexts | More startup safety; long requests rejected |
+| `max_num_seqs` | Max sequences in a batch | More throughput, if KV allows | Lower per-user latency, fewer preemptions |
+| `max_num_batched_tokens` | Token budget per iteration (decodes + prefill chunks) | Faster prefill, better TTFT | Smoother ITL |
+| `tensor_parallel_size` | Shard the model across GPUs | More KV space per replica, lower latency | Fewer comms, more independent replicas |
+| `kv_cache_dtype` | KV precision (e.g. FP8) | — | Roughly 2× KV capacity, possible accuracy cost |
+
+Try them together. Note which limit binds first:
+
+<Viz title="What happens if…" label="Explore">
+  <SchedulerKnobs />
+  <Fragment slot="caption">
+    <p>The bar shows how one GPU's memory is split. The gauge compares two batch limits: what the <b>KV pool can hold</b> at your traffic's average request length (green line) and what <code>max_num_seqs</code> allows (blue line). Whichever is lower is your real concurrency. Pick Llama 3.1 70B on one H100 to see a load failure, or set max_model_len to 128K on a small GPU to see a startup refusal.</p>
+  </Fragment>
+</Viz>
+
+## KV offload: more tiers than GPU memory
+
+HBM is small and expensive, so engines and add-on libraries now treat KV memory as a **hierarchy**:
+
+**GPU HBM** (hot, in use) → **CPU DRAM** (warm) → **local NVMe** (cool) → **shared remote store** (cold, sharable across replicas)
+
+Evicted or idle blocks, such as old [prefix-cache](../prefix-caching/) entries or long-paused conversations, move down the tiers instead of disappearing. When a request needs them again, the engine **reloads** them instead of **recomputing** the prefill. Whether that wins is a simple race:
+
+$$
+\underbrace{\frac{\text{tokens} \times \text{KV bytes/token}}{\text{tier bandwidth}}}_{\text{reload}}
+\quad \text{vs.} \quad
+\underbrace{\frac{2 P N + 2 L N^2 H d}{\text{GPU FLOP/s} \times \text{MFU}}}_{\text{recompute prefill}}
+$$
+
+<Viz title="Reload from a slower tier, or recompute?" label="Explore">
+  <SchedulerOffload />
+  <Fragment slot="caption">
+    <p>Recompute cost grows faster than linearly with prefix length, because attention is quadratic, while reload cost grows linearly. That makes offloading most attractive for <b>long, reused prefixes</b> such as documents, agent transcripts and long chats. For short prefixes, recomputing is often just as fast and much simpler.</p>
+  </Fragment>
+</Viz>
+
+<Interview>
+  <Q q="What is preemption in an LLM serving engine and when does it happen?" level="core">
+    When running sequences need new KV blocks and the pool is empty, the scheduler pauses one or more running sequences, usually the most recently admitted, to free their blocks. The paused request either has its KV dropped and recomputed later, or swapped to CPU memory and copied back later.
+  </Q>
+  <Q q="Compare recompute and swap preemption." level="mid">
+    Recompute: no extra memory or PCIe traffic, but redoes prefill over prompt plus generated tokens, so it is cheap for short sequences and wasteful for long ones. Swap: preserves the work but costs PCIe bandwidth and CPU RAM both ways and adds latency when bandwidth is contended. Many engines default to recompute because prefill is fast and highly parallel.
+  </Q>
+  <Q q="How do you recognize that preemption is hurting you in production?" level="mid">
+    A KV-usage gauge near 100%, a steadily rising preemption counter, a growing waiting queue, and worsening tail TPOT/E2E latency even when GPU utilization looks high. The fix is to admit less (<code>max_num_seqs</code>), cap context (<code>max_model_len</code>), add KV capacity (FP8 KV, TP, bigger GPUs), or scale out.
+  </Q>
+  <Q q="Why might the engine refuse to start after you raise max_model_len to 128K?" level="mid">
+    At startup the engine checks that at least one sequence of <code>max_model_len</code> fits in the KV pool left after weights and runtime. On a smaller or shared GPU, 128K tokens of KV may exceed it. Lower the limit, raise <code>gpu_memory_utilization</code>, quantize KV, add tensor parallelism, or use a dedicated long-context pool.
+  </Q>
+  <Q q="When is offloading KV to CPU or SSD better than recomputing?" level="senior">
+    When the transfer time (bytes ÷ tier bandwidth) is less than the prefill time for those tokens. Prefill cost grows super-linearly with length because of attention, so offloading pays off for long, frequently reused prefixes such as RAG documents, agent histories and multi-turn chats, and on fast links like NVLink-C2C. For short prefixes on PCIe/NVMe, recompute often wins.
+  </Q>
+  <Q q="max_num_seqs is 256 but KV fits only ~60 sequences of your typical length. What happens under load?" level="senior">
+    The scheduler keeps admitting until blocks run out, then preempts as running sequences grow, so you see thrashing: repeated recompute, wasted GPU time and a long latency tail. Aligning <code>max_num_seqs</code> with real KV capacity, or increasing capacity, gives better goodput even though peak concurrency looks lower.
+  </Q>
+</Interview>

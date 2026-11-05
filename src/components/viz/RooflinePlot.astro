@@ -1,0 +1,107 @@
+---
+/* Log-log roofline for a chosen GPU/precision with live operating points:
+   decode GEMM (moves with batch), decode attention (does not), prefill GEMM. */
+---
+<div data-viz="roofline-plot"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, player, select, segmented, slider, stats, legend, C, fmt } from '../../lib/viz';
+  import { GPUS, getGPU, getModel } from '../../data/hardware';
+
+  const W = 940, H = 470;
+  const BATCHES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+
+  mountAll('roofline-plot', (root) => {
+    let gpu = getGPU('h100');
+    let prec: 'bf16' | 'fp8' = 'bf16';
+    let bi = 0;
+    const model = getModel('llama3-8b');
+    const D = model.hidden;
+
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Roofline plot: attainable TFLOPS versus arithmetic intensity' });
+    const st = stats(root, ['Ridge point', 'Decode GEMM intensity', 'Attainable', 'Bound by']);
+    legend(root, [['Memory roof (bandwidth × intensity)', C.weight], ['Compute roof (peak FLOPs)', C.compute], ['Decode matmul (moves with batch)', C.decode], ['Decode attention (stuck)', C.kv], ['Prefill matmul', C.prefill]]);
+
+    const peak = () => (prec === 'fp8' && gpu.fp8TF ? gpu.fp8TF : gpu.bf16TF);
+    const bpp = () => (prec === 'fp8' && gpu.fp8TF ? 1 : 2);
+    const bw = () => gpu.bwTBs; // TB/s
+    const ridge = () => peak() / bw(); // FLOP/byte
+    const attain = (ai: number) => Math.min(peak(), bw() * ai);
+    // GEMM [N×D]·[D×D]: FLOPs 2ND², bytes bpp·(D² + 2ND)
+    const gemmAI = (n: number) => (2 * n * D * D) / (bpp() * (D * D + 2 * n * D));
+    // decode attention with GQA group g: each cached K/V element (bpp bytes) is used for 2·g FLOPs
+    const attnAI = () => (2 * (model.heads / model.kvHeads)) / bpp();
+
+    const PX = 80, PY = 24, PW = W - PX - 30, PH = H - PY - 56;
+    const xLo = -1, xHi = 4; // 0.1 … 10,000 FLOP/byte
+    const yLo = () => Math.floor(Math.log10(bw() * 0.1)), yHi = () => Math.ceil(Math.log10(peak() * 1.6));
+    const X = (ai: number) => PX + ((Math.log10(ai) - xLo) / (xHi - xLo)) * PW;
+    const Y = (tf: number) => PY + PH - ((Math.log10(tf) - yLo()) / (yHi() - yLo())) * PH;
+
+    function point(ai: number, color: string, label: string, r = 7, anchor: 'start' | 'end' = 'start', dy = -14) {
+      const x = X(ai), y = Y(attain(ai));
+      s('circle', { cx: x, cy: y, r, fill: color, stroke: 'var(--bg)', 'stroke-width': 2 }, svg);
+      text(svg, x + (anchor === 'start' ? 10 : -10), y + dy, label, { 'text-anchor': anchor, class: 't-small t-bold', ...fillStyle(color) });
+    }
+
+    function render() {
+      clear(svg);
+      // grid
+      for (let k = xLo; k <= xHi; k++) {
+        const x = X(10 ** k);
+        s('line', { x1: x, y1: PY, x2: x, y2: PY + PH, stroke: C.border }, svg);
+        text(svg, x, PY + PH + 16, fmt.num(10 ** k, 1).replace('.0', ''), { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+      }
+      for (let k = yLo(); k <= yHi(); k++) {
+        const y = Y(10 ** k);
+        s('line', { x1: PX, y1: y, x2: PX + PW, y2: y, stroke: C.border }, svg);
+        text(svg, PX - 8, y, fmt.num(10 ** k, 1).replace('.0', ''), { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+      }
+      text(svg, PX + PW / 2, H - 14, 'arithmetic intensity (FLOPs per byte moved from HBM, log)', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      text(svg, 18, PY + PH / 2, 'attainable TFLOPS (log)', { 'text-anchor': 'middle', class: 't-small t-dim', transform: `rotate(-90 18 ${PY + PH / 2})` });
+
+      // shaded regions
+      const rx = X(ridge());
+      rect(svg, PX, PY, rx - PX, PH, C.weightSoft, { rx: 0, opacity: 0.45 });
+      rect(svg, rx, PY, PX + PW - rx, PH, C.computeSoft, { rx: 0, opacity: 0.45 });
+      text(svg, PX + 10, PY + 16, 'MEMORY-BOUND', { class: 't-small t-bold', ...fillStyle(C.weight) });
+      text(svg, PX + PW - 10, PY + 16, 'COMPUTE-BOUND', { 'text-anchor': 'end', class: 't-small t-bold', ...fillStyle(C.compute) });
+
+      // roofs
+      const a0 = 10 ** xLo;
+      s('line', { x1: X(a0), y1: Y(attain(a0)), x2: rx, y2: Y(peak()), stroke: C.weight, 'stroke-width': 3, 'stroke-linecap': 'round' }, svg);
+      s('line', { x1: rx, y1: Y(peak()), x2: PX + PW, y2: Y(peak()), stroke: C.compute, 'stroke-width': 3, 'stroke-linecap': 'round' }, svg);
+      text(svg, X(0.3), Y(attain(0.3)) - 14, `slope = ${gpu.bwTBs} TB/s`, { class: 't-small t-mono', ...fillStyle(C.weight), transform: `rotate(-${Math.atan((PH / (yHi() - yLo())) / (PW / (xHi - xLo))) * 180 / Math.PI} ${X(0.3)} ${Y(attain(0.3)) - 14})` });
+      text(svg, PX + PW - 6, Y(peak()) - 10, `peak ${fmt.int(peak())} TFLOPS ${prec === 'fp8' && gpu.fp8TF ? 'FP8' : 'BF16'}`, { 'text-anchor': 'end', class: 't-small t-mono', ...fillStyle(C.compute) });
+      // ridge marker
+      s('line', { x1: rx, y1: Y(peak()), x2: rx, y2: PY + PH, stroke: C.text, 'stroke-dasharray': '4 4', opacity: 0.6 }, svg);
+      text(svg, rx + 6, PY + PH - 10, `ridge ≈ ${fmt.int(ridge())} FLOP/B`, { class: 't-small t-mono t-bold' });
+
+      // operating points
+      const b = BATCHES[bi];
+      const pAI = gemmAI(2048);
+      point(pAI, C.prefill, 'prefill matmul (2,048 tok)', 7, 'end', -14);
+      point(attnAI(), C.kv, `decode attention (GQA ×${model.heads / model.kvHeads})`, 7, 'start', 18);
+      const dAI = gemmAI(b);
+      point(dAI, C.decode, `decode matmul, batch ${b}`, 9, dAI > ridge() / 3 ? 'end' : 'start', -16);
+
+      const at = attain(dAI);
+      st.set('Ridge point', `${fmt.int(ridge())} FLOP/B`, `${fmt.int(peak())} TFLOPS ÷ ${gpu.bwTBs} TB/s`);
+      st.set('Decode GEMM intensity', `${dAI.toFixed(dAI < 10 ? 1 : 0)} FLOP/B`, `batch ${b}, ${prec === 'fp8' ? 'FP8' : 'BF16'} weights`, C.decode);
+      st.set('Attainable', `${fmt.num(at, at < 10 ? 1 : 0)} TFLOPS`, `${fmt.pct(at / peak(), at / peak() < 0.1 ? 1 : 0)} of peak`);
+      st.set('Bound by', dAI < ridge() ? 'memory' : 'compute', dAI < ridge() ? `need batch ≈ ${fmt.int(ridge() * bpp() / 2)} to reach the ridge` : 'tensor cores saturated', dAI < ridge() ? C.weight : C.compute);
+    }
+
+    let sl: { set: (v: number, fire?: boolean) => void } | undefined;
+    player(bar, root, { step: () => { bi = (bi + 1) % BATCHES.length; sl?.set(bi, false); return true; }, reset: () => { bi = 0; sl?.set(0, false); }, render, interval: 800, loop: true });
+    const g = group(bar);
+    select(g, 'GPU', GPUS.map((x) => ({ value: x.id, label: x.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    segmented(g, [{ value: 'bf16', label: 'BF16' }, { value: 'fp8', label: 'FP8' }], prec, (v) => { prec = v as typeof prec; render(); });
+    const bar2 = ctrlBar(root);
+    root.insertBefore(bar2, svg);
+    sl = slider(bar2, { label: 'Decode batch size', min: 0, max: BATCHES.length - 1, value: bi, format: (i) => String(BATCHES[i]), onInput: (i) => { bi = i; render(); } });
+    render();
+  });
+</script>

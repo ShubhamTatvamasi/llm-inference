@@ -1,0 +1,112 @@
+---
+/* Kubernetes cold start of an inference pod: each phase sized from real inputs,
+   a playhead sweeps through it while startup / readiness / liveness probe lamps change. */
+---
+<div data-viz="stack-cold"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, select, checkbox, button, stats, narration, rafLoop, reducedMotion, C, fmt } from '../../lib/viz';
+  import { getModel } from '../../data/hardware';
+
+  const SOURCES = [
+    { id: 'hub', label: 'Model hub over internet (~0.3 GB/s)', gbs: 0.3 },
+    { id: 's3', label: 'Object storage, same region (~1.5 GB/s)', gbs: 1.5 },
+    { id: 'pvc', label: 'Network volume / PVC (~0.8 GB/s)', gbs: 0.8 },
+    { id: 'nvme', label: 'Node-local NVMe cache (~6 GB/s)', gbs: 6 },
+  ];
+  const W = 940, H = 250;
+
+  mountAll('stack-cold', (root) => {
+    let mid = 'llama3-70b', src = SOURCES[1], nodeWarm = false, imgCached = false, graphs = true, warmPool = false;
+    const b1 = ctrlBar(root);
+    select(b1, 'Model', [['llama3-8b', 'Llama 3.1 8B'], ['qwen3-32b', 'Qwen3 32B'], ['llama3-70b', 'Llama 3.1 70B (TP 4)']].map(([v, l]) => ({ value: v, label: l })), mid, (v) => { mid = v; build(); });
+    select(b1, 'Weights from', SOURCES.map((x) => ({ value: x.id, label: x.label })), src.id, (v) => { src = SOURCES.find((x) => x.id === v)!; build(); });
+    const b2 = ctrlBar(root);
+    checkbox(b2, 'GPU node already running', nodeWarm, (v) => { nodeWarm = v; build(); });
+    checkbox(b2, 'Image pre-pulled', imgCached, (v) => { imgCached = v; build(); });
+    checkbox(b2, 'CUDA graphs + compile', graphs, (v) => { graphs = v; build(); });
+    checkbox(b2, 'Warm standby replica', warmPool, (v) => { warmPool = v; build(); });
+    button(b2, 'Replay', () => { now = 0; }, { icon: 'reset' });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Cold start phases with probe status' });
+    const st = stats(root, ['Time to ready', 'Biggest phase', 'Weights', 'Decode speed']);
+    const say = narration(root);
+
+    type Ph = { name: string; sec: number; col: string; note: string };
+    let phases: Ph[] = []; let total = 1; let now = 0;
+
+    function build() {
+      const m = getModel(mid);
+      const gb = (m.params * 2) / 1e9;
+      const tp = mid === 'llama3-70b' ? 4 : 1;
+      if (warmPool) {
+        phases = [{ name: 'route to standby', sec: 1, col: C.kv, note: 'A pre-warmed replica already passed readiness; the autoscaler just shifts traffic to it.' }];
+      } else {
+        phases = [
+          ...(nodeWarm ? [] : [{ name: 'GPU node provisioning', sec: 240, col: C.mem, note: 'Cluster autoscaler asks the cloud for a GPU VM, which boots and joins the cluster, and the GPU driver/device plugin comes up. Often 3–10 minutes, and capacity may be unavailable.' }]),
+          ...(imgCached ? [] : [{ name: 'image pull', sec: 10 / 0.25, col: C.mem, note: 'Engine images bundle CUDA, PyTorch and kernels: often 8–15 GB. Pre-pull with a DaemonSet or use a lazily-loaded image format.' }]),
+          { name: 'weight download', sec: gb / src.gbs, col: C.weight, note: `${fmt.num(gb, 0)} GB of safetensors at ${src.gbs} GB/s. Usually the biggest phase: stage weights near the node (local NVMe, a volume snapshot, or a shared cache).` },
+          { name: 'load to GPU', sec: gb / (8 * tp) + 5, col: C.weight, note: 'Read safetensors (memory-mapped) and copy them to HBM, sharded across TP ranks.' },
+          { name: 'engine init + KV profiling', sec: 12, col: C.kv, note: 'Start the workers, run a dummy forward pass to measure peak activation memory, then allocate all remaining memory as KV-cache blocks.' },
+          ...(graphs ? [{ name: 'compile + CUDA graph capture', sec: 45, col: C.compute, note: 'torch.compile and capturing CUDA graphs for many batch sizes. A persistent compile cache makes restarts much faster.' }] : []),
+          { name: 'warm-up request', sec: 3, col: C.decode, note: 'Send one real request (and compile any structured-output grammars) before declaring readiness.' },
+        ];
+      }
+      total = phases.reduce((a, p) => a + p.sec, 0);
+      now = 0;
+      const big = phases.reduce((a, b) => (b.sec > a.sec ? b : a));
+      st.set('Time to ready', total >= 60 ? `${(total / 60).toFixed(1)} min` : `${total.toFixed(0)} s`, warmPool ? 'traffic shift only' : 'pod created → Ready', total > 300 ? C.waste : total > 60 ? C.prefill : C.good);
+      st.set('Biggest phase', big.name, `${big.sec.toFixed(0)} s`);
+      st.set('Weights', `${fmt.num(gb, 0)} GB`, `BF16${tp > 1 ? `, TP ${tp}` : ''}`);
+      st.set('Decode speed', graphs ? 'full speed' : 'eager mode', graphs ? 'graphs replay small decode steps' : 'faster start, ~10–30% slower decode', graphs ? undefined : C.prefill);
+      if (reducedMotion()) now = total;
+    }
+
+    function draw() {
+      clear(svg);
+      const X0 = 20, X1 = W - 20;
+      const sx = (t: number) => X0 + (t / total) * (X1 - X0);
+      text(svg, X0, 16, 'Pod lifecycle (time →)', { class: 't-small t-faint' });
+      let t0 = 0; let cur: Ph | null = null;
+      phases.forEach((p) => {
+        const x0 = sx(t0), x1 = sx(t0 + p.sec);
+        const done = now >= t0 + p.sec; const active = now >= t0 && now < t0 + p.sec;
+        if (active) cur = p;
+        rect(svg, x0, 30, Math.max(2, x1 - x0 - 2), 40, p.col, { rx: 6, opacity: done ? 0.9 : active ? 1 : 0.28 });
+        if (x1 - x0 > 70) {
+          text(svg, x0 + 8, 44, p.name, { class: 't-small t-bold', fill: 'var(--bg)' });
+          text(svg, x0 + 8, 60, p.sec >= 60 ? `${(p.sec / 60).toFixed(1)} min` : `${p.sec.toFixed(0)} s`, { class: 't-small t-mono', fill: 'var(--bg)' });
+        }
+        t0 += p.sec;
+      });
+      s('line', { x1: sx(Math.min(now, total)), y1: 24, x2: sx(Math.min(now, total)), y2: 224, stroke: C.accent, 'stroke-width': 2 }, svg);
+
+      // probes
+      const loadEnd = phases.slice(0, -1).reduce((a, p) => a + p.sec, 0);
+      const ready = now >= total;
+      const started = now >= loadEnd || warmPool; // startup probe: /health responds once server is up
+      const containerAt = phases.filter((p) => p.name === 'GPU node provisioning' || p.name === 'image pull').reduce((a, p) => a + p.sec, 0);
+      const running = warmPool || now >= containerAt;
+      const probes: [string, string, boolean, string][] = [
+        ['startupProbe', 'GET /health: allow failureThreshold × period ≥ worst-case load time', started, started ? 'passing' : 'failing (expected), not restarted yet'],
+        ['readinessProbe', 'Only Ready after warm-up; fails again while draining', ready, ready ? 'Ready: receives traffic' : 'NotReady: no traffic'],
+        ['livenessProbe', 'Lenient: a busy engine must not be killed', started, started ? 'alive' : 'paused until startup passes'],
+      ];
+      probes.forEach(([n, d, ok, st0], i) => {
+        let state = st0;
+        const y = 102 + i * 40;
+        const lamp = !running ? C.mem : ok ? C.good : i === 2 ? C.mem : C.waste;
+        if (!running) state = 'pod Pending / ContainerCreating: no probes yet';
+        s('circle', { cx: X0 + 8, cy: y + 8, r: 7, fill: lamp, opacity: 0.9 }, svg);
+        text(svg, X0 + 24, y + 3, n, { class: 't-small t-bold t-mono' });
+        text(svg, X0 + 24, y + 19, d, { class: 't-small t-faint' });
+        text(svg, X1, y + 8, state, { 'text-anchor': 'end', class: 't-small t-bold', fill: ok ? C.good : C.dim });
+      });
+      say(cur ? `<b>${(cur as Ph).name}:</b> ${(cur as Ph).note}` : ready ? '<b>Ready.</b> The pod joins the InferencePool / Service endpoints and starts receiving requests.' : '');
+    }
+
+    build();
+    rafLoop(root, (dt) => { now = Math.min(total, now + dt * (total / 9)); draw(); });
+    draw();
+  });
+</script>

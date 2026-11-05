@@ -1,0 +1,74 @@
+---
+/* Monte-Carlo: in a locked (static/dynamic) batch every slot is held until the
+   LONGEST request finishes. Useful fraction = mean(L) / max(L). */
+---
+<div data-viz="batching-waste"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, slider, stats, legend, C, fmt, rng } from '../../lib/viz';
+
+  const BS = [1, 2, 4, 8, 16, 32, 64, 128];
+  const TRIALS = 400;
+
+  function gauss(r: () => number) {
+    const u = Math.max(1e-9, r()), v = r();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  mountAll('batching-waste', (root) => {
+    let sigma = 0.8, bi = 4;
+    const median = 250; // utilisation is scale-invariant: only the spread matters
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Length spread σ', min: 0, max: 1.5, step: 0.05, value: sigma, format: (v) => v.toFixed(2), onInput: (v) => { sigma = v; render(); } });
+    slider(bar, { label: 'Batch size', min: 0, max: BS.length - 1, value: bi, format: (i) => String(BS[i]), onInput: (i) => { bi = i; render(); } });
+
+    const W = 940, H = 270;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Useful slot fraction for locked batching versus continuous batching' });
+    const g = s('g', {}, svg);
+    const st = stats(root, ['Locked batch: useful slots', 'Continuous: useful slots', 'Continuous speed-up', 'Longest vs typical']);
+    legend(root, [['Locked batch (static / dynamic)', C.waste], ['Continuous batching', C.good]]);
+
+    function utilFor(B: number) {
+      const r = rng(11);
+      let useful = 0, held = 0, ratio = 0;
+      for (let k = 0; k < TRIALS; k++) {
+        let sum = 0, mx = 0;
+        for (let i = 0; i < B; i++) { const L = Math.max(1, median * Math.exp(sigma * gauss(r))); sum += L; mx = Math.max(mx, L); }
+        useful += sum; held += B * mx; ratio += mx / (sum / B);
+      }
+      return { util: useful / held, ratio: ratio / TRIALS };
+    }
+
+    function render() {
+      clear(g);
+      const res = BS.map(utilFor);
+      const X0 = 70, X1 = W - 20, PT = 24, PB = H - 40;
+      const gw = (X1 - X0) / BS.length;
+      const ys = (v: number) => PB - v * (PB - PT);
+      for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+        s('line', { x1: X0, y1: ys(v), x2: X1, y2: ys(v), stroke: C.border, 'stroke-dasharray': v === 0 ? null : '2 4' }, g);
+        text(g, X0 - 8, ys(v), `${v * 100}%`, { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+      }
+      text(g, 0, 10, 'Useful slot-time', { class: 't-small t-bold t-dim' });
+      res.forEach((r, i) => {
+        const cx = X0 + i * gw + gw / 2;
+        const bw = Math.min(28, gw / 3);
+        const sel = i === bi;
+        rect(g, cx - bw - 2, ys(r.util), bw, PB - ys(r.util), C.waste, { opacity: sel ? 1 : 0.55, rx: 4 });
+        const cont = 0.97; // continuous: only prefill/join overhead lost
+        rect(g, cx + 2, ys(cont), bw, PB - ys(cont), C.good, { opacity: sel ? 1 : 0.45, rx: 4 });
+        text(g, cx - bw / 2 - 2, ys(r.util) - 9, fmt.pct(r.util), { 'text-anchor': 'middle', class: 't-small t-mono' + (sel ? ' t-bold' : ' t-dim') });
+        text(g, cx, PB + 16, String(BS[i]), { 'text-anchor': 'middle', class: 't-small t-mono' + (sel ? ' t-bold' : ' t-faint') });
+        if (sel) rect(g, cx - gw / 2 + 4, PT - 6, gw - 8, PB - PT + 30, 'none', { stroke: C.accent, 'stroke-dasharray': '4 3', rx: 8 });
+      });
+      text(g, (X0 + X1) / 2, H - 6, 'batch size', { 'text-anchor': 'middle', class: 't-small t-faint' });
+
+      const r = res[bi];
+      st.set('Locked batch: useful slots', fmt.pct(r.util), `${fmt.pct(1 - r.util)} of slot-time idles behind the longest`, C.waste);
+      st.set('Continuous: useful slots', '~97%', 'freed slots refilled next iteration', C.good);
+      st.set('Continuous speed-up', `${(0.97 / r.util).toFixed(1)}×`, 'more useful work per GPU-second');
+      st.set('Longest vs typical', `${r.ratio.toFixed(1)}×`, `max ÷ mean output in a batch of ${BS[bi]}`);
+    }
+    render();
+  });
+</script>

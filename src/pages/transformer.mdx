@@ -1,0 +1,99 @@
+---
+layout: ../layouts/Chapter.astro
+title: The Transformer Layer
+description: One decoder layer, end to end. Norms, attention, MLP and residuals, with real tensor shapes, then the parameter and FLOP accounting that every serving estimate builds on.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import TfFlow from '../components/viz/TfFlow.astro';
+import TfCalc from '../components/viz/TfCalc.astro';
+
+A decoder-only LLM is surprisingly repetitive. After the [embedding lookup](../embeddings/), the same **decoder layer** is applied $L$ times (32 for Llama 3.1 8B, 80 for 70B), each time with its own weights. A final norm and the **LM head** then turn the last hidden vector into logits.
+
+Learn one layer and you know the whole model.
+
+## Following tokens through one layer
+
+Every layer has two sub-blocks, each wrapped in a **residual connection**:
+
+$$
+\begin{aligned}
+h &= x + \text{Attention}(\text{RMSNorm}(x)) \\
+x' &= h + \text{MLP}(\text{RMSNorm}(h))
+\end{aligned}
+$$
+
+The vector that flows from layer to layer, the **residual stream**, keeps the same shape $[n, d_\text{model}]$ throughout. Each sub-block reads from it and adds a correction back.
+
+<Viz title="One decoder layer, operation by operation" label="Live">
+  <TfFlow />
+  <Fragment slot="caption">
+    <p>Rose boxes are matrix multiplications against weights; they dominate both FLOPs and memory traffic. Switch between <b>Prefill</b> (n = 512 tokens at once) and <b>Decode</b> (n = 1): the operations are identical, only the first dimension of every tensor changes.</p>
+  </Fragment>
+</Viz>
+
+That last point is the key to all of inference performance. **Prefill and decode run exactly the same code.** In prefill each weight matrix is multiplied by a tall $[512, d]$ matrix, so every weight byte loaded from memory is used 512 times. In decode it is multiplied by a single row, so every weight byte is used **once**. See [Prefill vs Decode](../prefill-decode/).
+
+### The pieces
+
+- **RMSNorm** rescales each token's vector. It is cheap, elementwise, and keeps activations in a stable range.
+- **Attention projections** ($W_Q, W_K, W_V, W_O$) are the only place where tokens exchange information, through [attention](../attention/).
+- **MLP (SwiGLU)**: $\text{down}(\text{SiLU}(\text{gate}(x)) \odot \text{up}(x))$. It widens each token to $d_\text{ffn}$ (14,336 for Llama 3.1 8B) and back. It acts on each token independently and holds most of the weights.
+- **Residual adds** let information and gradients skip blocks, which is what allows 100+ layers to train.
+- **Mixture-of-Experts** models replace the single MLP with many expert MLPs and a **router** that picks a few per token. See [MoE](../moe/).
+
+## Counting parameters and FLOPs
+
+Two rules of thumb run through every serving estimate:
+
+$$
+\text{FLOPs per token} \approx 2 \times N_\text{active} \;+\; \underbrace{4 \, L \, n \, d_\text{attn}}_{\text{attention over } n \text{ cached tokens}}
+$$
+
+$$
+\text{Bytes per decode step (batch 1)} \approx \text{weight bytes} + \text{KV-cache bytes}
+$$
+
+The **2** comes from one multiply plus one add for every weight. Explore them for real configs:
+
+<Viz title="Parameters, FLOPs and bytes for one generated token" label="Calculator">
+  <TfCalc />
+  <Fragment slot="caption">
+    <p>Parameter counts are computed from each model's config: they match the published sizes. The last tile is the punchline. At batch size 1, decode does about <b>one FLOP per byte</b> it reads, while an H100 needs around 300 FLOPs per byte to keep its tensor cores busy.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key" title="Why batching exists">
+At batch 1, a decode step reads every weight from memory to do only ~1 FLOP per byte. The GPU spends most of its time waiting on memory. If 64 requests decode **together**, the same weight bytes serve 64 tokens, which is 64× the useful work for almost the same memory traffic. That single fact motivates [batching](../batching/), the [roofline](../roofline/) model, and most of serving engineering.
+</Callout>
+
+## From the last layer to a token
+
+After layer $L$, a final RMSNorm is applied and **only the last position's vector** goes to the LM head. A $[d, \text{vocab}]$ matmul produces one logit per vocabulary entry. During prefill, engines skip the LM head for every prompt position except the last, since only the next token is needed. [Sampling](../sampling/) then picks one token, which becomes the input of the next decode step.
+
+<Callout type="tip" title="Where the time goes in decode">
+For a dense 8B model at moderate context, roughly two thirds of the bytes read per step are MLP weights, about a sixth are attention weights, and the rest are the LM head, the embeddings row and the KV cache. As contexts grow into the tens of thousands of tokens, the KV cache read catches up with the weights.
+</Callout>
+
+<Interview>
+  <Q q="Describe the structure of a modern decoder layer." level="core">
+    A pre-norm residual block twice. First x + Attention(RMSNorm(x)), with Q/K/V projections, RoPE, causal attention against the KV cache and an output projection. Then h + MLP(RMSNorm(h)), where the MLP is usually SwiGLU (gate, up, SiLU⊙, down). The stack repeats L times, then a final norm and the LM head.
+  </Q>
+  <Q q="Why is the forward cost about 2 FLOPs per parameter per token?" level="core">
+    Almost all compute is matrix-vector work, where each weight takes part in one multiply and one add per token. Attention over the context adds a term proportional to L × context × d_attn, which matters only for long contexts.
+  </Q>
+  <Q q="Where are most of the parameters in a dense LLM?" level="core">
+    In the MLPs, typically about two thirds. Attention projections take most of the rest (less with GQA, since K and V are narrow), and embeddings plus the LM head take a few percent, more for small models with big vocabularies.
+  </Q>
+  <Q q="Prefill and decode run the same layer code. Why do they perform so differently?" level="mid">
+    The weights are the same, but in prefill each weight is multiplied against hundreds or thousands of token rows (high FLOPs per byte, compute-bound), while in decode against one row per sequence (≈1 FLOP per byte, memory-bound). Batching many decoding sequences raises that ratio.
+  </Q>
+  <Q q="Compute the FLOPs/byte of batch-1 decode for an 8B BF16 model and compare it to an H100." level="mid">
+    About 2 × 8e9 = 16 GFLOPs per token, against about 16 GB of weights read: roughly 1 FLOP per byte. An H100 provides ~989 TFLOPS / 3.35 TB/s ≈ 295 FLOPs per byte, so batch-1 decode uses well under 1% of the tensor cores. The step time is set by memory bandwidth: about 16 GB / 3.35 TB/s ≈ 5 ms.
+  </Q>
+  <Q q="In an MoE model, what does 'active parameters' mean for serving cost?" level="senior">
+    Only the routed experts (plus shared layers) run per token, so FLOPs scale with active parameters. But all experts must sit in GPU memory, and with large batches different tokens touch different experts, so memory capacity and bandwidth scale with total parameters. MoE is cheap in compute per token but heavy in memory.
+  </Q>
+</Interview>

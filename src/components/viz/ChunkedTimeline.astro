@@ -1,0 +1,112 @@
+---
+/* A long prompt lands while 4 users are streaming. Without chunking, one giant
+   iteration stalls everyone's stream; with a token budget, decodes go first and
+   the prompt is prefilled in chunks. */
+---
+<div data-viz="chunked-timeline"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, segmented, stats, legend, narration, C, SERIES, fmt } from '../../lib/viz';
+
+  type Mode = 'off' | '2048' | '512';
+  const BASE = 8, PER_TOK = 0.07; // ms per iteration floor, ms per token processed
+  const PROMPT = 6000, ARRIVE = 70, USERS = ['A', 'B', 'C', 'D'];
+  const T_END = 1000;
+
+  interface Iter { start: number; dur: number; dec: number; pre: number }
+
+  function simulate(mode: Mode) {
+    const iters: Iter[] = [];
+    const ticks: number[][] = USERS.map(() => []);
+    const xTicks: number[] = [];
+    let t = 0, left = PROMPT, xActive = false;
+    while (t < T_END) {
+      if (!xActive && t >= ARRIVE) xActive = true;
+      const decoding = USERS.length + (xActive && left === 0 ? 1 : 0);
+      let pre = 0;
+      if (xActive && left > 0) pre = mode === 'off' ? left : Math.min(left, Number(mode) - decoding);
+      const dur = BASE + PER_TOK * (decoding + pre);
+      iters.push({ start: t, dur, dec: decoding, pre });
+      t += dur;
+      USERS.forEach((_, i) => ticks[i].push(t));
+      if (xActive && left === 0) xTicks.push(t);
+      if (pre > 0) { left -= pre; if (left === 0) xTicks.push(t); }
+    }
+    return { iters, ticks, xTicks };
+  }
+
+  mountAll('chunked-timeline', (root) => {
+    let mode: Mode = 'off';
+    let sim = simulate(mode);
+    let now = 0;
+
+    const bar = ctrlBar(root);
+    const W = 940, H = 300, X0 = 110, X1 = W - 16;
+    const sx = (ms: number) => X0 + (Math.min(ms, T_END) / T_END) * (X1 - X0);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Iteration timeline and token streams with and without chunked prefill' });
+    const g = s('g', {}, svg);
+    const say = narration(root);
+    const st = stats(root, ['TTFT of long prompt', 'Worst gap between tokens', 'Typical gap', 'Iterations']);
+    legend(root, [['Iteration containing prefill', C.prefill], ['Decode-only iteration', C.decode], ['Token emitted to a user', SERIES[2]], ['Stall', C.waste]]);
+
+    function render() {
+      clear(g);
+      // axis
+      for (let ms = 0; ms <= T_END; ms += 100) {
+        s('line', { x1: sx(ms), y1: 26, x2: sx(ms), y2: H - 26, stroke: C.border, 'stroke-dasharray': '2 4' }, g);
+        text(g, sx(ms), H - 12, `${ms} ms`, { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+      }
+      // iteration lane
+      text(g, 0, 44, 'GPU iterations', { class: 't-small t-bold' });
+      for (const it of sim.iters) {
+        if (it.start > now) break;
+        const w = sx(Math.min(it.start + it.dur, now)) - sx(it.start);
+        rect(g, sx(it.start) + 0.5, 32, Math.max(0, w - 1), 26, it.pre ? C.prefill : C.decode, { rx: 3, opacity: it.pre ? 0.95 : 0.55 });
+        if (it.pre && w > 50) text(g, sx(it.start) + w / 2, 45, `${it.pre} prefill + ${it.dec} dec`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+      }
+      // arrival marker
+      if (now >= ARRIVE) {
+        s('line', { x1: sx(ARRIVE), y1: 22, x2: sx(ARRIVE), y2: H - 26, stroke: C.prefill, 'stroke-width': 1.5 }, g);
+        text(g, sx(ARRIVE) + 4, 18, `${fmt.int(PROMPT)}-token prompt X arrives`, { class: 't-small t-bold', fill: C.prefill });
+      }
+      // user streams
+      const rows = [...USERS.map((u, i) => ({ name: `user ${u}`, ticks: sim.ticks[i], col: SERIES[[0, 2, 3, 5][i]] })), { name: 'prompt X', ticks: sim.xTicks, col: C.prefill }];
+      rows.forEach((r, i) => {
+        const y = 86 + i * 34;
+        text(g, 0, y, r.name, { class: 't-small t-dim' });
+        s('line', { x1: X0, y1: y, x2: X1, y2: y, stroke: C.border }, g);
+        let prev = i < USERS.length ? 0 : ARRIVE;
+        for (const tk of r.ticks) {
+          if (tk > now) break;
+          const gap = tk - prev;
+          if (i < USERS.length && gap > 60) {
+            rect(g, sx(prev), y - 9, sx(tk) - sx(prev), 18, C.wasteSoft, { rx: 4, stroke: C.waste, 'stroke-width': 1 });
+            if (sx(tk) - sx(prev) > 60) text(g, (sx(prev) + sx(tk)) / 2, y, `stalled ${Math.round(gap)} ms`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: C.waste });
+          }
+          s('circle', { cx: sx(tk), cy: y, r: 2.4, fill: r.col }, g);
+          prev = tk;
+        }
+        if (i === USERS.length && r.ticks.length && r.ticks[0] <= now) text(g, sx(r.ticks[0]) + 6, y - 12, 'first token', { class: 't-small t-bold', fill: C.prefill });
+      });
+      // cursor
+      s('line', { x1: sx(now), y1: 26, x2: sx(now), y2: H - 26, stroke: C.text, opacity: 0.4 }, g);
+
+      // stats over full sim
+      const gaps: number[] = [];
+      sim.ticks.forEach((tk) => tk.forEach((t2, k) => gaps.push(t2 - (k ? tk[k - 1] : 0))));
+      gaps.sort((a, b) => a - b);
+      const ttft = sim.xTicks.length ? sim.xTicks[0] - ARRIVE : NaN;
+      st.set('TTFT of long prompt', fmt.ms(ttft), 'arrival → first token', C.prefill);
+      st.set('Worst gap between tokens', fmt.ms(gaps[gaps.length - 1]), 'what streaming users feel', gaps[gaps.length - 1] > 100 ? C.waste : C.good);
+      st.set('Typical gap', fmt.ms(gaps[Math.floor(gaps.length / 2)]), 'median inter-token latency');
+      st.set('Iterations', String(sim.iters.length), `in ${T_END} ms`);
+      if (now === 0) say('Four users are streaming tokens. Press <b>Play</b>: a 6,000-token prompt is about to arrive.');
+      else if (now < ARRIVE) say('Steady state: each iteration decodes one token for each of the 4 users, about every 8 ms.');
+      else if (mode === 'off') say('<b>No chunking:</b> the whole 6,000-token prefill runs as <b>one iteration</b>. Everyone else’s stream freezes until it finishes.');
+      else say(`<b>Chunked prefill (budget ${mode}):</b> each iteration first takes the 4–5 decode tokens, then fills the rest of the budget with the next chunk of the prompt. Streams keep flowing; the long prompt takes a little longer to start.`);
+    }
+
+    const pp = player(bar, root, { step: () => { now = Math.min(T_END, now + 12); return now < T_END; }, reset: () => { now = 0; }, render, interval: 40, autoplay: true, speeds: [0.5, 1, 2] });
+    segmented(bar, [{ value: 'off', label: 'No chunking' }, { value: '2048', label: 'Budget 2048' }, { value: '512', label: 'Budget 512' }], mode, (v) => { mode = v as Mode; sim = simulate(mode); render(); });
+  });
+</script>

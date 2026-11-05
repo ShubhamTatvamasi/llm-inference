@@ -1,0 +1,171 @@
+---
+/* Static vs dynamic vs continuous batching on the SAME request stream.
+   Each lane is a 4-slot GPU batch; columns are decode iterations. */
+---
+<div data-viz="batching-sim"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, slider, legend, narration, C, SERIES, rng, hatchDefs, uniq, clamp } from '../../lib/viz';
+
+  type Mode = 'static' | 'dynamic' | 'continuous';
+  type Kind = 'prefill' | 'decode' | 'waste';
+  interface Req { id: number; arr: number; len: number }
+  interface Cell { req: number; kind: Kind }
+  interface Sim { grid: (Cell | null)[][]; finish: number[]; start: number[]; T: number }
+
+  const SLOTS = 4, N = 14, WINDOW = 3;
+  const RC = [SERIES[0], SERIES[2], SERIES[3], SERIES[5], SERIES[7]]; // avoid amber (prefill) and rose (≈ waste)
+  const MODES: { id: Mode; name: string; sub: string }[] = [
+    { id: 'static', name: 'Static', sub: 'waits for a full batch' },
+    { id: 'dynamic', name: 'Dynamic', sub: 'batch window, then locked' },
+    { id: 'continuous', name: 'Continuous', sub: 'refill every iteration' },
+  ];
+
+  function gauss(r: () => number) {
+    const u = Math.max(1e-9, r()), v = r();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  function genRequests(rate: number, spread: number): Req[] {
+    const r = rng(7);
+    const out: Req[] = [];
+    let t = 0;
+    for (let i = 0; i < N; i++) {
+      t += -Math.log(1 - r() * 0.999) / (rate / 10);
+      const len = Math.round(clamp(9 * Math.exp(spread * gauss(r)), 2, 34));
+      out.push({ id: i, arr: Math.round(t), len });
+    }
+    return out;
+  }
+
+  function simulate(mode: Mode, reqs: Req[]): Sim {
+    const grid: (Cell | null)[][] = Array.from({ length: SLOTS }, () => []);
+    const finish = new Array(reqs.length).fill(-1);
+    const start = new Array(reqs.length).fill(-1);
+    type Slot = { req: number; remaining: number; prefilled: boolean; done: boolean } | null;
+    const slots: Slot[] = new Array(SLOTS).fill(null);
+    const queue: number[] = [];
+    let next = 0, completed = 0, t = 0;
+    const lastArr = reqs[reqs.length - 1].arr;
+    while (completed < reqs.length && t < 400) {
+      while (next < reqs.length && reqs[next].arr <= t) queue.push(next++);
+      const allFree = slots.every((x) => x === null);
+      const assign = (k: number) => {
+        for (let i = 0; i < SLOTS && k > 0 && queue.length; i++) {
+          if (slots[i] === null) { const id = queue.shift()!; slots[i] = { req: id, remaining: reqs[id].len, prefilled: false, done: false }; start[id] = t; k--; }
+        }
+      };
+      if (mode === 'continuous') assign(SLOTS);
+      else if (mode === 'static') { if (allFree && (queue.length >= SLOTS || (t > lastArr && queue.length))) assign(SLOTS); }
+      else if (allFree && queue.length && (queue.length >= SLOTS || t - reqs[queue[0]].arr >= WINDOW || t > lastArr)) assign(SLOTS);
+
+      for (let i = 0; i < SLOTS; i++) {
+        const sl = slots[i];
+        if (!sl) { grid[i][t] = null; continue; }
+        if (sl.done) { grid[i][t] = { req: sl.req, kind: 'waste' }; continue; }
+        if (!sl.prefilled) { sl.prefilled = true; grid[i][t] = { req: sl.req, kind: 'prefill' }; continue; }
+        grid[i][t] = { req: sl.req, kind: 'decode' };
+        sl.remaining--;
+        if (sl.remaining <= 0) {
+          finish[sl.req] = t + 1; completed++;
+          if (mode === 'continuous') slots[i] = null; else sl.done = true;
+        }
+      }
+      if (mode !== 'continuous' && slots.every((x) => x === null || x.done)) slots.fill(null);
+      t++;
+    }
+    return { grid, finish, start, T: t };
+  }
+
+  mountAll('batching-sim', (root) => {
+    let rate = 6, spread = 0.6;
+    let reqs = genRequests(rate, spread);
+    let sims = MODES.map((m) => simulate(m.id, reqs));
+    let Tmax = Math.max(...sims.map((x) => x.T));
+    let t = 0;
+
+    const bar = ctrlBar(root);
+    const bar2 = ctrlBar(root);
+    const W = 940, LX = 150, TOP = 40, SLOT_H = 15, LANE_H = SLOTS * SLOT_H + 34;
+    const H = TOP + MODES.length * LANE_H + 26;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Three Gantt charts comparing static, dynamic and continuous batching' });
+    const hatch = hatchDefs(svg, uniq('bh'), C.waste);
+    const g = s('g', {}, svg);
+    const say = narration(root);
+    legend(root, [['Prefill (request joins)', C.prefill], ['Decoding (one colour per request)', SERIES[0]], ['Slot held by a finished request (wasted)', C.waste], ['Empty slot', C.surface3]]);
+
+    function regen() {
+      reqs = genRequests(rate, spread);
+      sims = MODES.map((m) => simulate(m.id, reqs));
+      Tmax = Math.max(...sims.map((x) => x.T));
+    }
+
+    function render() {
+      clear(g);
+      const CW = (W - LX - 10) / Tmax;
+      const tx = (k: number) => LX + k * CW;
+      // arrivals strip
+      text(g, 0, 14, 'Arrivals', { class: 't-small t-dim t-bold' });
+      rect(g, LX, 8, W - LX - 10, 12, C.surface2, { rx: 6 });
+      for (const r of reqs) {
+        const arrived = r.arr <= t;
+        s('circle', { cx: tx(r.arr) + CW / 2, cy: 14, r: 4.2, fill: arrived ? RC[r.id % RC.length] : 'transparent', stroke: RC[r.id % RC.length], 'stroke-width': 1.3 }, g);
+      }
+      text(g, LX, 30, `${reqs.length} requests · output lengths ${Math.min(...reqs.map((r) => r.len))}–${Math.max(...reqs.map((r) => r.len))} tokens`, { class: 't-small t-faint' });
+
+      MODES.forEach((m, mi) => {
+        const sim = sims[mi];
+        const y0 = TOP + mi * LANE_H;
+        text(g, 0, y0 + 14, m.name, { class: 't-bold' });
+        text(g, 0, y0 + 30, m.sub, { class: 't-small t-faint' });
+        // live stats up to t
+        const done = reqs.filter((r) => sim.finish[r.id] > 0 && sim.finish[r.id] <= t);
+        const avgLat = done.length ? done.reduce((a, r) => a + (sim.finish[r.id] - r.arr), 0) / done.length : 0;
+        let busy = 0, total = 0;
+        for (let i = 0; i < SLOTS; i++) for (let k = 0; k < Math.min(t, sim.T); k++) { total++; const c = sim.grid[i][k]; if (c && c.kind !== 'waste') busy++; }
+        text(g, 0, y0 + 50, `done ${done.length}/${reqs.length}`, { class: 't-small t-mono t-dim' });
+        text(g, 0, y0 + 64, `avg latency ${done.length ? avgLat.toFixed(1) : '–'}`, { class: 't-small t-mono t-dim' });
+        text(g, 0, y0 + 78, `slot use ${total ? Math.round((busy / total) * 100) : 0}%`, { class: 't-small t-mono', fill: mi === 2 ? C.good : C.dim });
+
+        for (let i = 0; i < SLOTS; i++) {
+          const y = y0 + 6 + i * SLOT_H;
+          rect(g, LX, y, W - LX - 10, SLOT_H - 3, C.surface2, { rx: 2 });
+          for (let k = 0; k < Math.min(t, sim.T); k++) {
+            const c = sim.grid[i][k];
+            if (!c) continue;
+            const col = RC[c.req % RC.length];
+            if (c.kind === 'waste') rect(g, tx(k), y, CW + 0.4, SLOT_H - 3, hatch, { rx: 0 });
+            else if (c.kind === 'prefill') rect(g, tx(k), y, CW + 0.4, SLOT_H - 3, C.prefill, { rx: 0 });
+            else rect(g, tx(k), y, CW + 0.4, SLOT_H - 3, col, { rx: 0, opacity: 0.85 });
+          }
+        }
+        // per-request completion ticks
+        for (const r of reqs) {
+          const f = sim.finish[r.id];
+          if (f > 0 && f <= t) s('path', { d: `M${tx(f)},${y0 + 6 + SLOTS * SLOT_H + 1} l-3,5 h6 z`, fill: RC[r.id % RC.length] }, g);
+        }
+      });
+      // cursor + axis
+      const cx = tx(Math.min(t, Tmax));
+      s('line', { x1: cx, y1: 4, x2: cx, y2: H - 18, stroke: C.text, 'stroke-width': 1, opacity: 0.5, 'stroke-dasharray': '3 3' }, g);
+      text(g, LX, H - 8, 'iteration 0', { class: 't-small t-faint t-mono' });
+      text(g, W - 10, H - 8, `iteration ${Tmax}`, { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      text(g, cx, H - 8, `t=${t}`, { 'text-anchor': 'middle', class: 't-small t-mono t-bold' });
+
+      if (t === 0) say('Press <b>Play</b>. All three lanes receive the <b>same</b> requests at the same moments (dots at the top). Each lane is a GPU with 4 batch slots.');
+      else if (t < Tmax) {
+        const fin = sims.map((x) => x.finish.filter((f) => f > 0 && f <= t).length);
+        say(`Iteration <b>${t}</b>: finished — static ${fin[0]}, dynamic ${fin[1]}, continuous ${fin[2]}. Hatched cells are slots <b>stuck</b> behind the longest request in a locked batch.`);
+      } else {
+        const ends = sims.map((x) => x.T);
+        say(`All done. Continuous batching finished everything in <b>${ends[2]}</b> iterations vs <b>${ends[1]}</b> (dynamic) and <b>${ends[0]}</b> (static), because a freed slot is reused on the <b>very next</b> iteration.`);
+      }
+    }
+
+    function reset() { t = 0; }
+    function step() { if (t >= Tmax) return false; t++; return t < Tmax; }
+    const p = player(bar, root, { step, reset, render, interval: 140, autoplay: true });
+    slider(bar2, { label: 'Arrival rate', min: 2, max: 14, value: rate, format: (v) => `${v}/10 it`, onInput: (v) => { rate = v; regen(); p.reset(); } });
+    slider(bar2, { label: 'Output-length spread', min: 0, max: 1.2, step: 0.1, value: spread, format: (v) => (v < 0.3 ? 'uniform' : v < 0.8 ? 'mixed' : 'wild'), onInput: (v) => { spread = v; regen(); p.reset(); } });
+  });
+</script>

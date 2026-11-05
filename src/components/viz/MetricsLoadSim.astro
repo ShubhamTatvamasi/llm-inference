@@ -1,0 +1,168 @@
+---
+/* Load simulator: Poisson arrivals into a continuous-batching engine (max 64 seqs,
+   2048-token step budget, decode-first + chunked prefill). Shows the TTFT distribution
+   at the chosen arrival rate and throughput vs goodput across all rates (the "knee"). */
+---
+<div data-viz="metrics-load"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, slider, stats, legend, narration, C, rng } from '../../lib/viz';
+
+  interface Req { arr: number; P: number; O: number; pre: number; out: number; first: number; done: number; }
+
+  function simulate(rate: number, n = 700, seed = 7): Req[] {
+    const r = rng(seed);
+    const gauss = () => { let u = 0; while (u === 0) u = r(); const v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    const reqs: Req[] = []; let t = 0;
+    for (let i = 0; i < n; i++) {
+      t += -Math.log(1 - r()) / rate;
+      const P = Math.round(Math.min(6000, Math.max(40, 600 * Math.exp(0.8 * gauss()))));
+      const O = Math.round(Math.min(1000, Math.max(8, 160 * Math.exp(0.6 * gauss()))));
+      reqs.push({ arr: t, P, O, pre: P, out: 0, first: -1, done: -1 });
+    }
+    const MAXSEQ = 64, BUDGET = 2048;
+    let now = 0, i = 0, done = 0; const waiting: Req[] = []; let running: Req[] = [];
+    while (done < n) {
+      while (i < n && reqs[i].arr <= now) waiting.push(reqs[i++]);
+      if (!waiting.length && !running.length) { now = reqs[i].arr; continue; }
+      while (waiting.length && running.length < MAXSEQ) running.push(waiting.shift()!);
+      const decodes = running.filter((x) => x.pre === 0);
+      let budget = BUDGET - decodes.length, pref = 0; const finishing: Req[] = [];
+      for (const x of running) {
+        if (x.pre > 0 && budget > 0) { const c = Math.min(x.pre, budget); x.pre -= c; budget -= c; pref += c; if (x.pre === 0) finishing.push(x); }
+      }
+      // step time (ms): fixed overhead + per-sequence KV/attention cost + prefill compute
+      now += (6 + 0.12 * decodes.length + 0.028 * pref) / 1000;
+      for (const x of finishing) { x.first = now; x.out = 1; }
+      for (const x of decodes) x.out++;
+      running = running.filter((x) => { if (x.first >= 0 && x.out >= x.O) { x.done = now; done++; return false; } return true; });
+    }
+    return reqs.slice(50); // drop warm-up
+  }
+
+  const RATES = Array.from({ length: 24 }, (_, i) => i + 1);
+  const pct = (a: number[], p: number) => { const s2 = [...a].sort((x, y) => x - y); return s2[Math.min(s2.length - 1, Math.floor(p * s2.length))]; };
+
+  const W = 940, H = 330;
+
+  mountAll('metrics-load', (root) => {
+    // precompute every rate once (deterministic, ~100 ms)
+    const runs = RATES.map((rate) => {
+      const rs = simulate(rate);
+      const ttft = rs.map((x) => x.first - x.arr);
+      const tpot = rs.map((x) => (x.O > 1 ? (x.done - x.first) / (x.O - 1) : 0));
+      const span = Math.max(...rs.map((x) => x.done)) - rs[0].arr;
+      const outTok = rs.reduce((a, x) => a + x.O, 0);
+      return { rate, ttft, tpot, span, n: rs.length, outTok };
+    });
+
+    let rate = 12, sloTTFT = 0.5, sloTPOT = 20;
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Arrival rate', min: 1, max: 24, value: rate, format: (v) => `${v} req/s`, onInput: (v) => { rate = v; render(); } });
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'SLO: TTFT ≤', min: 0.1, max: 3, step: 0.1, value: sloTTFT, format: (v) => `${v.toFixed(1)} s`, onInput: (v) => { sloTTFT = v; render(); } });
+    slider(bar2, { label: 'SLO: TPOT ≤', min: 8, max: 40, value: sloTPOT, format: (v) => `${v} ms`, onInput: (v) => { sloTPOT = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'TTFT histogram and throughput vs goodput curves' });
+    const st = stats(root, ['TTFT p50 / p95 / p99', 'TPOT p50 / p99', 'Throughput', 'Goodput', 'Meeting SLO']);
+    legend(root, [['Requests meeting both SLOs', C.kv], ['Requests violating an SLO', C.waste], ['Throughput (all completed)', C.decode], ['Goodput (within SLO)', C.kv]]);
+    const say = narration(root);
+
+    const goodOf = (r: (typeof runs)[number]) => r.ttft.filter((t, k) => t <= sloTTFT && r.tpot[k] * 1000 <= sloTPOT).length;
+
+    function render() {
+      clear(svg);
+      const run = runs[rate - 1];
+
+      // ---------- left: TTFT histogram on log axis ----------
+      const LX0 = 52, LX1 = 440, LY0 = 40, LY1 = 270;
+      const lmin = Math.log10(0.01), lmax = Math.log10(30);
+      const lx = (sec: number) => LX0 + ((Math.log10(Math.max(0.01, Math.min(30, sec))) - lmin) / (lmax - lmin)) * (LX1 - LX0);
+      text(svg, LX0, 16, `TTFT distribution at ${rate} req/s`, { class: 't-bold' });
+      const BINS = 36;
+      const counts = new Array(BINS).fill(0), bad = new Array(BINS).fill(0);
+      run.ttft.forEach((t, k) => {
+        const b = Math.min(BINS - 1, Math.max(0, Math.floor(((Math.log10(Math.max(0.01, t)) - lmin) / (lmax - lmin)) * BINS)));
+        counts[b]++;
+        if (t > sloTTFT || run.tpot[k] * 1000 > sloTPOT) bad[b]++;
+      });
+      const cmax = Math.max(...counts, 1);
+      const bw = (LX1 - LX0) / BINS;
+      for (let b = 0; b < BINS; b++) {
+        if (!counts[b]) continue;
+        const hh = (counts[b] / cmax) * (LY1 - LY0 - 20);
+        const hb = (bad[b] / cmax) * (LY1 - LY0 - 20);
+        rect(svg, LX0 + b * bw + 1, LY1 - hh, bw - 2, hh - hb, C.kv, { rx: 1.5, opacity: 0.85 });
+        if (hb > 0) rect(svg, LX0 + b * bw + 1, LY1 - hb, bw - 2, hb, C.waste, { rx: 1.5, opacity: 0.85 });
+      }
+      line(svg, LX0, LY1, LX1, LY1, C.borderStrong, { 'stroke-width': 1 });
+      for (const [v, lab] of [[0.01, '10ms'], [0.1, '100ms'], [1, '1s'], [10, '10s']] as [number, string][]) {
+        line(svg, lx(v), LY1, lx(v), LY1 + 4, C.borderStrong, { 'stroke-width': 1 });
+        text(svg, lx(v), LY1 + 15, lab, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      }
+      text(svg, (LX0 + LX1) / 2, LY1 + 34, 'time to first token (log scale)', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      // SLO line
+      const sx0 = lx(sloTTFT);
+      line(svg, sx0, LY0, sx0, LY1, C.waste, { 'stroke-dasharray': '4 3', 'stroke-width': 1.3 });
+      text(svg, sx0 + 4, LY0 + 4, 'SLO', { class: 't-small t-bold', fill: C.waste });
+      // percentile markers
+      const ps: [number, string][] = [[0.5, 'p50'], [0.95, 'p95'], [0.99, 'p99']];
+      ps.forEach(([p, lab], k) => {
+        const v = pct(run.ttft, p); const x = lx(v);
+        s('path', { d: `M${x},${LY0 + 18 + k * 16} L${x},${LY1}`, stroke: C.text, 'stroke-width': 1, opacity: 0.5 }, svg);
+        rect(svg, x - 15, LY0 + 10 + k * 16, 30, 15, C.surface3, { rx: 4 });
+        text(svg, x, LY0 + 18 + k * 16, lab, { 'text-anchor': 'middle', class: 't-small t-mono t-bold' });
+      });
+
+      // ---------- right: throughput vs goodput across rates ----------
+      const RX0 = 530, RX1 = 920, RY0 = 40, RY1 = 270;
+      const thr = runs.map((r) => r.n / r.span);
+      const good = runs.map((r) => goodOf(r) / r.span);
+      const ymax = Math.ceil(Math.max(...thr) / 4) * 4 + 2;
+      const rx = (rr: number) => RX0 + ((rr - 1) / 23) * (RX1 - RX0);
+      const ry = (v: number) => RY1 - (v / ymax) * (RY1 - RY0 - 10);
+      text(svg, RX0, 16, 'Served load vs offered load', { class: 't-bold' });
+      line(svg, RX0, RY1, RX1, RY1, C.borderStrong, { 'stroke-width': 1 });
+      line(svg, RX0, RY0, RX0, RY1, C.borderStrong, { 'stroke-width': 1 });
+      for (let v = 0; v <= ymax; v += 4) {
+        line(svg, RX0, ry(v), RX1, ry(v), C.border, { 'stroke-width': 1 });
+        text(svg, RX0 - 6, ry(v), String(v), { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      }
+      for (const rr of [1, 6, 12, 18, 24]) text(svg, rx(rr), RY1 + 15, String(rr), { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      text(svg, (RX0 + RX1) / 2, RY1 + 34, 'offered load (req/s)', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      text(svg, RX0 - 34, RY0 - 8, 'req/s', { class: 't-small t-faint' });
+      // ideal diagonal
+      line(svg, rx(1), ry(1), rx(Math.min(24, ymax)), ry(Math.min(24, ymax)), C.faint, { 'stroke-dasharray': '2 4', 'stroke-width': 1 });
+      const path = (vals: number[]) => vals.map((v, k) => `${k ? 'L' : 'M'}${rx(k + 1)},${ry(v)}`).join(' ');
+      s('path', { d: path(thr), fill: 'none', stroke: C.decode, 'stroke-width': 2.2 }, svg);
+      s('path', { d: path(good), fill: 'none', stroke: C.kv, 'stroke-width': 2.2 }, svg);
+      text(svg, rx(24) - 2, ry(thr[23]) - 10, 'throughput', { 'text-anchor': 'end', class: 't-small t-bold', fill: C.decode });
+      // knee = rate with max goodput
+      let kneeI = 0; good.forEach((g, k) => { if (g > good[kneeI]) kneeI = k; });
+      s('circle', { cx: rx(kneeI + 1), cy: ry(good[kneeI]), r: 4.5, fill: 'none', stroke: C.kv, 'stroke-width': 2 }, svg);
+      text(svg, rx(kneeI + 1), ry(good[kneeI]) - 13, `knee ≈ ${kneeI + 1} req/s`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: C.kv });
+      const lastG = good[23];
+      text(svg, rx(24) - 2, ry(lastG) - 10, 'goodput', { 'text-anchor': 'end', class: 't-small t-bold', fill: C.kv });
+      // current rate marker
+      line(svg, rx(rate), RY0, rx(rate), RY1, C.accent, { 'stroke-width': 1.2, opacity: 0.8 });
+      s('circle', { cx: rx(rate), cy: ry(thr[rate - 1]), r: 4, fill: C.decode }, svg);
+      s('circle', { cx: rx(rate), cy: ry(good[rate - 1]), r: 4, fill: C.kv }, svg);
+
+      // stats
+      const f = (x: number) => (x < 1 ? `${Math.round(x * 1000)}ms` : `${x.toFixed(1)}s`);
+      const nGood = goodOf(run);
+      st.set('TTFT p50 / p95 / p99', `${f(pct(run.ttft, 0.5))} / ${f(pct(run.ttft, 0.95))} / ${f(pct(run.ttft, 0.99))}`);
+      st.set('TPOT p50 / p99', `${(pct(run.tpot, 0.5) * 1000).toFixed(1)} / ${(pct(run.tpot, 0.99) * 1000).toFixed(1)} ms`);
+      st.set('Throughput', `${thr[rate - 1].toFixed(1)} req/s`, `${Math.round(run.outTok / run.span)} output tok/s`, C.decode);
+      st.set('Goodput', `${good[rate - 1].toFixed(1)} req/s`, 'only requests within SLO', C.kv);
+      st.set('Meeting SLO', `${Math.round((nGood / run.n) * 100)}%`, `${nGood} of ${run.n} requests`, nGood / run.n > 0.95 ? C.good : C.waste);
+
+      const ratio = good[rate - 1] / thr[rate - 1];
+      const kneeRate = kneeI + 1;
+      if (rate < kneeRate - 1) say(`Below the knee: the engine keeps up, queues stay short and <b>${Math.round(ratio * 100)}%</b> of requests meet both SLOs. You have headroom.`);
+      else if (rate <= kneeRate + 1) say(`<b>At the knee.</b> This is the most load this replica can serve <i>within SLO</i>. Plan capacity here, not at peak throughput.`);
+      else say(`<b>Past the knee.</b> Throughput has flattened at ~${thr[rate - 1].toFixed(1)} req/s and the extra requests just queue. TTFT explodes, so goodput <b>falls</b> even though the GPU looks fully busy.`);
+    }
+    render();
+  });
+</script>

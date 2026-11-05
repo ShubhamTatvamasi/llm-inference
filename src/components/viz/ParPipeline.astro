@@ -1,0 +1,79 @@
+---
+/* Pipeline parallelism (inference, forward only): stages × time Gantt with micro-batches,
+   bubbles hatched, a sweeping playhead. Sliders for stages and micro-batches. */
+---
+<div data-viz="par-pipeline"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, slider, stats, legend, rafLoop, hatchDefs, uniq, button, C, SERIES, SERIES_SOFT } from '../../lib/viz';
+
+  const W = 940;
+
+  mountAll('par-pipeline', (root) => {
+    let P = 4, M = 6;
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Pipeline stages (GPUs)', min: 2, max: 8, value: P, onInput: (v) => { P = v; t = 0; build(); } });
+    slider(bar, { label: 'Micro-batches in flight', min: 1, max: 16, value: M, onInput: (v) => { M = v; t = 0; build(); } });
+    const pb = button(bar, 'Pause', () => { if (loop.running) { loop.pause(); pb.querySelector('span')!.textContent = 'Play'; } else { loop.resume(); pb.querySelector('span')!.textContent = 'Pause'; } });
+
+    const svg = svgRoot(root, W, 320, { 'aria-label': 'Pipeline schedule: stages over time with idle bubbles' });
+    const st = stats(root, ['Bubble (idle) fraction', 'GPU utilisation', 'Latency of one micro-batch', 'Per-GPU weights']);
+    legend(root, [['Micro-batch forward on a stage', C.decode], ['Idle bubble', C.waste], ['Activation hand-off (point-to-point)', C.comm]]);
+
+    let t = 0;
+    const hatchId = uniq('pph');
+
+    function build() {
+      const slots = M + P - 1;
+      const bubble = (P - 1) / slots;
+      st.set('Bubble (idle) fraction', `${(bubble * 100).toFixed(0)}%`, '(P − 1) / (M + P − 1)', bubble > 0.3 ? C.waste : C.good);
+      st.set('GPU utilisation', `${((1 - bubble) * 100).toFixed(0)}%`, 'during this window');
+      st.set('Latency of one micro-batch', `${P} stage-times`, 'same total work as 1 GPU, + hops');
+      st.set('Per-GPU weights', `1/${P}`, `${P} contiguous layer groups`);
+    }
+
+    function draw(time: number) {
+      clear(svg);
+      const hatch = hatchDefs(svg, hatchId, C.waste);
+      const slots = M + P - 1;
+      const X0 = 64, X1 = W - 12, top = 30;
+      const cw = (X1 - X0) / slots;
+      const rh = Math.min(30, (250 - top) / P);
+      svg.setAttribute('viewBox', `0 0 ${W} ${top + P * (rh + 4) + 34}`);
+      const cur = Math.floor(time) % (slots + 2); // +2 pause at end
+      text(svg, X0, 12, 'time →  (one cell = one stage-time)', { class: 't-small t-faint' });
+      for (let p = 0; p < P; p++) {
+        const y = top + p * (rh + 4);
+        text(svg, 6, y + rh / 2, `GPU ${p}`, { class: 't-small t-bold' });
+        for (let k = 0; k < slots; k++) {
+          const m = k - p;
+          const x = X0 + k * cw;
+          const shown = k <= cur;
+          if (m >= 0 && m < M) {
+            const col = SERIES[m % SERIES.length];
+            rect(svg, x + 1, y, cw - 2, rh, shown ? col : SERIES_SOFT[m % SERIES.length], { rx: 4, opacity: k === cur ? 1 : shown ? 0.82 : 0.5 });
+            if (cw > 22) text(svg, x + cw / 2, y + rh / 2, `m${m}`, { 'text-anchor': 'middle', class: 't-small t-mono t-bold', fill: shown ? 'var(--bg)' : C.dim });
+          } else {
+            rect(svg, x + 1, y, cw - 2, rh, hatch, { rx: 4, stroke: C.waste, 'stroke-opacity': 0.4, opacity: shown ? 0.9 : 0.35 });
+          }
+        }
+        // hand-off arrows at the playhead
+        if (p < P - 1) {
+          const m = cur - p;
+          if (m >= 0 && m < M) {
+            const x = X0 + cur * cw + cw - 2;
+            s('path', { d: `M${x},${y + rh * 0.6} L${x + cw * 0.5},${y + rh + 4 + rh * 0.4}`, stroke: C.comm, 'stroke-width': 2, fill: 'none' }, svg);
+          }
+        }
+      }
+      const px = X0 + Math.min(cur + 1, slots) * cw;
+      s('line', { x1: px, y1: top - 8, x2: px, y2: top + P * (rh + 4), stroke: C.accent, 'stroke-width': 2 }, svg);
+      const by = top + P * (rh + 4) + 22;
+      text(svg, X0, by, `Fill: ${P - 1} slots ramp-up  ·  Steady: ${Math.max(0, M - P + 1)} slots all busy  ·  Drain: ${P - 1} slots ramp-down`, { class: 't-small t-dim' });
+    }
+
+    build();
+    const loop = rafLoop(root, (dt) => { t += dt * 1.6; draw(t); });
+    draw(0);
+  });
+</script>

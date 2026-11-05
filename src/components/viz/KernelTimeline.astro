@@ -1,0 +1,129 @@
+---
+/* CPU launches vs GPU execution for two transformer layers of a small model at decode.
+   Eager: many short kernels, GPU starves waiting on the CPU. Fused: fewer kernels.
+   CUDA graph: one launch replays everything back-to-back. */
+---
+<div data-viz="kernel-timeline"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, segmented, stats, narration, legend, C, fmt, hatchDefs, uniq } from '../../lib/viz';
+
+  type K = { name: string; us: number; kind: 'gemm' | 'attn' | 'elem' };
+  // Llama-3.2-1B-like layer at batch 1 on an H100 (weight-read bound GEMMs), µs
+  const EAGER: K[] = [
+    { name: 'rmsnorm', us: 1.5, kind: 'elem' }, { name: 'q_proj', us: 2.5, kind: 'gemm' }, { name: 'k_proj', us: 1, kind: 'gemm' }, { name: 'v_proj', us: 1, kind: 'gemm' },
+    { name: 'rope', us: 1.5, kind: 'elem' }, { name: 'kv write', us: 1.5, kind: 'elem' }, { name: 'attention', us: 3, kind: 'attn' }, { name: 'o_proj', us: 2.5, kind: 'gemm' },
+    { name: 'add', us: 1.5, kind: 'elem' }, { name: 'rmsnorm', us: 1.5, kind: 'elem' }, { name: 'gate', us: 10, kind: 'gemm' }, { name: 'up', us: 10, kind: 'gemm' },
+    { name: 'silu·mul', us: 1.5, kind: 'elem' }, { name: 'down', us: 10, kind: 'gemm' }, { name: 'add', us: 1.5, kind: 'elem' },
+  ];
+  const FUSED: K[] = [
+    { name: 'add+rmsnorm', us: 1.5, kind: 'elem' }, { name: 'qkv_proj', us: 4, kind: 'gemm' }, { name: 'rope+kv write', us: 1.5, kind: 'elem' },
+    { name: 'attention', us: 3, kind: 'attn' }, { name: 'o_proj', us: 2.5, kind: 'gemm' }, { name: 'add+rmsnorm', us: 1.5, kind: 'elem' },
+    { name: 'gate_up', us: 19.5, kind: 'gemm' }, { name: 'silu·mul', us: 1.5, kind: 'elem' }, { name: 'down', us: 10, kind: 'gemm' },
+  ];
+  const LAYERS = 2, LAUNCH = 8, GAP_GRAPH = 0.6, GRAPH_LAUNCH = 12; // µs
+  const W = 940, H = 300, DT = 6; // µs per animation step
+
+  mountAll('kernel-timeline', (root) => {
+    let mode: 'eager' | 'fused' | 'graph' = 'eager';
+    let t = 0;
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'CPU kernel launches and GPU execution timeline' });
+    const hatchId = uniq('kth');
+    const say = narration(root);
+    const st = stats(root, ['Kernel launches / layer', 'GPU busy', 'Time for 2 layers', 'Whole model (16 layers)']);
+    legend(root, [['CPU launch overhead', C.mem], ['Matmul kernel', C.weight], ['Attention kernel', C.kv], ['Element-wise kernel', C.compute], ['GPU idle (hatched)', C.faint]]);
+
+    function schedule(m: typeof mode) {
+      const ks = (m === 'eager' ? EAGER : FUSED);
+      const all: K[] = []; for (let l = 0; l < LAYERS; l++) all.push(...ks);
+      const cpu: { a: number; b: number; label: string }[] = [];
+      const gpu: { a: number; b: number; k: K }[] = [];
+      if (m === 'graph') {
+        cpu.push({ a: 0, b: GRAPH_LAUNCH, label: 'graph.replay()' });
+        let g = GRAPH_LAUNCH;
+        for (const k of all) { gpu.push({ a: g, b: g + k.us, k }); g += k.us + GAP_GRAPH; }
+      } else {
+        let c = 0, g = 0;
+        for (const k of all) {
+          cpu.push({ a: c, b: c + LAUNCH, label: k.name });
+          c += LAUNCH;
+          const start = Math.max(g, c + 1); // kernel can't start before its launch arrives
+          gpu.push({ a: start, b: start + k.us, k });
+          g = start + k.us;
+        }
+      }
+      const end = Math.max(...gpu.map((x) => x.b), ...cpu.map((x) => x.b));
+      const busy = gpu.reduce((a, x) => a + (x.b - x.a), 0);
+      return { cpu, gpu, end, busy, launches: m === 'graph' ? 1 / LAYERS : (m === 'eager' ? EAGER : FUSED).length };
+    }
+    const maxEnd = () => schedule('eager').end;
+
+    function reset() { t = 0; }
+    function step() { t += DT; return t < schedule(mode).end; }
+
+    function render() {
+      clear(svg);
+      const hatch = hatchDefs(svg, hatchId, C.faint);
+      const sc = schedule(mode);
+      const X0 = 90, TW = W - X0 - 16;
+      const xs = (us: number) => X0 + (us / maxEnd()) * TW;
+      const CY = 40, GY = 120;
+      text(svg, 10, CY + 16, 'CPU', { class: 't-bold t-small' });
+      text(svg, 10, CY + 32, 'host thread', { class: 't-faint t-small' });
+      text(svg, 10, GY + 18, 'GPU', { class: 't-bold t-small' });
+      text(svg, 10, GY + 34, 'stream', { class: 't-faint t-small' });
+      // axis
+      for (let k = 0; k <= maxEnd(); k += 50) {
+        s('line', { x1: xs(k), y1: 26, x2: xs(k), y2: GY + 60, stroke: C.border, 'stroke-dasharray': '2 4' }, svg);
+        text(svg, xs(k), 16, `${k} µs`, { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+      }
+      // lanes
+      rect(svg, X0, CY, TW, 40, C.surface2, { rx: 6 });
+      rect(svg, X0, GY, TW, 48, C.surface2, { rx: 6 });
+      // GPU idle hatch up to t (behind kernels)
+      const tEnd = Math.min(t, sc.end);
+      if (tEnd > 0) rect(svg, X0, GY + 4, xs(tEnd) - X0, 40, hatch, { rx: 4, opacity: 0.5 });
+      for (const c of sc.cpu) {
+        if (c.a > t) continue;
+        const b = Math.min(c.b, t);
+        rect(svg, xs(c.a) + 0.5, CY + 6, Math.max(1, xs(b) - xs(c.a) - 1), 28, C.mem, { rx: 3, opacity: 0.85 });
+        if (xs(c.b) - xs(c.a) > 60 && b === c.b) text(svg, xs(c.a) + 5, CY + 20, c.label, { class: 't-small', style: 'fill:var(--bg)' });
+      }
+      for (const g of sc.gpu) {
+        if (g.a > t) continue;
+        const b = Math.min(g.b, t);
+        const col = g.k.kind === 'gemm' ? C.weight : g.k.kind === 'attn' ? C.kv : C.compute;
+        rect(svg, xs(g.a), GY + 4, Math.max(1, xs(b) - xs(g.a)), 40, col, { rx: 2 });
+        if (xs(g.b) - xs(g.a) > 44 && b === g.b) text(svg, xs(g.a) + 4, GY + 24, g.k.name, { class: 't-small', style: 'fill:var(--bg);font-weight:600' });
+      }
+      // playhead
+      if (t > 0 && t < sc.end) s('line', { x1: xs(t), y1: 26, x2: xs(t), y2: GY + 60, stroke: C.accent, 'stroke-width': 2 }, svg);
+      if (t >= sc.end) {
+        s('line', { x1: xs(sc.end), y1: 26, x2: xs(sc.end), y2: GY + 60, stroke: C.good, 'stroke-width': 2 }, svg);
+        text(svg, xs(sc.end) + (xs(sc.end) > W - 160 ? -6 : 6), GY + 76, `2 layers done in ${sc.end.toFixed(0)} µs`, { 'text-anchor': xs(sc.end) > W - 160 ? 'end' : 'start', class: 't-small t-bold', style: `fill:${C.good}` });
+      }
+      // annotation
+      const AY = 236;
+      const idle = 1 - sc.busy / sc.end;
+      rect(svg, X0, AY, TW, 14, C.surface3, { rx: 7 });
+      rect(svg, X0, AY, TW * (1 - idle), 14, C.weight, { rx: 7 });
+      text(svg, 10, AY + 7, 'GPU busy', { class: 't-small t-dim' });
+      text(svg, X0 + TW, AY + 30, `${fmt.pct(1 - idle)} busy · ${fmt.pct(idle)} idle`, { 'text-anchor': 'end', class: 't-small t-mono' });
+      text(svg, X0, AY + 30, mode === 'eager' ? `each launch costs ≈${LAUNCH} µs of CPU time; most kernels run in 1–3 µs` : mode === 'fused' ? 'fewer, bigger kernels: fewer launches, fewer trips through HBM' : 'whole decode step captured once, replayed with a single launch', { class: 't-small t-faint' });
+
+      const per16 = (sc.end / LAYERS) * 16;
+      st.set('Kernel launches / layer', mode === 'graph' ? '≈0' : String(sc.launches), mode === 'graph' ? '1 launch for the whole step' : `${sc.launches * 16} per token (16 layers)`);
+      st.set('GPU busy', fmt.pct(sc.busy / sc.end), mode === 'eager' ? 'CPU-bound: GPU starves' : 'GPU-bound', sc.busy / sc.end < 0.5 ? C.waste : C.good);
+      st.set('Time for 2 layers', `${sc.end.toFixed(0)} µs`);
+      st.set('Whole model (16 layers)', fmt.ms(per16 / 1000), `≈ ${fmt.num(1e6 / per16, 0)} tok/s (batch 1)`);
+
+      if (t === 0) say(mode === 'eager' ? '<b>Eager mode</b>: Python/PyTorch launches each kernel one at a time. Press <b>Play</b>.' : mode === 'fused' ? '<b>Fused kernels</b>: QKV in one matmul, gate+up in one, norms fused with residual adds.' : '<b>CUDA graph</b>: the whole sequence of kernels was recorded once at startup.');
+      else if (t < sc.end) say(mode === 'eager' ? 'The GPU finishes each tiny kernel in a few µs, then <b>waits</b> for the CPU to launch the next. The hatched gaps are idle GPU time.' : mode === 'fused' ? 'Fewer kernels means fewer launches, but the GPU still waits on the CPU between them.' : 'One launch; the GPU runs every kernel <b>back-to-back</b> with near-zero gaps.');
+      else say(mode === 'graph' ? `Done in <b>${sc.end.toFixed(0)} µs</b>, about ${(schedule('eager').end / sc.end).toFixed(1)}× faster than eager, with the same kernels doing the same math.` : `Done in <b>${sc.end.toFixed(0)} µs</b>. The GPU was busy only <b>${fmt.pct(sc.busy / sc.end)}</b> of the time.`);
+    }
+
+    player(bar, root, { step, reset, render, interval: 220, autoplay: true });
+    segmented(bar, [{ value: 'eager', label: 'Eager' }, { value: 'fused', label: 'Fused' }, { value: 'graph', label: 'CUDA graph' }], mode, (v) => { mode = v as typeof mode; reset(); render(); });
+  });
+</script>

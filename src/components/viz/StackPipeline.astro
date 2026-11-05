@@ -1,0 +1,222 @@
+---
+/* End-to-end lifecycle of one chat request through a production serving stack.
+   Request travels left→right, tokens stream back right→left as SSE. Click a stage for details.
+   "Cancel" shows a client disconnect propagating to the engine and freeing KV. */
+---
+<div data-viz="stack-pipeline"></div>
+
+<script>
+  import { mountAll, svgRoot, s, h, rect, text, clear, ctrlBar, button, narration, rafLoop, reducedMotion, C } from '../../lib/viz';
+
+  const BASE = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+  const link = (slug: string, label: string) => `<a href="${BASE}${slug}/">${label}</a>`;
+
+  const STAGES = [
+    {
+      id: 'client', name: 'Client', sub: 'OpenAI SDK', color: C.token,
+      what: 'Sends <code>POST /v1/chat/completions</code> with <code>model</code>, <code>messages</code>, <code>max_tokens</code> and <code>stream: true</code>. Self-hosted engines speak the same API, so the same SDK works by changing <code>base_url</code>. Parameters, tool calling and error formats still differ slightly, so contract-test them.',
+      links: [],
+    },
+    {
+      id: 'gateway', name: 'Gateway', sub: 'auth · limits', color: C.mem,
+      what: 'Authenticates the caller (API key / OIDC), enforces <b>per-tenant rate limits</b> (requests <i>and</i> tokens per minute), caps prompt and <code>max_tokens</code> size, picks a model pool, logs usage for cost attribution, and can fall back to another provider. It rejects early with <code>429 + Retry-After</code>. It must <b>not buffer</b> the response, or streaming breaks.',
+      links: [['routing-autoscaling', 'Routing & autoscaling']],
+    },
+    {
+      id: 'router', name: 'Router', sub: 'endpoint picker', color: C.comm,
+      what: 'Chooses <b>which replica</b> gets the request. Round-robin is a poor fit for LLMs. Smart pickers score replicas by queue depth, <b>KV-cache usage</b>, <b>prefix-cache hits</b> (send repeat prompts where their KV already lives) and loaded LoRA adapters. On Kubernetes this is the Gateway API Inference Extension (InferencePool + endpoint picker); llm-d builds on it.',
+      links: [['routing-autoscaling', 'Routing & autoscaling'], ['prefix-caching', 'Prefix caching']],
+    },
+    {
+      id: 'api', name: 'API server', sub: 'template · tokenize', color: C.token,
+      what: 'The engine front-end validates the request, applies the model\'s <b>chat template</b> (role markers, system prompt, tool schemas) and <b>tokenizes</b> the text into token IDs. It also sets up sampling parameters and, for structured output, compiles the JSON-schema grammar.',
+      links: [['tokenization', 'Tokenization'], ['structured-output', 'Structured output']],
+    },
+    {
+      id: 'sched', name: 'Scheduler', sub: 'queue · KV blocks', color: C.kv,
+      what: 'The request waits in the <b>waiting queue</b> until there are enough free KV blocks. Prefix-cache lookup can skip already-computed tokens. Every iteration, the scheduler builds a batch under a token budget: running decodes first, then (chunked) prefills. Under memory pressure it <b>preempts</b>.',
+      links: [['batching', 'Batching'], ['paged-attention', 'PagedAttention'], ['chunked-prefill', 'Chunked prefill'], ['scheduler', 'Scheduler']],
+    },
+    {
+      id: 'gpu', name: 'GPU executor', sub: 'prefill → decode', color: C.prefill,
+      what: 'Runs the forward pass. <b>Prefill</b> processes the whole prompt in one go and writes its KV cache, producing the first token. Then each <b>decode</b> step generates one token for every sequence in the batch, replayed through CUDA graphs. Logits are turned into tokens by the sampler.',
+      links: [['prefill-decode', 'Prefill vs decode'], ['kv-cache', 'KV cache'], ['sampling', 'Sampling'], ['kernels', 'CUDA graphs']],
+    },
+    {
+      id: 'detok', name: 'Detokenizer', sub: 'stream · SSE', color: C.decode,
+      what: '<b>Incrementally</b> turns token IDs back into text. A token can be part of a word or half of a multi-byte UTF-8 character, so text is only emitted when it is complete. It checks stop strings, then sends each delta as a Server-Sent Event: <code>data: &#123;…"delta":&#123;"content":"…"&#125;&#125;</code>, ending with <code>data: [DONE]</code> and usage stats.',
+      links: [['tokenization', 'Tokenization'], ['metrics', 'Latency metrics']],
+    },
+  ];
+  const ANSWER = ['The', ' capital', ' of', ' France', ' is', ' Paris', ',', ' on', ' the', ' Seine', '.'];
+  const NARR: Record<string, string> = {
+    client: 'The app sends a streaming chat request.',
+    gateway: '<b>Gateway:</b> key valid, tenant under its token quota → forward.',
+    router: '<b>Router:</b> replica 2 already has this system prompt cached and a short queue → pick it.',
+    api: '<b>API server:</b> chat template applied, 38 prompt tokens.',
+    sched: '<b>Scheduler:</b> 32 of 38 tokens hit the prefix cache; enough free KV blocks → admitted into the next batch.',
+    gpu: '<b>Prefill</b> computes K/V for the 6 uncached tokens and samples the first token: TTFT ends here.',
+  };
+
+  const W = 940, H = 252;
+
+  mountAll('stack-pipeline', (root) => {
+    const bar = ctrlBar(root);
+    button(bar, 'Send request', () => start(), { primary: true, icon: 'play' });
+    const cancelBtn = button(bar, 'Cancel (client disconnects)', () => cancel());
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Request lifecycle through the serving stack' });
+    const say = narration(root);
+    const wire = h('div', { class: 'sp-wire' }, root);
+    const wireL = h('div', { class: 'sp-box' }, wire);
+    h('div', { class: 'sp-k', text: 'On the wire (SSE)' }, wireL);
+    const sse = h('pre', { class: 'sp-sse' }, wireL);
+    const wireR = h('div', { class: 'sp-box' }, wire);
+    h('div', { class: 'sp-k', text: 'What the user sees' }, wireR);
+    const out = h('div', { class: 'sp-out' }, wireR);
+    const det = h('div', { class: 'sp-det' }, root);
+
+    let sel = 'router';
+    let t = 0; let phase: 'idle' | 'req' | 'prefill' | 'stream' | 'cancel' | 'done' | 'cancelled' = 'idle';
+    let tokensSent = 0; let streamT = 0; let cancelT = 0; const sseLines: string[] = [];
+    const STAGE_T = 1.0;
+
+    const nx = (i: number) => 30 + i * ((W - 60 - 104) / (STAGES.length - 1));
+    const NW = 104, NY = 92, NH = 74;
+
+    function start() { t = 0; phase = 'req'; tokensSent = 0; streamT = 0; sseLines.length = 0; out.textContent = ''; sse.textContent = ''; }
+    function cancel() { if (phase === 'stream' || phase === 'req' || phase === 'prefill') { phase = 'cancel'; cancelT = 0; } }
+
+    function showDetails() {
+      draw();
+      const st = STAGES.find((x) => x.id === sel)!;
+      det.innerHTML = `<div class="sp-dh"><span class="sp-dot" style="background:${st.color}"></span><b>${st.name}</b><span class="sp-dsub">${st.sub}</span></div><p>${st.what}</p>${st.links.length ? `<div class="sp-links">Deep dive → ${st.links.map(([s2, l]) => link(s2, l)).join(' · ')}</div>` : ''}`;
+    }
+
+    // static layer (built once, keeps click/focus handlers) + dynamic layer (redrawn every frame)
+    const yReq = NY - 26, yRes = NY + NH + 26;
+    const gStatic = s('g', {}, svg);
+    const gDyn = s('g', {}, svg);
+    text(gStatic, 30, yReq - 18, 'request →', { class: 't-small t-faint' });
+    text(gStatic, W - 30, yRes + 22, '← tokens stream back (SSE)', { 'text-anchor': 'end', class: 't-small t-faint' });
+    s('line', { x1: nx(0) + NW / 2, y1: yReq, x2: nx(STAGES.length - 1) + NW / 2, y2: yReq, stroke: C.border, 'stroke-width': 2, 'stroke-dasharray': '4 4' }, gStatic);
+    s('line', { x1: nx(0) + NW / 2, y1: yRes, x2: nx(STAGES.length - 1) + NW / 2, y2: yRes, stroke: C.border, 'stroke-width': 2, 'stroke-dasharray': '4 4' }, gStatic);
+    text(gStatic, 30, H - 14, 'Click any stage for details.', { class: 't-small t-faint' });
+    const nodes = STAGES.map((st, i) => {
+      const x = nx(i);
+      const grp = s('g', { style: 'cursor:pointer', tabindex: 0, role: 'button', 'aria-label': `${st.name}: show details` }, gStatic);
+      const pick = () => { sel = st.id; showDetails(); };
+      grp.addEventListener('click', pick);
+      grp.addEventListener('keydown', (e) => { const k = (e as KeyboardEvent).key; if (k === 'Enter' || k === ' ') { e.preventDefault(); pick(); } });
+      const ring = rect(grp, x - 5, NY - 5, NW + 10, NH + 10, 'none', { rx: 16, stroke: st.color, 'stroke-width': 2, opacity: 0 });
+      const box = rect(grp, x, NY, NW, NH, C.surface2, { rx: 12, stroke: C.border });
+      rect(grp, x, NY, 5, NH, st.color, { rx: 2 });
+      text(grp, x + NW / 2 + 2, NY + 26, st.name, { 'text-anchor': 'middle', class: 't-bold', 'font-size': 12.5 });
+      text(grp, x + NW / 2 + 2, NY + 46, st.sub, { 'text-anchor': 'middle', class: 't-small t-dim' });
+      text(grp, x + NW / 2 + 2, NY + 62, `${i + 1}`, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      return { ring, box };
+    });
+
+    function draw() {
+      clear(gDyn);
+      const reqIdx = phase === 'req' ? Math.min(STAGES.length - 2, Math.floor(t / STAGE_T)) : -1;
+      STAGES.forEach((st, i) => {
+        const activeNow = (phase === 'req' && i === reqIdx) || (phase === 'prefill' && st.id === 'gpu') || (phase === 'stream' && (st.id === 'gpu' || st.id === 'detok'));
+        const isSel = st.id === sel;
+        nodes[i].ring.setAttribute('opacity', activeNow ? '0.6' : '0');
+        nodes[i].box.setAttribute('fill', isSel ? C.surface3 : C.surface2);
+        nodes[i].box.setAttribute('stroke', isSel ? C.accent : C.border);
+        nodes[i].box.setAttribute('stroke-width', isSel ? '2' : '1');
+        if (st.id === 'gpu' && (phase === 'prefill' || phase === 'stream')) {
+          const x = nx(i);
+          rect(gDyn, x + 16, NY - 12, NW - 32, 18, phase === 'prefill' ? C.prefill : C.decode, { rx: 9 });
+          text(gDyn, x + NW / 2, NY - 3, phase === 'prefill' ? 'PREFILL' : 'DECODE', { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+        }
+      });
+
+      if (phase === 'req') {
+        const f = t / STAGE_T; const i = Math.floor(f); const frac = Math.min(1, (f - i) * 1.6);
+        const x = i >= STAGES.length - 1 ? nx(STAGES.length - 1) : nx(i) + (nx(i + 1) - nx(i)) * frac;
+        rect(gDyn, x + NW / 2 - 22, yReq - 9, 44, 18, C.token, { rx: 9 });
+        text(gDyn, x + NW / 2, yReq, 'POST', { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+      }
+      if (phase === 'stream' || phase === 'cancel' || phase === 'done') {
+        const span = nx(STAGES.length - 1) - nx(0);
+        for (let k = 0; k < tokensSent; k++) {
+          const age = streamT - k * 0.32;
+          const p = Math.min(1, age / 1.1);
+          if (p >= 1) continue;
+          const x = nx(STAGES.length - 1) + NW / 2 - span * p;
+          rect(gDyn, x - 26, yRes - 9, 52, 18, C.decode, { rx: 9, opacity: 0.95 });
+          text(gDyn, x, yRes, ANSWER[k].trim() || '·', { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+        }
+      }
+      if (phase === 'cancel') {
+        const p = Math.min(1, cancelT / 1.6);
+        const x = nx(0) + NW / 2 + (nx(STAGES.length - 2) - nx(0)) * p;
+        s('circle', { cx: x, cy: yReq, r: 9, fill: C.waste }, gDyn);
+        text(gDyn, x, yReq - 18, 'abort', { 'text-anchor': 'middle', class: 't-small t-bold', fill: C.waste });
+      }
+      if (phase === 'cancelled') {
+        const x = nx(5) + NW / 2;
+        rect(gDyn, x - 70, NY + NH + 4, 140, 18, C.wasteSoft, { rx: 9, stroke: C.waste });
+        text(gDyn, x, NY + NH + 13, 'KV blocks freed', { 'text-anchor': 'middle', class: 't-small t-bold', fill: C.waste });
+      }
+    }
+
+    function emit(k: number) {
+      const tok = ANSWER[k];
+      sseLines.push(`data: {"choices":[{"delta":{"content":${JSON.stringify(tok)}}}]}`);
+      if (sseLines.length > 5) sseLines.shift();
+      sse.textContent = sseLines.join('\n');
+      out.textContent += tok;
+    }
+
+    function frame(dt: number) {
+      t += dt;
+      if (phase === 'req') {
+        const i = Math.floor(t / STAGE_T);
+        const st = STAGES[Math.min(i, STAGES.length - 2)];
+        say(NARR[st.id] ?? '');
+        if (t >= STAGE_T * (STAGES.length - 1)) { phase = 'prefill'; t = 0; say(NARR.gpu); }
+      } else if (phase === 'prefill') {
+        if (t > 1.1) { phase = 'stream'; t = 0; streamT = 0; say('<b>Decode:</b> one token per step, shared with every other sequence in the batch. The detokenizer turns IDs into text and streams each piece as an SSE event.'); }
+      } else if (phase === 'stream') {
+        streamT += dt;
+        while (tokensSent < ANSWER.length && streamT >= tokensSent * 0.32) { emit(tokensSent); tokensSent++; }
+        if (tokensSent >= ANSWER.length && streamT > ANSWER.length * 0.32 + 1.1) {
+          phase = 'done';
+          sseLines.push('data: [DONE]'); if (sseLines.length > 5) sseLines.shift(); sse.textContent = sseLines.join('\n');
+          say('<b>Done.</b> finish_reason = "stop". The sequence leaves the batch and its KV blocks return to the free pool, or stay in the prefix cache for reuse.');
+        }
+      } else if (phase === 'cancel') {
+        cancelT += dt; streamT += dt;
+        say('<b>Client disconnected.</b> The abort must travel through the gateway and router to the engine. Otherwise the GPU keeps generating tokens nobody will read, and holds KV memory.');
+        if (cancelT > 1.7) { phase = 'cancelled'; say('<b>Aborted in the engine:</b> the sequence is removed from the batch and its KV blocks are freed immediately for other requests.'); }
+      }
+      draw();
+      cancelBtn.disabled = !(phase === 'req' || phase === 'prefill' || phase === 'stream');
+    }
+
+    showDetails();
+    if (reducedMotion()) { phase = 'done'; tokensSent = ANSWER.length; ANSWER.forEach((_, k) => emit(k)); }
+    else start();
+    rafLoop(root, frame);
+    draw();
+  });
+</script>
+
+<style is:global>
+  .sp-wire { display: grid; grid-template-columns: 1.4fr 1fr; gap: 10px; margin-top: 12px; }
+  .sp-box { background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; min-width: 0; }
+  .sp-k { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-faint); font-weight: 600; margin-bottom: 4px; }
+  .sp-sse { margin: 0; padding: 0; border: 0; background: none; font-size: 0.72rem; line-height: 1.5; min-height: 7.6em; white-space: pre; overflow-x: auto; color: var(--c-decode); }
+  .sp-out { font-size: 0.95rem; min-height: 3em; }
+  .sp-det { margin-top: 12px; border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; background: var(--surface-2); font-size: 0.9rem; }
+  .sp-det p { margin: 6px 0; color: var(--text-dim); }
+  .sp-dh { display: flex; align-items: center; gap: 8px; }
+  .sp-dot { width: 10px; height: 10px; border-radius: 3px; }
+  .sp-dsub { color: var(--text-faint); font-size: 0.8rem; }
+  .sp-links { font-size: 0.85rem; color: var(--text-faint); }
+  @media (max-width: 640px) { .sp-wire { grid-template-columns: 1fr; } }
+</style>

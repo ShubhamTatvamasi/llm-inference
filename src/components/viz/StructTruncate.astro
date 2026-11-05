@@ -1,0 +1,43 @@
+---
+/* Constrained decoding guarantees a valid PREFIX, not a finished object: max_tokens can cut it off. */
+---
+<div data-viz="struct-trunc"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, slider, stats, C } from '../../lib/viz';
+
+  const TOKS = ['{"', 'items', '":', ' [', '{"', 'sku', '":', ' "', 'A', '12', '",', ' "', 'qty', '":', ' 3', '},', ' {"', 'sku', '":', ' "', 'B', '7', '",', ' "', 'qty', '":', ' 1', '}]', '}'];
+  const W = 940, H = 96;
+
+  mountAll('struct-trunc', (root) => {
+    let maxTok = 18;
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'max_tokens', min: 4, max: TOKS.length + 4, value: maxTok, onInput: (v) => { maxTok = v; render(); } });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Generated JSON cut off at max_tokens' });
+    const st = stats(root, ['finish_reason', 'JSON.parse()', 'Tokens needed']);
+
+    function render() {
+      clear(svg);
+      const n = Math.min(maxTok, TOKS.length);
+      const shown = TOKS.slice(0, n);
+      const str = shown.join('');
+      let ok = true;
+      try { JSON.parse(str); } catch { ok = false; }
+      rect(svg, 8, 8, W - 16, 52, C.surface2, { rx: 9, stroke: ok ? C.good : C.waste });
+      let x = 20;
+      TOKS.forEach((t, i) => {
+        const w = t.length * 7.4 + 2;
+        const inside = i < n;
+        if (x + w > W - 20) return;
+        rect(svg, x - 1, 22, w, 24, inside ? (i % 2 ? C.tokenSoft : C.decodeSoft) : 'transparent', { rx: 4, stroke: inside ? 'none' : C.border, 'stroke-dasharray': inside ? null : '2 3' });
+        text(svg, x, 34, t.replace(/ /g, '␣'), { class: inside ? 't-mono' : 't-mono t-faint', 'font-size': 12 });
+        x += w + 3;
+      });
+      text(svg, 12, 82, ok ? '✓ complete object: the automaton reached ACCEPT before the limit' : '✗ cut off mid-object: every token was valid, but the object never closed', { class: 't-small t-bold', fill: ok ? C.good : C.waste });
+      st.set('finish_reason', ok ? 'stop' : 'length', ok ? 'model emitted end-of-sequence' : 'hit the token limit', ok ? C.good : C.waste);
+      st.set('JSON.parse()', ok ? 'OK' : 'SyntaxError', ok ? '' : 'always check finish_reason', ok ? C.good : C.waste);
+      st.set('Tokens needed', String(TOKS.length), `limit = ${maxTok}`);
+    }
+    render();
+  });
+</script>

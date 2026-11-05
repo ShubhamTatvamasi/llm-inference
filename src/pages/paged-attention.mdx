@@ -1,0 +1,117 @@
+---
+layout: ../layouts/Chapter.astro
+title: PagedAttention
+description: Virtual memory for the KV cache. Fixed-size blocks, per-request block tables and copy-on-write let an engine pack many more sequences into the same GPU.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import PagedAlloc from '../components/viz/PagedAlloc.astro';
+import PagedCoW from '../components/viz/PagedCoW.astro';
+import PagedBlockSize from '../components/viz/PagedBlockSize.astro';
+
+[Continuous batching](../batching/) creates a memory problem. Every sequence's [KV cache](../kv-cache/) grows by one token per step, sequences start and stop at arbitrary moments, and **nobody knows in advance how long an answer will be**.
+
+Early serving systems handled this the simple way: give each request one **contiguous** buffer big enough for the longest possible sequence. That approach wastes memory in three ways:
+
+- **Reservation waste**: space reserved for tokens that will never be generated. If max length is 8K and the answer is 300 tokens, more than 96% of the buffer is never used.
+- **Internal fragmentation**: the unused tail of each allocation.
+- **External fragmentation**: free memory split into gaps too small for a new max-length buffer. The total free space is large, but no single piece is.
+
+Measurements on these early systems found that only **20–40%** of KV memory held real tokens.
+
+## The idea: page the KV cache
+
+Operating systems solved the same problem decades ago with **virtual memory**. A process sees one contiguous address space, but the OS maps it in fixed-size **pages** onto whatever physical frames are free. PagedAttention applies that idea to the KV cache:
+
+| OS virtual memory | PagedAttention |
+|---|---|
+| Page (e.g. 4 KiB) | **KV block** (e.g. 16 tokens × all layers' K and V) |
+| Process | Sequence / request |
+| Page table | **Block table**: logical block → physical block |
+| Allocate a page on first touch | Allocate a block when the previous one is full |
+| Shared pages + copy-on-write (`fork`) | Shared prompt blocks + copy-on-write (parallel sampling, beam search) |
+
+<Viz title="Contiguous reservation vs paged blocks" label="Live">
+  <PagedAlloc />
+  <Fragment slot="caption">
+    <p>Same five requests, same 64 token slots of KV memory. In <b>contiguous</b> mode each request reserves 20 slots up front; D and E wait even though free slots exist, because no free run of 20 exists. In <b>paged</b> mode blocks are handed out one at a time from a free list, from <i>anywhere</i> in memory, and all five requests run at once. Each request wastes at most one partially filled block.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key">
+With paging, waste is limited to the **last, partially filled block** of each sequence: at most *block size − 1* slots. In practice that brings KV utilization above **95%**, which directly means more concurrent sequences, bigger batches and higher throughput.
+</Callout>
+
+## How attention reads paged memory
+
+Logical blocks of a sequence are scattered across physical memory, so the attention kernel cannot assume K and V sit in one contiguous tensor. A **paged attention kernel** receives:
+
+- the KV cache as a big pool shaped like `[num_blocks, block_size, kv_heads, head_dim]` per layer,
+- a **block table** per sequence: a small integer array mapping logical block *i* to a physical block id,
+- each sequence's current length.
+
+For each query token, the kernel walks its sequence's block table, gathers each block's keys and values, and runs attention over them, typically with the [FlashAttention](../flash-attention/)-style online softmax. The cost of the extra indirection is small: one integer lookup per block of 16 tokens.
+
+$$
+\text{physical\_block} = \text{block\_table}[\,\lfloor t / B \rfloor\,], \qquad \text{slot} = t \bmod B
+$$
+
+## Sharing and copy-on-write
+
+Because blocks are reached through a table, **two sequences can point at the same physical block**. Each block keeps a **reference count**. That makes several common cases cheap:
+
+- **Parallel sampling** (`n > 1`): all samples share the prompt's blocks.
+- **Beam search**: beams share their common history and fork only where they diverge.
+- **[Prefix caching](../prefix-caching/)**: different requests with the same system prompt share blocks.
+
+When a sequence needs to **write** into a block that is shared, the engine first copies that block. This is the same copy-on-write trick an OS uses after `fork()`.
+
+<Viz title="Parallel sampling with copy-on-write" label="Live">
+  <PagedCoW />
+  <Fragment slot="caption">
+    <p>Full blocks are never written again, so they can be shared forever. Only a <b>partially filled, shared</b> block ever needs copying, and at most one per sequence.</p>
+  </Fragment>
+</Viz>
+
+## Choosing the block size
+
+Block size is a trade-off:
+
+- **Small blocks** (1–8 tokens): almost no tail waste, but large block tables, more indirection, and kernels that move tiny, inefficient chunks of memory.
+- **Large blocks** (64–256): efficient bulk memory access and short tables, but more wasted slots in each sequence's last block, and coarser sharing for prefix caching.
+
+Most GPU engines default to **16 tokens**, which keeps waste under a few percent for realistic lengths. Some kernels and backends prefer 32, 64 or larger.
+
+<Viz title="Block size and max_model_len trade-offs" label="Explore">
+  <PagedBlockSize />
+  <Fragment slot="caption">
+    <p>Sequence lengths are drawn from a realistic, long-tailed distribution. Contiguous waste depends on how far <code>max_model_len</code> sits above typical lengths. Paged waste depends only on the block size. The dashed blue line is the number of block-table entries per sequence; smaller blocks mean more of them.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="note" title="It's not only vLLM">
+PagedAttention was introduced with vLLM, and the idea is now everywhere. TensorRT-LLM, SGLang, TGI and llama.cpp all manage KV memory in blocks or pages. Some use different block sizes, or token-granular pools with radix trees, but the principle is the same: **no per-request contiguous reservation**.
+</Callout>
+
+<Interview>
+  <Q q="What problem does PagedAttention solve?" level="core">
+    KV memory waste from contiguous, max-length, per-request reservation: reserved-but-unused space, internal fragmentation, and external fragmentation. By allocating fixed-size blocks on demand and mapping them through a per-sequence block table, waste drops to less than one block per sequence, so many more sequences fit in the same memory.
+  </Q>
+  <Q q="What is a block table, and who uses it?" level="core">
+    A small array per sequence mapping logical block index to physical block id. The scheduler and block manager update it as blocks are allocated and freed. The attention kernel reads it to locate each token's K and V in the shared physical pool.
+  </Q>
+  <Q q="How does copy-on-write work for parallel sampling?" level="mid">
+    All samples' block tables point to the same prompt blocks, and each block's reference count equals the number of sequences using it. When a sample must append to a shared, partially filled block, the engine allocates a new block, copies the existing tokens, decrements the old block's reference count, and writes into the copy. Full blocks are read-only and stay shared.
+  </Q>
+  <Q q="What are the trade-offs in choosing block size?" level="mid">
+    Smaller blocks mean less tail waste and finer-grained prefix sharing, but larger block tables, more indirection, and less efficient memory access in the kernel. Larger blocks mean the opposite. Around 16 tokens is a common balance for GPU engines.
+  </Q>
+  <Q q="Does paging the KV cache slow down attention?" level="senior">
+    Slightly, and it is usually more than paid back. The kernel does one extra index lookup per block and gathers from non-contiguous addresses, but each block is a contiguous chunk of several KB, so memory accesses stay coalesced. The memory freed up allows far bigger batches, which matters much more for throughput than a few percent of kernel speed.
+  </Q>
+  <Q q="Why can't the engine just reserve exactly the space each request needs?" level="senior">
+    The output length is unknown until the model emits an end-of-sequence token or hits <code>max_tokens</code>. Reserving for <code>max_tokens</code> brings back the waste problem. Growing contiguous buffers would need reallocation and copying. Paging sidesteps both: memory grows one block at a time, wherever there is room.
+  </Q>
+</Interview>

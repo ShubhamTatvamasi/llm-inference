@@ -1,0 +1,101 @@
+---
+/* Embedding lookup: a token ID simply selects one row of a [vocab × d_model] matrix. */
+---
+<div data-viz="emb-lookup"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, select, stats, narration, C, fmt, rng, arrowDefs, uniq } from '../../lib/viz';
+  import { MODELS, getModel } from '../../data/hardware';
+
+  const TOKENS = [
+    { t: 'The', id: 791 }, { t: '␣cat', id: 8415 }, { t: '␣sat', id: 7731 },
+    { t: '␣on', id: 389 }, { t: '␣the', id: 279 }, { t: '␣mat', id: 5634 },
+  ];
+  const W = 940, H = 400;
+  const DIMS = 16;
+  const ROW_IDS = [0, 1, 279, 389, 791, 2048, 5634, 7731, 8415, 15000, 30000, 50000, 70000, 90000, 110000, 125000];
+
+  const MX = 250, MY = 40, MW = 260, RH = 18;
+  const OX = 610, OY = 70, CELL = 18;
+
+  function vec(id: number) { const r = rng(id * 7919); return Array.from({ length: DIMS }, () => (r() * 2 - 1)); }
+
+  mountAll('emb-lookup', (root) => {
+    let model = getModel('llama3-8b');
+    let i = -1;
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Token IDs selecting rows from the embedding matrix' });
+    const arrowId = uniq('emba');
+    const say = narration(root);
+    const st = stats(root, ['Embedding matrix', 'Parameters', 'Memory (BF16)', 'Share of model']);
+
+    let rowIds = ROW_IDS; let ROWS = ROW_IDS.length + 2; // + ellipsis + last row
+    const rowOf = (id: number) => rowIds.indexOf(id);
+
+    function cellFill(v: number) { return v >= 0 ? C.token : C.decode; }
+
+    function render() {
+      clear(svg);
+      rowIds = ROW_IDS.filter((x) => x < model.vocab - 1); ROWS = rowIds.length + 2;
+      const arrow = arrowDefs(svg, arrowId, C.accent);
+      // tokens column
+      text(svg, 20, 18, 'token → id', { class: 't-dim t-small t-bold' });
+      TOKENS.forEach((tk, j) => {
+        const y = MY + 10 + j * 46;
+        const on = j === i; const done = j <= i;
+        rect(svg, 20, y, 130, 32, done ? C.tokenSoft : C.surface2, { stroke: on ? C.token : C.border, 'stroke-width': on ? 2 : 1, rx: 8 });
+        text(svg, 32, y + 16, tk.t, { class: 't-bold t-mono', 'font-size': 12 });
+        text(svg, 140, y + 16, String(tk.id), { 'text-anchor': 'end', class: 't-mono t-small t-dim' });
+      });
+
+      // matrix
+      text(svg, MX, 18, `Embedding matrix  E  [${fmt.int(model.vocab)} × ${fmt.int(model.hidden)}]`, { class: 't-dim t-small t-bold' });
+      const active = i >= 0 ? rowOf(TOKENS[i].id) : -1;
+      for (let r = 0; r < ROWS; r++) {
+        const y = MY + r * RH;
+        if (r === ROWS - 2) { text(svg, MX + MW / 2, y + RH / 2, '⋮', { 'text-anchor': 'middle', class: 't-faint' }); continue; }
+        const on = r === active;
+        rect(svg, MX, y + 1, MW, RH - 3, on ? C.tokenSoft : C.surface2, { stroke: on ? C.token : 'none', 'stroke-width': 1.5, rx: 2 });
+        // faint content stripes
+        const v = vec(r * 13 + 1);
+        for (let d = 0; d < DIMS; d++) rect(svg, MX + 3 + d * ((MW - 6) / DIMS), y + 3, (MW - 6) / DIMS - 1, RH - 7, cellFill(v[d]), { opacity: (on ? 0.9 : 0.18) * Math.abs(v[d]), rx: 1 });
+        const lbl = r === ROWS - 1 ? String(model.vocab - 1) : String(rowIds[r]);
+        text(svg, MX - 8, y + RH / 2, lbl, { 'text-anchor': 'end', class: 't-mono t-small ' + (on ? 't-bold' : 't-faint') });
+      }
+      // arrows
+      if (i >= 0) {
+        const ty = MY + 10 + i * 46 + 16;
+        const ry = MY + active * RH + RH / 2;
+        s('path', { d: `M152,${ty} C200,${ty} 200,${ry} ${MX - 50},${ry}`, fill: 'none', stroke: C.accent, 'stroke-width': 1.6, 'marker-end': arrow }, svg);
+        const oy = OY + i * (CELL + 8) + CELL / 2;
+        s('path', { d: `M${MX + MW + 4},${ry} C${MX + MW + 50},${ry} ${OX - 50},${oy} ${OX - 8},${oy}`, fill: 'none', stroke: C.accent, 'stroke-width': 1.6, 'marker-end': arrow }, svg);
+      }
+      // output matrix
+      text(svg, OX, 18, `Output X  [n × ${fmt.int(model.hidden)}]`, { class: 't-dim t-small t-bold' });
+      text(svg, OX, 40, `(showing ${DIMS} of ${fmt.int(model.hidden)} dims)`, { class: 't-faint t-small' });
+      TOKENS.forEach((tk, j) => {
+        const y = OY + j * (CELL + 8);
+        const v = vec(tk.id);
+        for (let d = 0; d < DIMS; d++) {
+          const x = OX + d * (CELL + 1);
+          if (j <= i) rect(svg, x, y, CELL, CELL, cellFill(v[d]), { opacity: 0.25 + 0.75 * Math.abs(v[d]), rx: 3 });
+          else rect(svg, x, y, CELL, CELL, 'none', { stroke: C.border, 'stroke-dasharray': '2 2', rx: 3 });
+        }
+        text(svg, OX + DIMS * (CELL + 1) + 6, y + CELL / 2, `x${j}`, { class: 't-mono t-small t-faint' });
+      });
+      text(svg, OX, H - 18, 'violet = positive, blue = negative', { class: 't-faint t-small' });
+
+      const params = model.vocab * model.hidden;
+      st.set('Embedding matrix', `${fmt.num(model.vocab, 0)} × ${fmt.int(model.hidden)}`, 'one row per vocabulary entry');
+      st.set('Parameters', fmt.num(params, 2), 'LM head is another matrix this size (unless tied)');
+      st.set('Memory (BF16)', fmt.bytes(params * 2), 'read only for the rows you need');
+      st.set('Share of model', fmt.pct(params / model.params, 1), model.name);
+
+      if (i < 0) say('Press <b>Play</b>. Each token ID is used as a <b>row index</b>. No multiplication happens; the vector is simply copied out.');
+      else say(`Token <b>“${TOKENS[i].t}”</b> has id <b>${TOKENS[i].id}</b>, so we copy row ${TOKENS[i].id} of E: a vector of <b>${fmt.int(model.hidden)}</b> numbers. Stacking the rows gives the input X to layer 1.`);
+    }
+
+    player(bar, root, { step: () => { i++; return i < TOKENS.length - 1; }, reset: () => { i = -1; }, render, interval: 1000, autoplay: true });
+    select(bar, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+  });
+</script>

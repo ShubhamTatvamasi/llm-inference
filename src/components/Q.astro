@@ -1,0 +1,25 @@
+---
+interface Props { q: string; level?: 'core' | 'mid' | 'senior' }
+const { q, level = 'core' } = Astro.props;
+---
+<details class="qa">
+  <summary><span class={`lv ${level}`}>{level}</span><span class="qq">{q}</span><span class="chev" aria-hidden="true">›</span></summary>
+  <div class="ans"><slot /></div>
+</details>
+<style>
+  .qa { border-top: 1px solid var(--border); }
+  .qa:first-child { border-top: 0; }
+  summary { list-style: none; cursor: pointer; display: flex; align-items: flex-start; gap: 12px; padding: 13px 4px; font-weight: 560; }
+  summary::-webkit-details-marker { display: none; }
+  summary:hover .qq { color: var(--accent); }
+  .qq { flex: 1; transition: color 0.15s; }
+  .chev { color: var(--text-faint); transition: transform 0.2s; font-size: 1.2rem; line-height: 1.2; }
+  .qa[open] .chev { transform: rotate(90deg); }
+  .lv { flex: none; font-family: var(--font-mono); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.08em; padding: 3px 7px; border-radius: 6px; margin-top: 3px; }
+  .lv.core { background: var(--c-kv-soft); color: var(--c-kv); }
+  .lv.mid { background: var(--c-decode-soft); color: var(--c-decode); }
+  .lv.senior { background: var(--c-token-soft); color: var(--c-token); }
+  .ans { padding: 0 4px 14px 62px; color: var(--text-dim); font-size: 0.95rem; }
+  .ans :global(p) { margin: 0 0 0.6rem; }
+  @media (max-width: 640px) { .ans { padding-left: 4px; } }
+</style>

@@ -1,0 +1,73 @@
+---
+/* How expensive is computing the token mask? Naive per-token checking vs precomputed
+   (context-independent tokens cached ahead of time), compared with the GPU step it must hide behind. */
+---
+<div data-viz="struct-cost"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, select, slider, segmented, stats, legend, C, fmt, s } from '../../lib/viz';
+
+  const W = 940, H = 230;
+  const GRAMMARS = {
+    simple: { label: 'Small JSON schema', ctxDep: 0.005, compileMs: 8 },
+    nested: { label: 'Nested JSON + enums', ctxDep: 0.015, compileMs: 60 },
+    huge: { label: 'Large grammar (e.g. full SQL)', ctxDep: 0.04, compileMs: 900 },
+  } as const;
+  const NS_PER_CHAR = 8;     // one automaton transition, CPU
+  const AVG_TOK_CHARS = 4.5;
+  const THREADS = 8;
+
+  mountAll('struct-cost', (root) => {
+    let vocab = 128256, batch = 32, g: keyof typeof GRAMMARS = 'nested';
+    const bar = ctrlBar(root);
+    select(bar, 'Vocabulary', [
+      { value: '32000', label: '32k (Llama 2)' }, { value: '128256', label: '128k (Llama 3)' },
+      { value: '151936', label: '152k (Qwen3)' }, { value: '201088', label: '200k' },
+    ], String(vocab), (v) => { vocab = Number(v); render(); });
+    segmented(bar, Object.entries(GRAMMARS).map(([k, v]) => ({ value: k, label: v.label })), g, (v) => { g = v as typeof g; render(); });
+    const bar2 = ctrlBar(root);
+    const BS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+    slider(bar2, { label: 'Constrained sequences in batch', min: 0, max: BS.length - 1, value: 5, format: (i) => String(BS[i]), onInput: (i) => { batch = BS[i]; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Mask computation time vs GPU step time' });
+    const st = stats(root, ['GPU decode step', 'Naive mask (all tokens)', 'Precomputed mask', 'First-use compile']);
+    legend(root, [['GPU forward pass (8B model, H100)', C.decode], ['Naive: check every token on the CPU', C.waste], ['Precomputed: check only context-dependent tokens', C.kv]]);
+
+    function render() {
+      clear(svg);
+      const G = GRAMMARS[g];
+      const gpuMs = Math.max(4.8, batch * 0.027) + 1.5; // weights stream + compute + overheads
+      const perSeqNaive = (vocab * AVG_TOK_CHARS * NS_PER_CHAR) / 1e6; // ms
+      const naiveMs = (perSeqNaive * batch) / THREADS;
+      const perSeqPre = (vocab * G.ctxDep * AVG_TOK_CHARS * NS_PER_CHAR) / 1e6 + 0.01;
+      const preMs = (perSeqPre * batch) / THREADS;
+      const bars = [
+        { label: 'GPU step', ms: gpuMs, color: C.decode },
+        { label: 'Naive mask', ms: naiveMs, color: C.waste },
+        { label: 'Precomputed', ms: preMs, color: C.kv },
+      ];
+      const maxMs = Math.max(...bars.map((b) => b.ms), gpuMs * 1.5);
+      const X0 = 130, X1 = W - 140;
+      const sx = (ms: number) => (ms / maxMs) * (X1 - X0);
+      // overlap zone: CPU mask work done while the GPU runs the forward pass is hidden
+      rect(svg, X0, 14, sx(gpuMs), 36 * 3 + 20, C.decodeSoft, { rx: 6, opacity: 0.5 });
+      text(svg, X0 + 8, 28, 'hidden if mask finishes inside the GPU step (CPU/GPU overlap)', { class: 't-small', fill: C.decode });
+      bars.forEach((b, i) => {
+        const y = 44 + i * 40;
+        text(svg, 16, y + 11, b.label, { class: 't-bold t-small' });
+        rect(svg, X0, y, Math.max(2, sx(Math.min(b.ms, maxMs))), 22, b.color, { rx: 5 });
+        const over = i > 0 && b.ms > gpuMs;
+        text(svg, X0 + Math.min(sx(b.ms), X1 - X0) + 8, y + 11, `${fmt.ms(b.ms)}${over ? `  → stalls every step by ${fmt.ms(b.ms - gpuMs)}` : i > 0 ? '  ✓ hidden' : ''}`, { class: 't-small t-mono', fill: over ? C.waste : i > 0 ? C.good : C.text });
+      });
+      s('line', { x1: X0 + sx(gpuMs), x2: X0 + sx(gpuMs), y1: 14, y2: 170, stroke: C.decode, 'stroke-dasharray': '4 3' }, svg);
+      text(svg, 16, 200, `${fmt.int(vocab)} tokens × ${AVG_TOK_CHARS} chars × ~${NS_PER_CHAR} ns/step ÷ ${THREADS} CPU threads; precomputing leaves ~${(G.ctxDep * 100).toFixed(1)}% of tokens to check.`, { class: 't-small t-faint' });
+      text(svg, 16, 218, 'Illustrative numbers; real engines (xgrammar, llguidance) add token tries, persistent stacks and schema caches.', { class: 't-small t-faint' });
+
+      st.set('GPU decode step', fmt.ms(gpuMs), `batch ${batch}`);
+      st.set('Naive mask (all tokens)', fmt.ms(naiveMs), naiveMs > gpuMs ? 'slower than the GPU!' : 'hidden', naiveMs > gpuMs ? C.waste : C.good);
+      st.set('Precomputed mask', fmt.ms(preMs), preMs > gpuMs ? 'adds latency' : 'hidden behind GPU', preMs > gpuMs ? C.waste : C.good);
+      st.set('First-use compile', fmt.ms(G.compileMs), 'once per schema, then cached');
+    }
+    render();
+  });
+</script>

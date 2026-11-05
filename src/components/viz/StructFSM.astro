@@ -1,0 +1,235 @@
+---
+/* Grammar-constrained decoding. A tiny character-level automaton decides, for every candidate
+   token, whether output + token can still become a valid match. Invalid tokens are masked
+   (logit → −∞) before sampling. */
+---
+<div data-viz="struct-fsm"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, player, segmented, stats, legend, narration, C, s } from '../../lib/viz';
+
+  type Seg =
+    | { kind: 'lit'; s: string; label: string }
+    | { kind: 'cls'; test: (c: string) => boolean; min: number; max: number; label: string }
+    | { kind: 'alt'; opts: string[]; label: string };
+  type St = { seg: number; pos: number; alt: number };
+
+  const notQuote = (c: string) => c !== '"' && c !== '\\' && c !== '\n';
+  const digit = (c: string) => c >= '0' && c <= '9';
+
+  const SCHEMAS: Record<string, { name: string; prompt: string; spec: string; segs: Seg[]; steps: [string, number][][] }> = {
+    json: {
+      name: 'JSON schema',
+      prompt: 'Extract the person as JSON: “Ada, 36, lives in London.”',
+      spec: '{ name: string, age: integer }',
+      segs: [
+        { kind: 'lit', s: '{"name": "', label: '{"name": "' },
+        { kind: 'cls', test: notQuote, min: 1, max: 24, label: 'string (≥1 char)' },
+        { kind: 'lit', s: '", "age": ', label: '", "age": ' },
+        { kind: 'cls', test: digit, min: 1, max: 3, label: 'integer' },
+        { kind: 'lit', s: '}', label: '}' },
+      ],
+      steps: [
+        [['Sure', 5.2], ['```', 4.1], ['{"', 3.6], ['{', 3.0], [' {', 2.4], ['\n', 2.2]],
+        [['name', 6.1], ['Name', 3.0], ['user', 2.4], ['"', 2.0], ['na', 1.5]],
+        [['":', 5.8], ['"', 3.1], ['_', 2.0], ['s', 1.4]],
+        [[' "', 6.0], [' null', 2.5], [' {', 1.9], [' ', 1.2]],
+        [['Ada', 4.9], ['Alan', 4.3], ['"', 3.0], ['A', 2.0]],
+        [['",', 5.5], [' Lovelace', 4.8], ['"}', 3.9], ['"', 2.1]],
+        [[' "', 6.2], ['\n', 2.0], [' ', 1.0]],
+        [['age', 5.9], ['email', 4.4], ['a', 2.0]],
+        [['":', 6.4], ['"', 2.0], [':', 1.0]],
+        [[' "', 4.1], [' 36', 3.8], [' ', 2.0], ['36', 1.5]],
+        [['}', 5.2], [',', 4.6], ['0', 1.2], ['\n', 1.0]],
+        [['\n', 4.0], ['```', 3.5], ['<eos>', 3.0], [' ', 1.0]],
+      ],
+    },
+    regex: {
+      name: 'Regex',
+      prompt: 'When did Apollo 11 land on the Moon? Answer as a date.',
+      spec: '\\d{4}-\\d{2}-\\d{2}',
+      segs: [
+        { kind: 'cls', test: digit, min: 4, max: 4, label: '\\d{4}' },
+        { kind: 'lit', s: '-', label: '-' },
+        { kind: 'cls', test: digit, min: 2, max: 2, label: '\\d{2}' },
+        { kind: 'lit', s: '-', label: '-' },
+        { kind: 'cls', test: digit, min: 2, max: 2, label: '\\d{2}' },
+      ],
+      steps: [
+        [['The', 5.5], ['July', 4.8], ['19', 4.0], ['1', 2.2], ['"', 1.5]],
+        [['69', 6.0], ['6', 2.0], ['-', 1.0]],
+        [[',', 4.1], [' ', 3.5], ['-', 3.0], ['-07', 2.8]],
+        [['07', 5.2], ['July', 4.0], ['7', 3.0]],
+        [['-', 5.0], ['/', 2.2], ['.', 1.5]],
+        [['20', 5.5], ['2', 2.0], ['21', 1.0]],
+        [['.', 4.0], ['T', 3.1], [' ', 2.9], ['<eos>', 2.5]],
+      ],
+    },
+    choice: {
+      name: 'Choice',
+      prompt: 'Sentiment of: “The service was fine, nothing special.”',
+      spec: 'positive | negative | neutral',
+      segs: [{ kind: 'alt', opts: ['positive', 'negative', 'neutral'], label: 'positive | negative | neutral' }],
+      steps: [
+        [['The', 5.0], ['Mixed', 4.6], ['ne', 3.9], ['neutral', 3.7], ['pos', 3.5], ['Neutral', 3.2]],
+        [['utral', 5.0], ['gative', 4.0], ['ut', 2.0], ['.', 1.5]],
+        [['.', 3.6], ['ly', 2.8], ['<eos>', 2.6]],
+      ],
+    },
+  };
+
+  // ---------- tiny NFA over the segment list
+  function closure(segs: Seg[], states: St[]): St[] {
+    const out: St[] = []; const seen = new Set<string>();
+    const push = (x: St) => { const k = `${x.seg}:${x.pos}:${x.alt}`; if (!seen.has(k)) { seen.add(k); out.push(x); stack.push(x); } };
+    const stack: St[] = [];
+    states.forEach(push);
+    while (stack.length) {
+      const st = stack.pop()!;
+      if (st.seg >= segs.length) continue;
+      const g = segs[st.seg];
+      if (g.kind === 'alt' && st.alt < 0) { g.opts.forEach((_, i) => push({ seg: st.seg, pos: 0, alt: i })); continue; }
+      const done = g.kind === 'lit' ? st.pos === g.s.length : g.kind === 'cls' ? st.pos >= g.min : st.pos === g.opts[st.alt].length;
+      if (done) push({ seg: st.seg + 1, pos: 0, alt: -1 });
+    }
+    return out.filter((x) => !(x.seg < segs.length && segs[x.seg].kind === 'alt' && x.alt < 0));
+  }
+  function run(segs: Seg[], str: string): St[] {
+    let states = closure(segs, [{ seg: 0, pos: 0, alt: -1 }]);
+    for (const ch of str) {
+      const next: St[] = [];
+      for (const st of states) {
+        if (st.seg >= segs.length) continue;
+        const g = segs[st.seg];
+        if (g.kind === 'lit' && g.s[st.pos] === ch) next.push({ ...st, pos: st.pos + 1 });
+        else if (g.kind === 'cls' && st.pos < g.max && g.test(ch)) next.push({ ...st, pos: st.pos + 1 });
+        else if (g.kind === 'alt' && g.opts[st.alt][st.pos] === ch) next.push({ ...st, pos: st.pos + 1 });
+      }
+      states = closure(segs, next);
+      if (!states.length) break;
+    }
+    return states;
+  }
+  const isComplete = (segs: Seg[], states: St[]) => states.some((x) => x.seg >= segs.length);
+
+  const show = (t: string) => t.replace(/ /g, '␣').replace(/\n/g, '⏎');
+  const W = 940, H = 420;
+
+  mountAll('struct-fsm', (root) => {
+    let key: keyof typeof SCHEMAS = 'json';
+    let stepI = 0, phase = 0; // phase 0 = show logits + mask, 1 = picked & appended
+    let out: string[] = [];
+
+    const bar = ctrlBar(root);
+    const bar2 = ctrlBar(root);
+    segmented(bar2, Object.entries(SCHEMAS).map(([k, v]) => ({ value: k, label: v.name })), key, (v) => { key = v as keyof typeof SCHEMAS; reset(); render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Candidate tokens, the grammar mask, and the automaton state' });
+    const say = narration(root);
+    const st = stats(root, ['Step', 'Tokens masked', 'Model’s #1 allowed?', 'Output valid so far']);
+    legend(root, [['Allowed token', C.decode], ['Masked (logit → −∞)', C.waste], ['Chosen', C.kv], ['Active automaton state', C.accent]]);
+
+    function reset() { stepI = 0; phase = 0; out = []; }
+
+    function evalStep() {
+      const sc = SCHEMAS[key];
+      const idx = Math.min(stepI, sc.steps.length - 1);
+      const cands = sc.steps[idx];
+      const prefix = out.slice(0, idx).join(''); // output BEFORE this step's token
+      const rows = cands.map(([tok, logit]) => {
+        let allowed: boolean;
+        if (tok === '<eos>') allowed = isComplete(sc.segs, run(sc.segs, prefix));
+        else allowed = run(sc.segs, prefix + tok).length > 0;
+        return { tok, logit, allowed };
+      });
+      const z = rows.reduce((a, r) => a + Math.exp(r.logit), 0);
+      const za = rows.filter((r) => r.allowed).reduce((a, r) => a + Math.exp(r.logit), 0) || 1;
+      const chosen = rows.filter((r) => r.allowed).sort((a, b) => b.logit - a.logit)[0];
+      return { rows: rows.map((r) => ({ ...r, p: Math.exp(r.logit) / z, pm: r.allowed ? Math.exp(r.logit) / za : 0 })), chosen };
+    }
+
+    function step() {
+      const sc = SCHEMAS[key];
+      if (stepI >= sc.steps.length) return false;
+      if (phase === 0) { phase = 1; const { chosen } = evalStep(); if (chosen.tok !== '<eos>') out.push(chosen.tok); else out.push(''); return true; }
+      phase = 0; stepI++;
+      if (stepI >= sc.steps.length) { stepI = sc.steps.length; return false; }
+      return true;
+    }
+
+    function render() {
+      clear(svg);
+      const sc = SCHEMAS[key];
+      const finished = stepI >= sc.steps.length;
+      const curIdx = Math.min(stepI, sc.steps.length - 1);
+      // prompt + output
+      text(svg, 16, 16, `Prompt: ${sc.prompt}`, { class: 't-small t-dim' });
+      text(svg, 16, 34, `Constraint: ${sc.spec}`, { class: 't-small t-mono', fill: C.accent });
+      rect(svg, 12, 48, W - 24, 40, C.surface2, { rx: 9, stroke: C.border });
+      let x = 24;
+      out.forEach((t, i) => {
+        if (!t) return;
+        const w = Math.max(8, t.length * 7.6);
+        const isNew = phase === 1 && i === out.length - 1 && !finished;
+        rect(svg, x - 1, 56, w + 2, 24, isNew ? C.kvSoft : i % 2 ? C.tokenSoft : C.decodeSoft, { rx: 4, stroke: isNew ? C.kv : 'none' });
+        text(svg, x, 68, show(t), { class: 't-mono', 'font-size': 12.5, 'xml:space': 'preserve' });
+        x += w + 4;
+      });
+      if (!finished || phase === 0) s('rect', { x, y: 57, width: 2, height: 22, fill: C.accent }, svg);
+      if (finished) text(svg, W - 28, 68, '✓ complete', { 'text-anchor': 'end', class: 't-bold', fill: C.good });
+
+      // candidates
+      const { rows, chosen } = evalStep();
+      const raw1 = [...rows].sort((a, b) => b.logit - a.logit)[0];
+      const CY = 112, RH = 30, LX = 16, BX = 150, BW = 300;
+      text(svg, LX, CY - 8, `Step ${curIdx + 1}: model’s top candidates`, { class: 't-small t-bold t-dim' });
+      text(svg, BX + BW + 10, CY - 8, 'probability: raw → after mask', { class: 't-small t-faint' });
+      rows.forEach((r, i) => {
+        const y = CY + i * RH;
+        const isChosen = r === chosen && (phase === 1 || finished);
+        rect(svg, LX - 4, y, 128, RH - 6, isChosen ? C.kv : r.allowed ? C.decodeSoft : C.wasteSoft, { rx: 6, stroke: r.allowed ? 'none' : C.waste, 'stroke-dasharray': r.allowed ? null : '3 3' });
+        const t = text(svg, LX + 4, y + (RH - 6) / 2, show(r.tok), { class: 't-mono t-bold', 'font-size': 12.5, fill: isChosen ? 'var(--bg)' : r.allowed ? C.text : C.waste });
+        if (!r.allowed) t.setAttribute('text-decoration', 'line-through');
+        // raw prob (ghost) and masked prob
+        rect(svg, BX, y + 3, BW * r.p, 8, C.mem, { rx: 3, opacity: 0.55 });
+        rect(svg, BX, y + 13, BW * r.pm, 8, r.allowed ? (isChosen ? C.kv : C.decode) : C.waste, { rx: 3, opacity: r.allowed ? 1 : 0 });
+        text(svg, BX + BW + 10, y + (RH - 6) / 2, r.allowed ? `${(r.p * 100).toFixed(0)}% → ${(r.pm * 100).toFixed(0)}%` : `${(r.p * 100).toFixed(0)}% → masked`, { class: 't-small t-mono', fill: r.allowed ? C.dim : C.waste });
+        if (r === raw1) text(svg, BX + BW + 120, y + (RH - 6) / 2, '← model’s #1', { class: 't-small', fill: C.prefill });
+      });
+
+      // automaton chain
+      const states = run(sc.segs, out.join(''));
+      const active = new Set(states.map((x) => x.seg));
+      const AY = 330;
+      text(svg, 16, AY - 22, 'Automaton (compiled from the constraint). Highlighted = where the output can be right now', { class: 't-small t-bold t-dim' });
+      const n = sc.segs.length + 1;
+      const gap = 18;
+      const bw = Math.min(170, (W - 32 - gap * (n - 1)) / n);
+      for (let i = 0; i < n; i++) {
+        const bx = 16 + i * (bw + gap);
+        const isEnd = i === sc.segs.length;
+        const on = active.has(i);
+        const label = isEnd ? 'ACCEPT' : sc.segs[i].label;
+        rect(svg, bx, AY, bw, 42, on ? C.accentSoft : C.surface2, { rx: 9, stroke: on ? C.accent : C.border, 'stroke-width': on ? 2 : 1 });
+        text(svg, bx + bw / 2, AY + 21, label.length > 22 ? label.slice(0, 21) + '…' : label, { 'text-anchor': 'middle', class: isEnd ? 't-bold' : 't-mono', 'font-size': 11.5, fill: on ? C.accent : C.dim });
+        if (i < n - 1) s('path', { d: `M${bx + bw + 3},${AY + 21} h${gap - 6}`, stroke: C.borderStrong, 'stroke-width': 1.5, 'marker-end': 'none' }, svg);
+      }
+      if (sc.segs.length === 1 && sc.segs[0].kind === 'alt') {
+        const alive = states.filter((x) => x.seg === 0).map((x) => (sc.segs[0] as { opts: string[] }).opts[x.alt]);
+        if (alive.length) text(svg, 16, AY + 64, `branches still alive: ${alive.join(', ')}`, { class: 't-small t-mono', fill: C.accent });
+      }
+
+      const masked = rows.filter((r) => !r.allowed).length;
+      st.set('Step', `${curIdx + 1} / ${sc.steps.length}`);
+      st.set('Tokens masked', `${masked} of ${rows.length}`, 'shown candidates; a real vocab has ~100k', masked ? C.waste : undefined);
+      st.set('Model’s #1 allowed?', raw1.allowed ? 'yes' : 'no', raw1.allowed ? 'mask changed nothing' : `wanted “${show(raw1.tok)}”`, raw1.allowed ? C.good : C.prefill);
+      st.set('Output valid so far', states.length ? 'valid prefix' : 'invalid', isComplete(sc.segs, states) ? 'and a complete match' : 'can still be completed', C.good);
+
+      const tokTxt = `“${show(chosen.tok)}”`;
+      if (finished) say(`Done. The output is guaranteed to match <b>${sc.spec}</b>. Every token was checked before it was sampled.`);
+      else if (phase === 0) say(`The model proposes logits for every token. The engine checks each one against the automaton and sets <b>${masked}</b> invalid one${masked === 1 ? '' : 's'} to −∞. ${raw1.allowed ? '' : `The model actually preferred “${show(raw1.tok)}”, which would break the format.`}`);
+      else say(chosen.tok === '<eos>' ? '<b>End of sequence</b> is only allowed once the automaton reaches ACCEPT.' : `Sample from the renormalized distribution → ${tokTxt}. The automaton advances. Note that tokens can span grammar boundaries (e.g. <code>",</code> closes the string <i>and</i> starts the next literal), so masks are computed at the <b>character</b> level.`);
+    }
+
+    player(bar, root, { step, reset, render, interval: 1300, autoplay: true });
+  });
+</script>

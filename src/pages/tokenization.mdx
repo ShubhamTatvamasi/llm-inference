@@ -1,0 +1,114 @@
+---
+layout: ../layouts/Chapter.astro
+title: Text → Tokens
+description: Before a model can read your prompt, the text has to become a list of integers. How BPE builds that list, why chat templates add hidden tokens, and why every serving metric is counted in tokens.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import TokBPE from '../components/viz/TokBPE.astro';
+import TokChat from '../components/viz/TokChat.astro';
+import TokStream from '../components/viz/TokStream.astro';
+
+A language model never sees letters. It sees **token IDs**: integers between 0 and the vocabulary size (about 128K for Llama 3, about 150K for Qwen3). The **tokenizer** is the small, deterministic program that converts text into those integers on the way in and converts them back into text on the way out.
+
+Tokenization runs on the CPU, before and after the GPU work, so it is easy to ignore. It still matters a great deal for serving, because **everything an engine measures is counted in tokens**: context length, KV-cache size, batch budgets, latency per token, and price.
+
+## Why not characters, why not words?
+
+There are two obvious choices, and both are bad:
+
+- **Characters (or bytes)** give a tiny vocabulary, but sequences become 4–5× longer. Every extra position costs a full forward pass during decode and makes attention more expensive.
+- **Whole words** give short sequences, but the vocabulary explodes. Any word missing from the vocabulary, such as a typo, a name or a new API, cannot be represented at all.
+
+**Subword tokenization** sits between the two. Common words get a single token, and rare words are split into pieces the model has already seen. Modern LLMs almost all use **byte-level BPE** (byte-pair encoding) or a close relative such as SentencePiece-BPE.
+
+## BPE: merging the most frequent pairs
+
+BPE is learned once, from a training corpus:
+
+1. Start with the 256 possible **bytes** as the vocabulary. Any text in any language can be written as bytes, so nothing is ever "unknown".
+2. Count every adjacent pair of symbols in the corpus. **Merge the most frequent pair** into a new symbol and record that merge.
+3. Repeat until the vocabulary reaches its target size.
+
+The result is an **ordered list of merges**. To tokenize new text, split it into bytes and replay the merges in that same order. The diagram below does exactly this, using a real BPE that your browser trained a moment ago on a short English-and-Python corpus.
+
+<Viz title="Byte-level BPE, merge by merge" label="Live">
+  <TokBPE />
+  <Fragment slot="caption">
+    <p>Each chip is a token. A green ring marks the merge that was just applied. Red chips are raw bytes that no merge covers. Try <b>Hindi</b> or <b>Emoji</b>: the toy vocabulary saw almost none of that text, so it falls back to one token per byte. Drag <b>Merges learned</b> down to see how a smaller vocabulary produces more tokens.</p>
+  </Fragment>
+</Viz>
+
+Two things to notice:
+
+- **The leading space belongs to the word.** "␣model" and "model" are different tokens. That is why the same word can cost a different number of tokens depending on what precedes it.
+- **Coverage depends on the training corpus.** Text that is underrepresented in the tokenizer's training data, such as many non-Latin scripts, unusual code or long numbers, splits into many more tokens. The same sentence can cost 2–4× more tokens in Hindi than in English, which means more latency, more KV cache and a higher bill.
+
+Before merging, real tokenizers run a **pre-tokenizer**: a regular expression that splits text into words, number groups and punctuation, so merges never cross those boundaries. Llama 3, for example, splits numbers into chunks of at most three digits. That is one reason models find arithmetic on long numbers hard.
+
+## The tokens you never typed: chat templates
+
+A chat API takes a list of messages, but the model consumes **one flat sequence**. The **chat template** (a Jinja template stored with the model) renders the messages into that sequence, using **special tokens** to mark roles and turn boundaries. Special tokens are single IDs that ordinary user text can never produce.
+
+<Viz title="From messages to one token sequence" label="Interactive">
+  <TokChat />
+  <Fragment slot="caption">
+    <p>Violet chips are special tokens. With <code>add_generation_prompt</code> on, the template ends with an open assistant header. That header is the cue for the model to start writing its reply. Edit the messages and compare template styles.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="warn" title="Template mismatches are silent bugs">
+If the server applies a different template than the one the model was trained with (a missing BOS, the wrong role header, an extra newline), nothing crashes. Quality just quietly drops, tool calls break, or the model never stops. Always serve with the template that ships with the model weights, and pin it along with the model version.
+</Callout>
+
+Templates matter for serving performance too. Every request in a conversation starts with the **same** system prompt and the same earlier turns, rendered the same way. That identical prefix is what [prefix caching](../prefix-caching/) can reuse, so a template that injects something variable near the start (a timestamp, a request ID) destroys cache hits.
+
+## The way out: streaming detokenization
+
+During [decode](../prefill-decode/) the model produces one token ID per step, and the server streams each new piece of text to the client, usually as **Server-Sent Events**. With byte-level tokens there is a catch: one token can end **in the middle of a multi-byte UTF-8 character**. An emoji is 4 bytes, and a Devanagari letter is 3.
+
+<Viz title="Streaming tokens back into text" label="Live">
+  <TokStream />
+  <Fragment slot="caption">
+    <p>The <b>incremental detokenizer</b> keeps a small byte buffer and flushes only complete characters. Switch to <b>Naive per-token decode</b> to see the broken � characters a careless server would stream.</p>
+  </Fragment>
+</Viz>
+
+Production engines also detokenize with **context**. Some tokenizers (SentencePiece in particular) change how a token is spelled depending on its neighbours, for example whether a leading space is shown. So engines decode a small window of recent tokens and emit only the new suffix. That work is pure CPU and runs for every token of every request. At thousands of tokens per second it is significant, which is why engines move tokenization and detokenization off the main scheduling loop.
+
+## Why serving engineers care
+
+| Quantity | Measured in | Driven by tokens because… |
+|---|---|---|
+| Time to first token | ms | [Prefill](../prefill-decode/) cost grows with **prompt tokens** |
+| Time per output token | ms / token | each output token is one [decode step](../prefill-decode/) |
+| [KV cache](../kv-cache/) | bytes | stored **per token**, per layer |
+| Context limit | tokens | `max_model_len` counts prompt + output tokens |
+| Price | $ / 1M tokens | input and output tokens are often priced differently |
+
+<Callout type="tip" title="Rule of thumb">
+For English prose with a modern ~128K-entry vocabulary, expect about **4 characters, or 0.75 words, per token**. Code, JSON, other languages and numbers all cost more. Measure with the real tokenizer of the model you serve.
+</Callout>
+
+<Interview>
+  <Q q="Why do LLMs use subword tokens instead of characters or words?" level="core">
+    Characters make sequences several times longer, which means more decode steps, more KV cache and quadratic attention cost. Words need a huge vocabulary and cannot represent unseen words. Subwords keep common words as one token and still cover anything by falling back to smaller pieces, and ultimately to bytes.
+  </Q>
+  <Q q="How does BPE training work, and how is new text tokenized?" level="core">
+    Start from bytes. Repeatedly merge the most frequent adjacent pair in the corpus and record each merge, in order, until the target vocabulary size is reached. To tokenize, split the text into bytes (after pre-tokenization) and apply the merges in that same order, lowest rank first, until no merge applies.
+  </Q>
+  <Q q="A customer says the same prompt costs far more tokens in their language. Why, and what does it affect?" level="mid">
+    The tokenizer's merges were learned mostly from other languages, so their script splits into many short pieces, sometimes single bytes. More tokens means a higher TTFT, a larger KV cache per request, fewer concurrent users, a smaller effective context and a higher per-token bill.
+  </Q>
+  <Q q="What is a chat template and what breaks if it is wrong?" level="mid">
+    It is the rule (usually a Jinja template shipped with the model) that renders messages into one sequence, with special tokens marking roles and turn ends. A wrong template causes silent quality loss, broken tool calls, or a model that never emits its end-of-turn token and runs to `max_tokens`.
+  </Q>
+  <Q q="Why can't a server just decode each generated token on its own and stream it?" level="senior">
+    Byte-level tokens can split a multi-byte UTF-8 character, and some tokenizers spell a token differently depending on its neighbours. Engines use an incremental detokenizer: decode a window of recent tokens, hold back incomplete bytes, and emit only the new, complete suffix.
+  </Q>
+  <Q q="How can the chat template hurt prefix-cache hit rates?" level="senior">
+    Prefix caching matches identical token prefixes. If the template or system prompt puts per-request content near the start (a timestamp, a user ID, randomly ordered tools), every request diverges early and nothing after that point can be reused. Keep stable content first and variable content last.
+  </Q>
+</Interview>

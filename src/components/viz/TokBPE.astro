@@ -1,0 +1,98 @@
+---
+/* Live byte-level BPE: type text, then watch merges collapse bytes into tokens. */
+---
+<div data-viz="tok-bpe"></div>
+
+<script>
+  import { mountAll, h, ctrlBar, player, segmented, slider, stats, narration, checkbox, C, SERIES, SERIES_SOFT } from '../../lib/viz';
+  import { getBPE, initial, nextMerge, applyRank, label } from './tok-bpe';
+
+  const PRESETS: Record<string, string> = {
+    English: 'The tokenizer is serving the model its tokens.',
+    Code: 'for step in range(max_tokens): tokens.append(next_token)',
+    Numbers: 'In 2026 the price was 1234567 tokens for $3.50',
+    Hindi: 'नमस्ते दुनिया',
+    Emoji: 'Ship it 🚀🔥',
+  };
+
+  mountAll('tok-bpe', (root) => {
+    const bpe = getBPE(400);
+    const maxMerges = bpe.merges.length;
+    let text = PRESETS.English;
+    let budget = maxMerges;
+    let showIds = false;
+    let state: string[][] = [];
+    let last = -1; let lastCount = 0; let applied = 0;
+
+    const top = ctrlBar(root);
+    segmented(top, Object.keys(PRESETS).map((k) => ({ value: k, label: k })), 'English', (k) => { text = PRESETS[k]; input.value = text; p.reset(); });
+    const input = h('input', { class: 'text-input', type: 'text', value: text, 'aria-label': 'Text to tokenize', spellcheck: 'false' }, root);
+    input.addEventListener('input', () => { text = input.value; p.reset(); });
+
+    const bar = ctrlBar(root);
+    bar.style.marginTop = '12px';
+    const chips = h('div', { class: 'tokv-chips', 'aria-live': 'polite' }, root);
+    const say = narration(root);
+    const st = stats(root, ['Characters', 'UTF-8 bytes', 'Tokens', 'Chars / token', 'Vocab size']);
+
+    function tokenColor(sym: string) {
+      let hsh = 0; for (const ch of sym) hsh = (hsh * 31 + ch.charCodeAt(0)) >>> 0;
+      return hsh % 6;
+    }
+
+    function reset() { state = initial(text); last = -1; lastCount = 0; applied = 0; }
+    function step() {
+      const r = nextMerge(state, bpe, budget);
+      if (r < 0) return false;
+      const res = applyRank(state, bpe, r);
+      state = res.state; last = r; lastCount = res.count; applied++;
+      return nextMerge(state, bpe, budget) >= 0;
+    }
+    function render() {
+      chips.innerHTML = '';
+      const newSym = last >= 0 ? bpe.merges[last].join(',') : '';
+      let n = 0;
+      for (const w of state) {
+        const wd = h('span', { class: 'tokv-word' }, chips);
+        for (const sym of w) {
+          n++;
+          const c = tokenColor(sym);
+          const isNew = sym === newSym;
+          const isByte = !sym.includes(',') && Number(sym) >= 128;
+          const chip = h('span', { class: 'tokv-chip' + (isNew ? ' new' : '') + (isByte ? ' byte' : '') }, wd);
+          chip.style.background = isByte ? C.wasteSoft : SERIES_SOFT[c];
+          chip.style.borderColor = isNew ? C.kv : isByte ? C.waste : SERIES[c];
+          h('span', { class: 'tokv-t', text: label(sym) }, chip);
+          if (showIds) h('span', { class: 'tokv-id', text: String(bpe.id.get(sym)) }, chip);
+        }
+      }
+      const bytes = new TextEncoder().encode(text).length;
+      const chars = [...text].length;
+      st.set('Characters', String(chars));
+      st.set('UTF-8 bytes', String(bytes), 'start: one token per byte');
+      st.set('Tokens', String(n), applied ? `${applied} merge steps so far` : 'nothing merged yet', C.token);
+      st.set('Chars / token', n ? (chars / n).toFixed(2) : '–', 'English text with a real tokenizer: ~4');
+      st.set('Vocab size', String(256 + budget), `256 bytes + ${budget} merges`);
+      if (last < 0) say(`Every character starts as its raw <b>UTF-8 bytes</b> (${bytes} of them). Press <b>Play</b> to apply learned merges in rank order.`);
+      else {
+        const [a, b] = bpe.merges[last];
+        const done = nextMerge(state, bpe, budget) < 0;
+        say(`Merge rank <b>#${last}</b>: “${label(a)}” + “${label(b)}” → <b>“${label(a + ',' + b)}”</b> (token id ${256 + last}), applied ×${lastCount}.` + (done ? ` <b>Done</b>: no learned merge applies any more.` : ''));
+      }
+    }
+
+    const p = player(bar, root, { step, reset, render, interval: 520, autoplay: true });
+    slider(bar, { label: 'Merges learned', min: 0, max: maxMerges, value: budget, onInput: (v) => { budget = v; p.reset(); } });
+    checkbox(bar, 'Show IDs', false, (v) => { showIds = v; render(); });
+  });
+</script>
+
+<style is:global>
+  .tokv-chips { display: flex; flex-wrap: wrap; gap: 8px 4px; min-height: 64px; padding: 14px; margin-top: 4px; border: 1px dashed var(--border-strong); border-radius: 12px; background: color-mix(in srgb, var(--surface-2) 50%, transparent); align-items: flex-start; }
+  .tokv-word { display: inline-flex; gap: 2px; margin-right: 6px; }
+  .tokv-chip { display: inline-flex; flex-direction: column; align-items: center; padding: 3px 7px; border-radius: 7px; border: 1px solid; font-family: var(--font-mono); font-size: 0.86rem; line-height: 1.35; transition: transform 0.25s, box-shadow 0.25s; }
+  .tokv-chip.new { transform: translateY(-3px); box-shadow: 0 0 0 2px var(--c-kv), 0 6px 18px -4px var(--c-kv); }
+  .tokv-chip.byte { font-size: 0.74rem; }
+  .tokv-t { white-space: pre; color: var(--text); }
+  .tokv-id { font-size: 0.66rem; color: var(--text-faint); }
+</style>

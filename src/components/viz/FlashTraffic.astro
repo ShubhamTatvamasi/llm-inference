@@ -1,0 +1,83 @@
+---
+/* HBM traffic and memory footprint: naive attention vs FlashAttention, as context grows. */
+---
+<div data-viz="flash-traffic"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, select, slider, stats, legend, C, fmt } from '../../lib/viz';
+  import { GPUS, getGPU } from '../../data/hardware';
+
+  const W = 940, H = 250;
+  const NS = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+  const kfmt = (n: number) => (n >= 1024 ? `${n / 1024}K` : String(n));
+
+  mountAll('flash-traffic', (root) => {
+    let ni = 4, heads = 32, d = 128, br = 128;
+    let gpu = getGPU('h100');
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Sequence length N', min: 0, max: NS.length - 1, value: ni, format: (i) => kfmt(NS[i]), onInput: (i) => { ni = i; render(); } });
+    select(bar, 'Heads', [8, 32, 64].map((h) => ({ value: String(h), label: String(h) })), String(heads), (v) => { heads = Number(v); render(); });
+    select(bar, 'Q block size', [64, 128, 256].map((b) => ({ value: String(b), label: String(b) })), String(br), (v) => { br = Number(v); render(); });
+    select(bar, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'HBM traffic and time for naive versus FlashAttention' });
+    const st = stats(root, ['Attention FLOPs', 'Naive HBM traffic', 'Flash HBM traffic', 'Speed-up (one layer, prefill)']);
+    legend(root, [['Naive attention', C.waste], ['FlashAttention', C.kv], ['GPU memory capacity', C.text]]);
+
+    function render() {
+      clear(svg);
+      const N = NS[ni], bpe = 2;
+      const qkvo = 4 * N * heads * d * bpe;
+      const flops = 4 * N * N * heads * d * 0.5; // causal: QKᵀ and PV, half the matrix
+      // naive: write S, read S, write P, read P (full N×N per head) + Q,K,V,O
+      const naiveBytes = 4 * N * N * heads * bpe + qkvo;
+      const naiveFoot = N * N * heads * bpe; // S (or P) held in HBM at once
+      // flash: Q,O once; K,V re-read once per Q block (causal ≈ half)
+      const flashBytes = 2 * N * heads * d * bpe + (N / br) * 2 * N * heads * d * bpe * 0.5;
+      const flashFoot = N * heads * d * bpe; // output only (+ tiny stats)
+      const peak = gpu.bf16TF * 1e12 * 0.6, bw = gpu.bwTBs * 1e12 * 0.85;
+      const tNaive = Math.max(flops / peak, naiveBytes / bw);
+      const tFlash = Math.max(flops / peak, flashBytes / bw);
+
+      const LX = 190, BW = W - LX - 130;
+      const lo = 6, hi = 13; // 1 MB … 10 TB (log)
+      const xs = (b: number) => LX + Math.max(0, Math.min(1, (Math.log10(Math.max(b, 1)) - lo) / (hi - lo))) * BW;
+      const row = (y: number, label: string, sub: string, a: number, b: number, unit: (v: number) => string) => {
+        text(svg, 10, y + 10, label, { class: 't-small t-bold' });
+        text(svg, 10, y + 26, sub, { class: 't-small t-faint' });
+        rect(svg, LX, y, xs(a) - LX, 14, C.waste, { rx: 4 });
+        text(svg, xs(a) + 8, y + 7, unit(a), { class: 't-small t-mono' });
+        rect(svg, LX, y + 18, xs(b) - LX, 14, C.kv, { rx: 4 });
+        text(svg, xs(b) + 8, y + 25, unit(b), { class: 't-small t-mono' });
+      };
+      const gb = (v: number) => (v >= 1e12 ? `${(v / 1e12).toFixed(1)} TB` : v >= 1e9 ? `${(v / 1e9).toFixed(1)} GB` : `${fmt.num(v / 1e6, 0)} MB`);
+      for (const k of [6, 9, 12]) {
+        s('line', { x1: xs(10 ** k), y1: 10, x2: xs(10 ** k), y2: 180, stroke: C.border, 'stroke-dasharray': '2 3' }, svg);
+        text(svg, xs(10 ** k), 194, k === 6 ? '1 MB' : k === 9 ? '1 GB' : '1 TB', { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      }
+      row(20, 'HBM traffic', 'per layer, one sequence (upper bound)', naiveBytes, flashBytes, gb);
+      row(80, 'Extra memory needed', 'scores held at once', naiveFoot, flashFoot, gb);
+      // capacity line
+      const cx = xs(gpu.memGB * 1e9);
+      s('line', { x1: cx, y1: 72, x2: cx, y2: 120, stroke: C.text, 'stroke-width': 2 }, svg);
+      text(svg, cx, 66, `${gpu.memGB} GB HBM`, { 'text-anchor': 'middle', class: 't-small t-bold' });
+      if (naiveFoot > gpu.memGB * 1e9) text(svg, W - 10, 104, 'naive does not fit!', { 'text-anchor': 'end', class: 't-small t-bold', ...fillStyle(C.waste) });
+      // time row (linear relative)
+      const ty = 140;
+      text(svg, 10, ty + 10, 'Time (one layer)', { class: 't-small t-bold' });
+      text(svg, 10, ty + 26, 'max(FLOPs, bytes) bound', { class: 't-small t-faint' });
+      const tmax = Math.max(tNaive, tFlash);
+      rect(svg, LX, ty, (tNaive / tmax) * BW, 14, C.waste, { rx: 4 });
+      text(svg, LX + (tNaive / tmax) * BW + 8, ty + 7, fmt.ms(tNaive * 1000) + (naiveBytes / bw > flops / peak ? '  memory-bound' : '  compute-bound'), { class: 't-small t-mono' });
+      rect(svg, LX, ty + 18, Math.max(3, (tFlash / tmax) * BW), 14, C.kv, { rx: 4 });
+      text(svg, LX + Math.max(3, (tFlash / tmax) * BW) + 8, ty + 25, fmt.ms(tFlash * 1000) + (flashBytes / bw > flops / peak ? '  memory-bound' : '  compute-bound'), { class: 't-small t-mono' });
+      text(svg, 10, H - 18, `BF16 · head dim ${d} · causal · 60% peak FLOPs, 85% peak bandwidth · Flash traffic is worst case: K/V re-read per ${br}-row Q block, no L2 reuse`, { class: 't-small t-faint' });
+
+      st.set('Attention FLOPs', fmt.num(flops, 1), 'per layer, causal');
+      st.set('Naive HBM traffic', gb(naiveBytes), `intensity ≈ ${(flops / naiveBytes).toFixed(0)} FLOP/B`, C.waste);
+      st.set('Flash HBM traffic', gb(flashBytes), `intensity ≈ ${(flops / flashBytes).toFixed(0)} FLOP/B`, C.kv);
+      st.set('Speed-up (one layer, prefill)', `${(tNaive / tFlash).toFixed(1)}×`, naiveFoot > gpu.memGB * 1e9 ? 'naive would not even run' : 'from not round-tripping S and P');
+    }
+    render();
+  });
+</script>

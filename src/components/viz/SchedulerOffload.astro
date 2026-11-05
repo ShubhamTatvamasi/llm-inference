@@ -1,0 +1,71 @@
+---
+/* KV offload tiers: is reloading a cached prefix from a slower tier faster than
+   recomputing its prefill on the GPU? */
+---
+<div data-viz="scheduler-offload"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, select, slider, stats, legend, C, fmt } from '../../lib/viz';
+  import { MODELS, GPUS, getModel, getGPU, kvBytesPerToken } from '../../data/hardware';
+
+  const TIERS = [
+    { name: 'CPU DRAM via NVLink-C2C', bw: 300e9, note: 'Grace-Hopper/Blackwell superchips' },
+    { name: 'CPU DRAM via PCIe Gen5 x16', bw: 45e9, note: 'typical x86 server' },
+    { name: 'Local NVMe SSD', bw: 6e9, note: 'per drive, sequential' },
+    { name: 'Remote store over 100 GbE', bw: 10e9, note: 'shared KV store / object store' },
+  ];
+
+  mountAll('scheduler-offload', (root) => {
+    let model = getModel('llama3-8b'), gpu = getGPU('h100'), tokens = 16000, kvb = 2;
+    const bar = ctrlBar(root);
+    select(bar, 'Model', MODELS.filter((m) => m.params <= 8e10).map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(bar, 'GPU', GPUS.map((x) => ({ value: x.id, label: x.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    select(bar, 'KV dtype', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }], '2', (v) => { kvb = Number(v); render(); });
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'Cached prefix length', min: 500, max: 128000, step: 500, value: tokens, format: (v) => `${fmt.num(v, 1)} tok`, onInput: (v) => { tokens = v; render(); } });
+
+    const W = 940, H = 250;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Time to reload KV from each tier versus recomputing prefill' });
+    const g = s('g', {}, svg);
+    const st = stats(root, ['KV bytes to move', 'Recompute prefill', 'Fastest option', 'Break-even bandwidth']);
+    legend(root, [['Reload beats recompute', C.kv], ['Recompute is faster', C.waste], ['Recompute on GPU', C.prefill]]);
+
+    function recomputeTime() {
+      // linear FLOPs (2·P·N) + causal attention FLOPs (≈ 2·L·N²·H·d), ~50% MFU
+      const lin = 2 * model.activeParams * tokens;
+      const attn = 2 * model.layers * tokens * tokens * model.heads * model.headDim;
+      return (lin + attn) / (gpu.bf16TF * 1e12 * 0.5);
+    }
+
+    function render() {
+      clear(g);
+      const bytes = tokens * kvBytesPerToken(model, kvb);
+      const rc = recomputeTime();
+      const rows = [
+        ...TIERS.map((t) => ({ name: t.name, note: t.note, time: bytes / t.bw, kind: 'tier' as const })),
+        { name: 'Recompute prefill on GPU', note: `${gpu.name}, ~50% MFU`, time: rc, kind: 'rc' as const },
+      ];
+      const mx = Math.max(...rows.map((r) => r.time));
+      const X0 = 260, X1 = W - 110;
+      // log scale for readability
+      const lmin = Math.log10(Math.max(1e-4, Math.min(...rows.map((r) => r.time)) / 2));
+      const lmax = Math.log10(mx * 1.2);
+      const sx = (v: number) => X0 + ((Math.log10(Math.max(v, 1e-4)) - lmin) / (lmax - lmin)) * (X1 - X0);
+      rows.forEach((r, i) => {
+        const y = 14 + i * 44;
+        text(g, 0, y + 10, r.name, { class: 't-small t-bold' });
+        text(g, 0, y + 25, r.note, { class: 't-small t-faint' });
+        const col = r.kind === 'rc' ? C.prefill : r.time < rc ? C.kv : C.waste;
+        rect(g, X0, y + 2, Math.max(3, sx(r.time) - X0), 26, col, { rx: 5, opacity: 0.9 });
+        text(g, sx(r.time) + 8, y + 15, fmt.ms(r.time * 1000), { class: 't-small t-mono t-bold' });
+      });
+      text(g, X0, H - 8, 'time (log scale) →', { class: 't-small t-faint' });
+      const best = [...rows].sort((a, b) => a.time - b.time)[0];
+      st.set('KV bytes to move', fmt.bytes(bytes), `${fmt.bytes(kvBytesPerToken(model, kvb))} per token`);
+      st.set('Recompute prefill', fmt.ms(rc * 1000), 'grows ~quadratically with length', C.prefill);
+      st.set('Fastest option', best.name.split(' via ')[0].replace('Recompute prefill on GPU', 'Recompute'), fmt.ms(best.time * 1000), best.kind === 'rc' ? C.prefill : C.kv);
+      st.set('Break-even bandwidth', `${fmt.num(bytes / rc / 1e9, 1)} GB/s`, 'any tier faster than this wins');
+    }
+    render();
+  });
+</script>

@@ -1,0 +1,108 @@
+---
+layout: ../layouts/Chapter.astro
+title: FlashAttention
+description: Exact attention without ever storing the N×N score matrix. Tiling plus an "online" softmax keeps everything in fast on-chip SRAM, turning a memory-bound operation into a compute-bound one.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import FlashTiling from '../components/viz/FlashTiling.astro';
+import FlashTraffic from '../components/viz/FlashTraffic.astro';
+import FlashDecodeSplit from '../components/viz/FlashDecodeSplit.astro';
+
+The [attention](../attention/) formula is short:
+
+$$
+O = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d}} + M\right) V
+$$
+
+Implemented literally, though, it is one of the worst-behaved operations on a GPU. The intermediate score matrix $S = QK^\top$ has **N × N** entries per head, where N is the sequence length. At 32K tokens that is a billion scores per head, per layer. Writing them to HBM, reading them back for the softmax, writing the probabilities, and reading those again for the multiply by V makes attention **memory-bound and memory-hungry**.
+
+**FlashAttention** computes exactly the same result without ever storing S.
+
+## The trick: tiles and an online softmax
+
+Two ideas make it work:
+
+1. **Tiling.** Split Q into blocks of rows and K/V into blocks of columns. Load one Q block and one K/V block into an SM's shared memory (SRAM), compute that small tile of scores, use it immediately, and discard it.
+2. **Online softmax.** Softmax needs each row's maximum and sum, which seem to require the whole row first. Instead, keep a **running max** $m$, a **running sum** $\ell$ and a **running output** $O$. When a new tile reveals a larger maximum, rescale what has been accumulated so far by $e^{m_\text{old} - m_\text{new}}$. The final answer is **identical** to the standard softmax.
+
+<Viz title="Streaming attention through SRAM, tile by tile" label="Live">
+  <FlashTiling />
+  <Fragment slot="caption">
+    <p>Eight tokens in 2×2 tiles with a causal mask. In <b>FlashAttention</b> mode, each orange tile is computed in SRAM, folded into the running m, l and O, then discarded; tiles above the diagonal are never touched. The readout tracks one query row and checks the streamed result against an exact softmax. Switch to <b>Naive</b> to see the three-kernel version that round-trips the full score matrix through HBM.</p>
+  </Fragment>
+</Viz>
+
+The update rule for each new tile of scores $s$ with values $v$:
+
+$$
+m' = \max\!\big(m,\ \max_j s_j\big), \qquad
+\ell' = \ell\, e^{m - m'} + \sum_j e^{s_j - m'}, \qquad
+O' = O\, e^{m - m'} + \sum_j e^{s_j - m'}\, v_j
+$$
+
+When the row is finished, output $O' / \ell'$. Subtracting the max is the usual trick for numerical stability; the rescaling factor corrects earlier partial sums whenever the max changes.
+
+<Callout type="key">
+FlashAttention is **not an approximation**. It does the same FLOPs (slightly more, because of rescaling) but moves far fewer bytes. On a GPU, where bytes are the scarce resource, that makes it 2–4× faster and lets attention scale to long contexts with only **O(N)** extra memory.
+</Callout>
+
+## How much traffic it saves
+
+<Viz title="HBM traffic and memory, naive vs FlashAttention" label="Calculator">
+  <FlashTraffic />
+  <Fragment slot="caption">
+    <p>Naive attention moves 4 × N² scores per head through HBM and must hold an N²-sized buffer. FlashAttention reads Q once, writes O once, and re-reads K/V once per Q block, so its traffic grows like N²·d / block_size instead of N². Push N to 64K or 128K: the naive score matrix alone exceeds GPU memory. The Flash figure is an upper bound: Q blocks of the same head run at the same time on different SMs and share K/V through the L2 cache, so real kernels move fewer bytes and usually end up compute-bound.</p>
+  </Fragment>
+</Viz>
+
+The arithmetic intensity of the fused kernel is roughly the Q block size: each K/V element loaded into SRAM is reused by every query row in the block. Bigger blocks mean more reuse, but blocks must fit in the ~100–228 KB of SRAM per SM. Choosing tile sizes per GPU is much of the engineering effort.
+
+## The FlashAttention family
+
+| Version / variant | What changed | Why it matters for serving |
+|---|---|---|
+| **FlashAttention (v1)** | Tiling + online softmax, fused into one kernel | Removed the N² memory wall |
+| **FlashAttention-2** | Better parallelism across sequence length and warps; fewer non-matmul FLOPs | ~2× faster; standard for prefill |
+| **FlashAttention-3** | Hopper-specific: asynchronous tensor-core ops (WGMMA), TMA loads, warp specialisation, FP8 | Overlaps data movement with math on H100-class GPUs |
+| **Flash-Decoding (split-K)** | Splits the **KV sequence** across thread blocks at decode time, then reduces | Fills the GPU when batch × heads is small but context is long |
+| **Paged variants** | Read K/V through a [block table](../paged-attention/) instead of contiguous memory | Lets serving engines use PagedAttention without copying |
+| **FlashInfer & similar libraries** | Kernels specialised for serving: paged/ragged KV, shared-prefix ("cascade") attention, sampling | Used by engines like vLLM and SGLang |
+
+## Decode is a different problem
+
+At decode time each sequence has only **one query row**. The work is "one row times a very long K/V", which is memory-bound by nature (see [the roofline](../roofline/)). Tiling over Q gives no reuse at all. The challenge now is just **using enough of the GPU**. With a small batch, there may be fewer (sequence, KV-head) pairs than SMs.
+
+<Viz title="Flash-Decoding: split the KV cache to fill the GPU" label="Explore">
+  <FlashDecodeSplit />
+  <Fragment slot="caption">
+    <p>Without splitting, each (sequence, KV head) pair becomes one thread block, and one SM has to stream that sequence's entire cache. Splitting the KV into chunks spreads the work across all SMs. Each chunk produces a partial (m, l, O), merged with the same online-softmax rule. With large batches there is already enough parallelism, and splitting only adds reduction overhead.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="tip" title="Where FlashAttention shows up in a serving engine">
+**Prefill** uses FlashAttention-2/3-style kernels with variable-length ("ragged") batches, so many prompts of different lengths are packed into one launch. **Decode** uses paged, split-K kernels that read the KV cache directly from PagedAttention blocks. Mixed batches from [chunked prefill](../chunked-prefill/) need kernels that handle both shapes in one launch.
+</Callout>
+
+<Interview>
+  <Q q="What problem does FlashAttention solve, and is it an approximation?" level="core">
+    Naive attention writes and re-reads the N×N score and probability matrices in HBM. That costs O(N²) memory and makes the operation memory-bound. FlashAttention tiles Q, K and V into SRAM and uses an **online softmax**, so scores never leave the chip. The result is **exact**, mathematically identical up to floating-point rounding.
+  </Q>
+  <Q q="Explain the online softmax in one or two sentences." level="core">
+    Keep a running max m, a running sum l of exp(s − m), and a running weighted sum O. When a new block raises the max, multiply the old l and O by exp(m_old − m_new) before adding the new block's terms; at the end, output O / l.
+  </Q>
+  <Q q="FlashAttention does slightly MORE FLOPs than naive attention. Why is it faster?" level="mid">
+    Attention is limited by **memory traffic**, not FLOPs. Removing 4×N² values of HBM reads and writes per head (S and P) saves far more time than the extra rescaling math costs. Fusing three kernels into one also removes launch overhead and intermediate buffers.
+  </Q>
+  <Q q="Why does decode attention need a different kernel strategy (Flash-Decoding) than prefill?" level="mid">
+    In decode there is one query per sequence, so there is nothing to tile over on the Q side and parallelism is only batch × KV heads. For small batches with long contexts, that leaves most SMs idle. Splitting the KV sequence across thread blocks (split-K) and merging the partial softmax results restores occupancy.
+  </Q>
+  <Q q="How does FlashAttention interact with PagedAttention?" level="senior">
+    PagedAttention stores KV in non-contiguous fixed-size blocks. A paged attention kernel loads each K/V tile by looking up the block table, then does the same tiled online-softmax computation. Block size is therefore co-designed with the kernel's tile size, and serving engines ship paged variants of FlashAttention-style kernels.
+  </Q>
+  <Q q="What did FlashAttention-3 change, and why does it only apply to newer GPUs?" level="senior">
+    It uses Hopper-generation features: asynchronous warp-group matrix multiplies, the Tensor Memory Accelerator for bulk async loads, and warp specialisation. These let it overlap softmax, data movement and matmul, and support FP8 attention with techniques to control quantization error. Older architectures lack these instructions, so they keep FA-2-style kernels.
+  </Q>
+</Interview>

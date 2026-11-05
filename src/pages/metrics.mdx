@@ -1,0 +1,140 @@
+---
+layout: ../layouts/Chapter.astro
+title: Latency Metrics & Goodput
+description: TTFT, ITL, TPOT and E2E describe what a user feels. Throughput describes what a GPU does. Goodput, the throughput that still meets your SLOs, ties the two together.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import MetricsTimeline from '../components/viz/MetricsTimeline.astro';
+import MetricsLoadSim from '../components/viz/MetricsLoadSim.astro';
+import MetricsLittle from '../components/viz/MetricsLittle.astro';
+import MetricsDashboard from '../components/viz/MetricsDashboard.astro';
+
+A web server is fast or slow. An LLM server is **fast in two different ways at once**. Users first wait for the answer to *start*, then watch it *stream*. These two experiences come from different phases of the engine ([prefill and decode](../prefill-decode/)), so they need different metrics, different SLOs and different fixes.
+
+## The anatomy of one streamed request
+
+Follow a single chat request from the moment it reaches the server until the last token arrives:
+
+<Viz title="One request, five metrics" label="Live">
+  <MetricsTimeline />
+  <Fragment slot="caption">
+    <p>The server lane shows what the engine is doing; the client lane shows tokens arriving over Server-Sent Events. Watch the stall in the middle: another user's long prompt landed in the same engine step.</p>
+  </Fragment>
+</Viz>
+
+| Metric | Definition | What drives it | Felt as |
+|---|---|---|---|
+| **Queue time** | arrival → scheduled | load vs capacity, admission policy | "nothing is happening" |
+| **TTFT** (time to first token) | arrival → first token | queue + <span class="chip prefill">prefill</span> of the prompt | responsiveness |
+| **ITL** (inter-token latency) | gap between two consecutive tokens | one <span class="chip decode">decode</span> step, plus any interference | smoothness of the stream |
+| **TPOT** (time per output token) | average decode time per token after the first | batch size, memory bandwidth | reading speed |
+| **E2E latency** | arrival → last token | all of the above × output length | total wait for agents and tools |
+
+They are tied together by two identities worth memorising:
+
+$$
+\text{TPOT} = \frac{\text{E2E} - \text{TTFT}}{N_\text{out} - 1}
+\qquad\qquad
+\text{E2E} \approx \text{TTFT} + (N_\text{out} - 1)\cdot\text{TPOT}
+$$
+
+<Callout type="key" title="ITL and TPOT are not the same number">
+TPOT is a **per-request average**, so a single 300 ms freeze is diluted across hundreds of tokens. ITL is measured **per gap**, so its p99 exposes freezes. Users notice freezes. Track ITL percentiles for smoothness and TPOT for overall speed.
+</Callout>
+
+Which metric matters depends on the workload. A chat UI lives and dies by TTFT and ITL. A batch summarisation job only cares about E2E and cost. An agent that chains ten tool calls cares about E2E, because every call's TTFT adds up.
+
+## Throughput, and why it is not enough
+
+**Throughput** counts how much work the server completes per second. Always state the unit:
+
+- **Output tokens/s**: the usual headline number, and the one that decode speed limits.
+- **Input (prompt) tokens/s**: dominated by prefill; RAG and long-document workloads stress this.
+- **Requests/s**: what capacity planning and Little's law use.
+
+The trap is that throughput keeps looking good while users suffer. Past saturation, the GPU completes the same number of requests per second as before; everything else waits in a queue. That is why serving teams track **goodput**: the rate of requests that finished **within every SLO**.
+
+$$
+\text{goodput} = \frac{\#\{\text{requests with TTFT} \le \text{SLO}_\text{TTFT} \ \wedge\ \text{TPOT} \le \text{SLO}_\text{TPOT}\}}{\text{time window}}
+$$
+
+The simulator below models a single replica: an 8B-class model on one H100-class GPU, continuous batching with 64 slots, and chunked prefill. Each request is simulated end to end. Drag the arrival rate past the knee:
+
+<Viz title="Offered load → latency distribution → goodput" label="Simulation">
+  <MetricsLoadSim />
+  <Fragment slot="caption">
+    <p>Left: the TTFT distribution at the chosen rate. Red marks requests that broke an SLO. Right: as offered load grows, throughput climbs and then flattens, while goodput peaks at the <b>knee</b> and then <b>drops</b>. Tighten the TPOT SLO and the knee moves left: a stricter streaming SLO forces you to run smaller batches. Numbers are illustrative.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="warn" title="Capacity is the knee, not the peak">
+A load test that reports "15 req/s peak throughput" has measured the wrong thing. The useful number is **"N req/s at 99% SLO attainment"**. Plan fleets from that number, then add headroom for bursts.
+</Callout>
+
+## Percentiles, not averages
+
+LLM latency is **long-tailed**. Prompt lengths vary by 100×, output lengths by 50×, and the tail is where users churn. Averages hide all of that. Report **p50** (typical), **p95** (bad day), and **p99** (worst experience at scale).
+
+Three mistakes show up again and again:
+
+1. **Averaging percentiles.** The mean of each replica's p95 is not the fleet p95. Merge the underlying **histograms** first, then compute the quantile. Prometheus histograms with `histogram_quantile` over a `sum by (le)` do this correctly.
+2. **Mixing workloads.** A 50-token autocomplete and a 30k-token contract review in one histogram describe neither. Label metrics by route, model and tenant.
+3. **Measuring only inside the engine.** Engine timers start when the scheduler sees the request. Users' clocks start earlier, before the gateway, auth, the tokenizer and the queue. Measure at both ends, and trace the gap.
+
+## Little's law: concurrency from traffic
+
+One equation turns traffic numbers into the concurrency your servers must hold. In any stable system, the average number of requests inside ($L$) equals the arrival rate ($\lambda$) times the average time each spends inside ($W$):
+
+$$
+L = \lambda \times W
+$$
+
+<Viz title="Little's law, live" label="Live">
+  <MetricsLittle />
+  <Fragment slot="caption">
+    <p>Each dot is a request that stays for <i>W</i> seconds. The count inside settles at λ·W whatever the arrival pattern. Doubling the output length doubles <i>W</i>, so it doubles the concurrent KV cache you need.</p>
+  </Fragment>
+</Viz>
+
+Example: 4 req/s with 10 s average E2E means about **40 requests in flight**. Each one holds its [KV cache](../kv-cache/) for those 10 seconds. If one replica stays within SLO up to 24 concurrent requests, you need 2 replicas before headroom. This is the core of [capacity planning](../capacity-planning/).
+
+## What to put on the dashboard
+
+A useful serving dashboard has four groups of panels, all labelled by model, route and tenant. Pick a scenario to see which panels react. Recognising these patterns is most of what on-call debugging involves:
+
+<Viz title="Diagnose the dashboard" label="Scenarios">
+  <MetricsDashboard />
+  <Fragment slot="caption">
+    <p>Metric names follow vLLM's Prometheus exporter (<code>vllm:…</code>) and NVIDIA DCGM (<code>DCGM_FI_…</code>). Other engines expose equivalents. Red borders mark the panels that should page someone in each scenario.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="tip" title="GPU utilisation lies">
+The classic `nvidia-smi` "GPU-Util" only means *some* kernel was running. A memory-bound decode loop shows 100% while the tensor cores idle. Use **SM activity** and **DRAM bandwidth utilisation** from DCGM, and, more importantly, the engine's own queue and KV metrics.
+</Callout>
+
+Add **distributed tracing** (OpenTelemetry) on top. A trace that spans gateway → router → engine → first token tells you whether a slow TTFT came from queueing, a cold prefix cache, or a 20k-token prompt.
+
+<Interview>
+  <Q q="Define TTFT, ITL, TPOT and E2E, and give the relationship between them." level="core">
+    TTFT runs from arrival to the first token, so it includes queueing and prefill. ITL is the gap between consecutive streamed tokens. TPOT is the average decode time per token after the first: (E2E − TTFT)/(N − 1). E2E runs from arrival to the last token, roughly TTFT + (N − 1)·TPOT.
+  </Q>
+  <Q q="What is goodput and why plan with it instead of throughput?" level="core">
+    Goodput is the rate of requests that met **all** SLOs. Past saturation, throughput stays flat while queueing pushes requests over their TTFT SLO, so goodput falls. Capacity should be quoted as "req/s at target SLO attainment", which is the knee of the curve.
+  </Q>
+  <Q q="Your mean TPOT is 25 ms and fine, but users complain the stream 'freezes'. What do you look at?" level="mid">
+    **p99 ITL**, not mean TPOT. Freezes are rare long gaps, typically a long prompt's prefill running in the same step as everyone's decodes, or a preemption. Correlate ITL spikes with prompt-token rate. Fixes include a smaller chunked-prefill budget, separating ingestion traffic, or [disaggregation](../disaggregation/).
+  </Q>
+  <Q q="You have 8 replicas, each reporting its own p95 TTFT. How do you get the fleet p95?" level="mid">
+    Aggregate the raw **histogram buckets** across replicas, then take the quantile, e.g. `histogram_quantile(0.95, sum by (le) (rate(...bucket[5m])))`. Averaging per-replica p95s is mathematically wrong and usually understates the tail.
+  </Q>
+  <Q q="TTFT p95 triples every weekday 10–11 am while the median stays flat. Walk through your investigation." level="senior">
+    A flat median with a rising tail points to **queueing or interference at peak**, not slower kernels. Check `num_requests_waiting` and KV usage per replica (imbalanced routing?), the prompt-length mix at that hour, preemption counts, prefix hit rate, and autoscaler lag (did new replicas arrive late or cold?). Fixes: scheduled pre-scaling before 10 am, queue-depth autoscaling, load-aware routing, and moving batch jobs off the interactive pool.
+  </Q>
+  <Q q="The GPU shows ~100% utilisation, yet the service misses its SLO and serves less than in the load test. What's going on?" level="senior">
+    Headline utilisation only says a kernel was resident. Check DCGM SM activity and memory bandwidth, the real running batch size, preemptions and recomputation, and drift in traffic shape (longer outputs, fewer shared prefixes than in the test). With TP, also check all-reduce time. The load test probably no longer matches production traffic.
+  </Q>
+</Interview>

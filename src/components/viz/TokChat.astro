@@ -1,0 +1,100 @@
+---
+/* Chat templates: how a list of messages becomes ONE flat token sequence with special tokens. */
+---
+<div data-viz="tok-chat"></div>
+
+<script>
+  import { mountAll, h, ctrlBar, select, checkbox, stats, C } from '../../lib/viz';
+  import { getBPE, encodeFull } from './tok-bpe';
+
+  type Seg = { k: 'sp' | 'tx' | 'gen'; s: string };
+  type Fmt = 'llama3' | 'chatml' | 'mistral';
+
+  function build(fmt: Fmt, sys: string, user: string, asst: string, genPrompt: boolean): Seg[] {
+    const out: Seg[] = [];
+    const sp = (s: string) => out.push({ k: 'sp', s });
+    const tx = (s: string) => out.push({ k: 'tx', s });
+    if (fmt === 'llama3') {
+      sp('<|begin_of_text|>');
+      if (sys) { sp('<|start_header_id|>'); tx('system'); sp('<|end_header_id|>'); tx('\n\n' + sys); sp('<|eot_id|>'); }
+      sp('<|start_header_id|>'); tx('user'); sp('<|end_header_id|>'); tx('\n\n' + user); sp('<|eot_id|>');
+      sp('<|start_header_id|>'); tx('assistant'); sp('<|end_header_id|>'); tx('\n\n');
+      if (genPrompt) out.push({ k: 'gen', s: 'model writes here…' }); else { tx(asst); sp('<|eot_id|>'); }
+    } else if (fmt === 'chatml') {
+      if (sys) { sp('<|im_start|>'); tx('system\n' + sys); sp('<|im_end|>'); tx('\n'); }
+      sp('<|im_start|>'); tx('user\n' + user); sp('<|im_end|>'); tx('\n');
+      sp('<|im_start|>'); tx('assistant\n');
+      if (genPrompt) out.push({ k: 'gen', s: 'model writes here…' }); else { tx(asst); sp('<|im_end|>'); }
+    } else {
+      sp('<s>'); sp('[INST]'); tx(' ' + (sys ? sys + '\n\n' : '') + user + ' '); sp('[/INST]');
+      if (genPrompt) out.push({ k: 'gen', s: 'model writes here…' }); else { tx(asst); sp('</s>'); }
+    }
+    return out;
+  }
+
+  mountAll('tok-chat', (root) => {
+    const bpe = getBPE(400);
+    let fmt: Fmt = 'llama3';
+    let gen = true;
+    const grid = h('div', { class: 'tchat-grid' }, root);
+    const field = (lbl: string, val: string, color: string) => {
+      const w = h('label', { class: 'tchat-f' }, grid);
+      const t = h('span', { class: 'tchat-role', text: lbl }, w); t.style.color = color;
+      const i = h('input', { class: 'text-input', type: 'text', value: val, spellcheck: 'false' }, w);
+      i.addEventListener('input', render);
+      return i;
+    };
+    const sys = field('system', 'You are a concise assistant.', C.mem);
+    const user = field('user', 'What is the capital of France?', C.decode);
+    const asst = field('assistant', 'Paris.', C.kv);
+
+    const bar = ctrlBar(root); bar.style.marginTop = '12px';
+    select(bar, 'Template', [
+      { value: 'llama3', label: 'Llama 3 style' },
+      { value: 'chatml', label: 'ChatML (Qwen) style' },
+      { value: 'mistral', label: '[INST] (Mistral) style' },
+    ], fmt, (v) => { fmt = v as Fmt; render(); });
+    checkbox(bar, 'add_generation_prompt (serving a new request)', gen, (v) => { gen = v; render(); });
+
+    const box = h('div', { class: 'tchat-box', 'aria-live': 'polite' }, root);
+    const st = stats(root, ['Messages', 'Special tokens', 'Text tokens (toy BPE)', 'Template overhead']);
+
+    function render() {
+      const segs = build(fmt, sys.value.trim(), user.value.trim(), asst.value.trim(), gen);
+      box.innerHTML = '';
+      let special = 0; let textToks = 0;
+      for (const sg of segs) {
+        if (sg.k === 'sp') { special++; h('span', { class: 'tchat-sp', text: sg.s }, box); }
+        else if (sg.k === 'gen') { h('span', { class: 'tchat-gen', text: sg.s }, box); }
+        else {
+          textToks += encodeFull(sg.s, bpe).length;
+          const parts = sg.s.split('\n');
+          parts.forEach((p, i) => {
+            if (p) h('span', { class: 'tchat-tx', text: p }, box);
+            if (i < parts.length - 1) { h('span', { class: 'tchat-nl', text: '↵' }, box); h('br', {}, box); }
+          });
+        }
+      }
+      const contentToks = [sys.value, user.value, gen ? '' : asst.value].reduce((a, s) => a + (s.trim() ? encodeFull(s.trim(), bpe).length : 0), 0);
+      const total = special + textToks;
+      st.set('Messages', String(sys.value.trim() ? (gen ? 2 : 3) : gen ? 1 : 2));
+      st.set('Special tokens', String(special), 'single IDs the user can never type', C.token);
+      st.set('Text tokens (toy BPE)', String(textToks), 'roles, newlines and content');
+      st.set('Template overhead', `${total - contentToks} tok`, `${Math.round(((total - contentToks) / Math.max(1, total)) * 100)}% of the prompt is formatting`);
+    }
+    render();
+  });
+</script>
+
+<style is:global>
+  .tchat-grid { display: grid; grid-template-columns: 1fr; gap: 8px; }
+  .tchat-f { display: grid; grid-template-columns: 82px 1fr; align-items: center; gap: 10px; }
+  .tchat-role { font-family: var(--font-mono); font-size: 0.78rem; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em; }
+  .tchat-box { font-family: var(--font-mono); font-size: 0.84rem; line-height: 2; padding: 14px 16px; border-radius: 12px; background: var(--surface-2); border: 1px solid var(--border); word-break: break-word; }
+  .tchat-sp { display: inline-block; padding: 0 6px; margin: 0 2px; border-radius: 6px; background: var(--c-token-soft); color: var(--c-token); border: 1px solid color-mix(in srgb, var(--c-token) 45%, transparent); font-weight: 600; line-height: 1.6; }
+  .tchat-tx { white-space: pre-wrap; color: var(--text); }
+  .tchat-nl { color: var(--text-faint); font-size: 0.75em; margin: 0 2px; }
+  .tchat-gen { display: inline-block; padding: 0 8px; border-radius: 6px; border: 1px dashed var(--c-decode); color: var(--c-decode); line-height: 1.6; animation: tchat-blink 1.2s infinite; }
+  @keyframes tchat-blink { 50% { opacity: 0.45; } }
+  @media (max-width: 560px) { .tchat-f { grid-template-columns: 1fr; gap: 2px; } }
+</style>

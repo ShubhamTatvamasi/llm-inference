@@ -1,0 +1,188 @@
+---
+/* FlashAttention tiling: Q blocks × K/V blocks streamed through SRAM, online softmax
+   (running max m, running sum l, rescaled accumulator O). Compare with naive attention,
+   which materialises the full N×N score matrix in HBM. */
+---
+<div data-viz="flash-tiling"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, segmented, stats, narration, legend, C, rng, hatchDefs, uniq } from '../../lib/viz';
+
+  const N = 8, B = 2, T = N / B; // 8 tokens, 2×2 tiles → 4×4 tile grid
+  const W = 940, H = 400, CELL = 30, GX = 54, GY = 58;
+  const fillStyle = (c: string) => ({ style: `fill:${c}` });
+
+  // deterministic toy scores (already scaled by 1/sqrt(d))
+  const r = rng(7);
+  const S: number[][] = Array.from({ length: N }, () => Array.from({ length: N }, () => +(r() * 4 - 1).toFixed(2)));
+  const V: number[] = Array.from({ length: N }, () => +(r() * 2 - 1).toFixed(2)); // one value dim for the readout
+
+  type Step = { qi: number; kj: number };
+  const FLASH: Step[] = [];
+  for (let qi = 0; qi < T; qi++) for (let kj = 0; kj <= qi; kj++) FLASH.push({ qi, kj });
+
+  mountAll('flash-tiling', (root) => {
+    let mode: 'flash' | 'naive' = 'flash';
+    let idx = -1; // flash: index into FLASH; naive: phase 0..3
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'FlashAttention tiling and online softmax' });
+    const hatchId = uniq('fah');
+    const say = narration(root);
+    const st = stats(root, ['Scores written to HBM', 'K/V tiles loaded to SRAM', 'Kernel launches', 'Peak extra HBM memory']);
+    legend(root, [['Current tile (computed in SRAM)', C.compute], ['Done, then discarded', C.kvSoft], ['Masked (future tokens)', C.mem], ['Materialised in HBM (naive)', C.waste]]);
+
+    function reset() { idx = -1; }
+    function step() {
+      idx++;
+      return mode === 'flash' ? idx < FLASH.length - 1 : idx < 2;
+    }
+
+    // online softmax state for query row `row` after processing kv tiles 0..kj
+    function online(row: number, upToTile: number) {
+      let m = -Infinity, l = 0, o = 0;
+      const hist: { m: number; l: number; scale: number }[] = [];
+      for (let t = 0; t <= upToTile; t++) {
+        const cols = [t * B, t * B + 1].filter((c) => c <= row);
+        if (!cols.length) break;
+        const mt = Math.max(...cols.map((c) => S[row][c]));
+        const mNew = Math.max(m, mt);
+        const scale = m === -Infinity ? 0 : Math.exp(m - mNew);
+        l = l * scale + cols.reduce((a, c) => a + Math.exp(S[row][c] - mNew), 0);
+        o = o * scale + cols.reduce((a, c) => a + Math.exp(S[row][c] - mNew) * V[c], 0);
+        m = mNew;
+        hist.push({ m, l, scale });
+      }
+      return { m, l, o: o / l, hist };
+    }
+
+    function render() {
+      clear(svg);
+      const hatch = hatchDefs(svg, hatchId, C.mem);
+      const cur = mode === 'flash' && idx >= 0 ? FLASH[idx] : null;
+
+      // axes labels
+      text(svg, GX + (N * CELL) / 2, 16, 'keys  k₀ … k₇  (from the KV cache)', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      text(svg, 16, GY + (N * CELL) / 2, 'queries', { 'text-anchor': 'middle', class: 't-small t-dim', transform: `rotate(-90 16 ${GY + (N * CELL) / 2})` });
+      for (let i = 0; i < N; i++) {
+        text(svg, GX + i * CELL + CELL / 2, GY - 12, `k${i}`, { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+        text(svg, GX - 12, GY + i * CELL + CELL / 2, `q${i}`, { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+      }
+
+      // cells
+      for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+        const x = GX + j * CELL, y = GY + i * CELL;
+        const ti = Math.floor(i / B), tj = Math.floor(j / B);
+        const masked = j > i;
+        let fill: string = C.surface2, op = 1, label = '';
+        if (masked) { fill = hatch; }
+        else if (mode === 'flash') {
+          const k = FLASH.findIndex((f) => f.qi === ti && f.kj === tj);
+          if (cur && cur.qi === ti && cur.kj === tj) { fill = C.compute; label = S[i][j].toFixed(1); }
+          else if (k >= 0 && k < idx) { fill = C.kvSoft; }
+        } else {
+          if (idx >= 0) { fill = C.waste; op = idx === 0 ? 0.55 : idx === 1 ? 0.8 : 0.95; label = idx === 0 ? S[i][j].toFixed(1) : ''; }
+        }
+        rect(svg, x + 1, y + 1, CELL - 2, CELL - 2, fill, { rx: 4, opacity: op, stroke: masked ? C.border : 'none' });
+        if (label) text(svg, x + CELL / 2, y + CELL / 2 + 0.5, label, { 'text-anchor': 'middle', class: 't-mono', style: 'fill:var(--bg);font-size:10.5px;font-weight:600' });
+      }
+      // tile grid lines
+      for (let t = 0; t <= T; t++) {
+        s('line', { x1: GX + t * B * CELL, y1: GY, x2: GX + t * B * CELL, y2: GY + N * CELL, stroke: C.borderStrong, 'stroke-width': 1.5 }, svg);
+        s('line', { x1: GX, y1: GY + t * B * CELL, x2: GX + N * CELL, y2: GY + t * B * CELL, stroke: C.borderStrong, 'stroke-width': 1.5 }, svg);
+      }
+      if (cur) rect(svg, GX + cur.kj * B * CELL, GY + cur.qi * B * CELL, B * CELL, B * CELL, 'none', { stroke: C.accent, 'stroke-width': 3, rx: 5 });
+      text(svg, GX, GY + N * CELL + 22, mode === 'flash' ? 'N×N scores never leave the chip' : 'full N×N matrix written to HBM', { class: 't-small t-bold', ...fillStyle(mode === 'flash' ? C.kv : C.waste) });
+
+      // SRAM panel
+      const SX = 370, SY = 50;
+      rect(svg, SX, SY, 220, 236, C.kvSoft, { rx: 12, stroke: C.kv, opacity: 0.9 });
+      text(svg, SX + 12, SY + 18, mode === 'flash' ? 'SRAM (one SM)' : 'GPU, 3 separate kernels', { class: 't-small t-bold' });
+      if (mode === 'flash') {
+        const box = (y: number, label: string, col: string, on: boolean) => {
+          rect(svg, SX + 14, y, 192, 28, on ? col : 'transparent', { rx: 6, stroke: col, 'stroke-dasharray': on ? null : '4 3', opacity: on ? 0.95 : 0.6 });
+          text(svg, SX + 24, y + 14, label, { class: 't-small t-bold t-mono', ...fillStyle(on ? 'var(--bg)' : col) });
+        };
+        box(SY + 34, cur ? `Q block ${cur.qi}  (q${cur.qi * B}–q${cur.qi * B + 1})` : 'Q block', C.token, !!cur);
+        box(SY + 70, cur ? `K block ${cur.kj}  (k${cur.kj * B}–k${cur.kj * B + 1})` : 'K block', C.kv, !!cur);
+        box(SY + 106, cur ? `V block ${cur.kj}` : 'V block', C.kv, !!cur);
+        box(SY + 142, 'S tile = Q·Kᵀ  (2×2)', C.compute, !!cur);
+        box(SY + 178, cur ? `O acc · m · l  for block ${cur.qi}` : 'O accumulator, m, l', C.decode, !!cur);
+      } else {
+        const ph = ['① S = Q·Kᵀ → write S to HBM', '② read S, softmax → write P', '③ read P and V → O = P·V'];
+        ph.forEach((p, i) => {
+          const on = idx === i, done = idx > i;
+          rect(svg, SX + 14, SY + 38 + i * 62, 192, 48, on ? C.waste : done ? C.wasteSoft : 'transparent', { rx: 8, stroke: C.waste, 'stroke-dasharray': on || done ? null : '4 3' });
+          text(svg, SX + 24, SY + 62 + i * 62, p, { class: 't-small t-bold', ...fillStyle(on ? 'var(--bg)' : C.waste) });
+        });
+      }
+      // arrow to HBM
+      text(svg, SX + 110, SY + 256, mode === 'flash' ? '↓ only O is written back' : '↕ N² values round-trip HBM', { 'text-anchor': 'middle', class: 't-small t-dim' });
+
+      // online softmax readout (flash)
+      const RX = 620;
+      text(svg, RX, 66, 'Online softmax for one query row', { class: 't-small t-bold' });
+      if (mode === 'flash' && cur) {
+        const row = cur.qi * B + 1; // second row of the block (sees more keys)
+        const o = online(row, cur.kj);
+        text(svg, RX, 88, `row q${row}, after key block ${cur.kj}`, { class: 't-small t-faint' });
+        const lines: [string, string][] = [
+          ['m  running max', o.m.toFixed(3)],
+          ['l  running sum of e^(s−m)', o.l.toFixed(3)],
+          ['rescale e^(m_old − m_new)', o.hist.length > 1 ? o.hist[o.hist.length - 1].scale.toFixed(3) : '— (first block)'],
+          ['O  output so far', o.o.toFixed(3)],
+        ];
+        lines.forEach(([k, v], i) => {
+          rect(svg, RX, 104 + i * 40, 300, 32, C.surface2, { rx: 7, stroke: C.border });
+          text(svg, RX + 10, 120 + i * 40, k, { class: 't-small t-dim' });
+          text(svg, RX + 290, 120 + i * 40, v, { 'text-anchor': 'end', class: 't-small t-mono t-bold' });
+        });
+        // exact check once the row is complete
+        const done = cur.kj === cur.qi;
+        if (done) {
+          const cols = Array.from({ length: row + 1 }, (_, c) => c);
+          const mx = Math.max(...cols.map((c) => S[row][c]));
+          const den = cols.reduce((a, c) => a + Math.exp(S[row][c] - mx), 0);
+          const ex = cols.reduce((a, c) => a + (Math.exp(S[row][c] - mx) / den) * V[c], 0);
+          text(svg, RX, 276, `✓ exact softmax gives O = ${ex.toFixed(3)}`, { class: 't-small t-bold', ...fillStyle(C.good) });
+          text(svg, RX, 294, 'identical: tiling is exact, not an approximation', { class: 't-small t-faint' });
+        } else {
+          text(svg, RX, 276, 'row not finished: more key blocks to go', { class: 't-small t-faint' });
+        }
+      } else if (mode === 'naive') {
+        text(svg, RX, 92, 'Naive needs the whole row of S before it', { class: 't-small t-dim' });
+        text(svg, RX, 110, 'can take the max and normalise, so S must', { class: 't-small t-dim' });
+        text(svg, RX, 128, 'be stored somewhere: HBM.', { class: 't-small t-dim' });
+      } else {
+        text(svg, RX, 92, 'Press Play to stream the first tile.', { class: 't-small t-faint' });
+      }
+
+      // formulas strip
+      const FY = 336;
+      rect(svg, 10, FY, W - 20, 54, C.surface2, { rx: 10, stroke: C.border });
+      text(svg, 24, FY + 18, 'm′ = max(m, max s_tile)', { class: 't-small t-mono' });
+      text(svg, 300, FY + 18, 'l′ = l·e^(m−m′) + Σ e^(s−m′)', { class: 't-small t-mono' });
+      text(svg, 600, FY + 18, 'O′ = O·e^(m−m′) + Σ e^(s−m′)·v', { class: 't-small t-mono' });
+      text(svg, 24, FY + 38, 'at the end: O = O′ / l′   — every partial result is corrected as soon as a larger max appears', { class: 't-small t-faint' });
+
+      // stats
+      const causal = (N * (N + 1)) / 2;
+      const tiles = mode === 'flash' ? Math.max(0, idx + 1) : 0;
+      st.set('Scores written to HBM', mode === 'flash' ? '0' : idx < 0 ? '0' : `${N * N}`, mode === 'flash' ? 'S and P stay in SRAM' : `full ${N}×${N} (then masked)`, mode === 'flash' ? C.good : C.waste);
+      st.set('K/V tiles loaded to SRAM', mode === 'flash' ? `${tiles} / ${FLASH.length}` : '–', mode === 'flash' ? `${causal} useful scores, causal tiles only` : '');
+      st.set('Kernel launches', mode === 'flash' ? '1 (fused)' : '3+', mode === 'flash' ? 'matmul + softmax + matmul fused' : 'one per stage');
+      st.set('Peak extra HBM memory', mode === 'flash' ? 'O(N·d)' : 'O(N²)', mode === 'flash' ? 'just the output' : '128K tokens → 32 GiB per head');
+
+      if (mode === 'flash') {
+        if (!cur) say('<b>FlashAttention</b> processes attention one <b>tile</b> at a time. Press <b>Play</b>.');
+        else if (cur.kj < cur.qi) say(`Q block <b>${cur.qi}</b> × K/V block <b>${cur.kj}</b>: load the tiles into SRAM, compute a 2×2 score tile, update <b>m</b>, <b>l</b> and <b>O</b>, then <b>throw the scores away</b>.`);
+        else say(`Last tile for Q block <b>${cur.qi}</b> (diagonal, partly masked). Tiles above the diagonal are <b>skipped entirely</b> by the causal mask. Normalise O by l and write it to HBM.`);
+      } else {
+        say(idx < 0 ? '<b>Naive attention</b> runs three separate steps, storing the full score matrix in between. Press <b>Play</b>.'
+          : ['<b>① Q·Kᵀ</b>: compute every score and write the N×N matrix S to HBM.', '<b>② softmax</b>: read S back, normalise each row, write probabilities P (another N×N).', '<b>③ P·V</b>: read P and V back to produce O. S and P made 4 trips of N² values through HBM.'][idx]);
+      }
+    }
+
+    player(bar, root, { step, reset, render, interval: 1300, autoplay: true });
+    segmented(bar, [{ value: 'flash', label: 'FlashAttention' }, { value: 'naive', label: 'Naive' }], mode, (v) => { mode = v as typeof mode; reset(); render(); });
+  });
+</script>

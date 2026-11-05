@@ -1,0 +1,114 @@
+---
+layout: ../layouts/Chapter.astro
+title: The KV Cache
+description: Why every serving engine keeps a KV cache, exactly how big it gets, and why it, not the weights, usually decides how many users a GPU can serve.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import KVGrowth from '../components/viz/KVGrowth.astro';
+import KVCalculator from '../components/viz/KVCalculator.astro';
+
+Every token the model generates has to **attend** to every token that came before it. To do that, each layer needs a **key** vector and a **value** vector for every earlier token. Those vectors depend only on the earlier tokens, so once one is computed it never changes. The **KV cache** saves them so they are never recomputed.
+
+## The problem it solves
+
+Generation is **autoregressive**: the model produces one token, appends it to the input, and runs again. Without a cache, step *n* would re-run the whole sequence of *n* tokens through every layer just to get one new token, so total work grows like *n²*.
+
+With a cache, each step pushes only the **one new token** through the network. The new token's query is compared against keys that are **read** from memory instead of recomputed.
+
+<Viz title="Prefill fills the cache, decode appends to it" label="Live">
+  <KVGrowth />
+  <Fragment slot="caption">
+    <p>Each column is one token; each pair of rows is the K and V that one layer stores for that token. Switch to <b>No cache</b> and compare the total-work bar: the cache turns quadratic recomputation into one new column per step.</p>
+  </Fragment>
+</Viz>
+
+Two things in the animation drive everything later in this guide:
+
+1. **Prefill** writes K/V for the whole prompt in a single pass. That pass is a large batch of matrix multiplications, which makes it <span class="chip prefill">compute-bound</span>.
+2. **Decode** adds one column per step, but has to **read the entire cache** (plus all the weights) to do it. That makes it <span class="chip decode">memory-bandwidth-bound</span>.
+
+## What exactly is stored
+
+For each layer $\ell$ and each token position $t$, the attention block projects the hidden state into
+
+$$
+k_t^{(\ell)} = W_K^{(\ell)} \, x_t^{(\ell)}, \qquad v_t^{(\ell)} = W_V^{(\ell)} \, x_t^{(\ell)}
+$$
+
+The query $q_t$ is used once and thrown away. The keys and values are what later tokens need, so they are cached. Note that the cache is **per layer**: a 32-layer model keeps 32 separate K/V tables per sequence.
+
+<Callout type="key">
+The cache trades **memory for compute**. That is a good trade on a GPU, which has far more FLOPs than memory bandwidth. The catch is that the memory is finite and **every concurrent user needs their own cache**.
+</Callout>
+
+## How big does it get?
+
+The size per token is a simple product:
+
+$$
+\text{KV bytes / token} = 2 \times n_\text{layers} \times n_\text{kv\_heads} \times d_\text{head} \times \text{bytes per element}
+$$
+
+For **Llama 3.1 8B** in BF16: $2 \times 32 \times 8 \times 128 \times 2 = 131{,}072$ bytes, which is **128 KiB per token**. One 8K-token conversation then needs **1 GiB** of KV cache. A batch of 64 such conversations needs **64 GiB**, which is four times the size of the model's weights.
+
+Try it yourself. Push the context to 32K, raise the concurrency, and watch the cache overflow the GPU:
+
+<Viz title="GPU memory budget: weights vs KV cache" label="Calculator">
+  <KVCalculator />
+  <Fragment slot="caption">
+    <p>Engines such as vLLM pre-allocate <code>gpu_memory_utilization × VRAM</code>. They load the weights, reserve some memory for activations and runtime overhead, and turn <b>everything left over</b> into KV-cache blocks. "Max concurrent seqs" is the hard ceiling on parallel users at that context length.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="warn" title="The KV cache, not the weights, caps concurrency">
+Weights are paid for once and shared by every request. KV cache is paid **per request, per token**. In production, the number of users a replica can serve at once is almost always limited by KV capacity.
+</Callout>
+
+## Shrinking the cache
+
+Since the cache is the bottleneck, model architects and engine builders attack every term in the formula:
+
+| Technique | Which term shrinks | Typical saving | Trade-off |
+|---|---|---|---|
+| **GQA** (grouped-query attention) | $n_\text{kv\_heads}$: groups of query heads share one K/V head | 4–8× vs MHA | Tiny quality cost; now standard |
+| **MQA** (multi-query attention) | $n_\text{kv\_heads} = 1$ | up to 32–64× | Larger quality cost |
+| **MLA** (multi-head latent attention) | Caches one compressed latent instead of K and V | ~10× vs GQA | Extra up/down projections |
+| **KV quantization** (FP8 / INT8 / INT4) | bytes per element | 2–4× | Can hurt long-context recall |
+| **Sliding-window / local attention** | number of tokens kept | bounded by window | Loses far context in those layers |
+| **Offload to CPU / SSD** | memory tier | moves cold blocks off GPU | Reload must beat recompute |
+
+Select **Llama 2 7B (MHA)** in the calculator, then **Llama 3.1 8B (GQA)**. They are nearly the same size, yet the GQA model needs **4× less** cache per token. Then try **DeepSeek-V3**: despite having 671B parameters, its MLA cache per token is smaller than the 8B model's.
+
+## The engine's view
+
+A serving engine treats the KV cache as **the central resource** to manage:
+
+- At startup it profiles memory and carves the free space into fixed-size **blocks**. The next chapters cover [PagedAttention](../paged-attention/) and how blocks are allocated.
+- The **scheduler** admits a new request only if there are enough free blocks. Otherwise the request waits, or a running one is [preempted](../scheduler/).
+- Identical prompt prefixes can **share** blocks; see [prefix caching](../prefix-caching/).
+- When a request finishes, its blocks return to the free pool immediately.
+
+<Callout type="tip" title="Rule of thumb">
+Rough decode speed per sequence ≈ memory bandwidth ÷ (weight bytes + this sequence's KV bytes). As contexts grow, reading the KV cache starts to cost as much time as reading the weights.
+</Callout>
+
+<Interview>
+  <Q q="Why do we cache K and V but not Q?" level="core">
+    A query is only used by its own token, at the moment that token is processed. Keys and values are re-read by **every future token**. Caching Q would cost memory and save no work.
+  </Q>
+  <Q q="Compute the KV cache per token for a 40-layer model with 8 KV heads, head dim 128, in FP16." level="core">
+    2 × 40 × 8 × 128 × 2 bytes = 163,840 B = **160 KiB per token**. An 8,192-token sequence needs 8,192 × 160 KiB = **1.25 GiB**.
+  </Q>
+  <Q q="Why does the KV cache, rather than the weights, usually limit concurrency?" level="mid">
+    Weights are a fixed one-time cost shared by all requests. KV grows **linearly with tokens and with concurrent requests**. Once the weights are loaded, the remaining memory divided by (KV per token × context) gives the maximum number of sequences in flight.
+  </Q>
+  <Q q="FP8 KV cache: what do you gain and what can go wrong?" level="mid">
+    It halves cache memory, so you can roughly double concurrency or context length, and decode reads fewer bytes. The risk is accuracy loss, especially in long-context retrieval or "needle" tasks. Validate on your own evals before enabling it.
+  </Q>
+  <Q q="When is offloading KV blocks to CPU memory a win?" level="senior">
+    When reloading over PCIe or NVLink-C2C is cheaper than **recomputing** the prefill for those tokens. That usually holds for long, reused prefixes, such as multi-turn chat or shared documents. Recomputation is cheap for short prefixes and usually wins there.
+  </Q>
+</Interview>

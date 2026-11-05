@@ -1,0 +1,190 @@
+---
+/* Same requests, same 64-slot KV memory: contiguous max-length reservation vs
+   paged blocks allocated on demand with per-request block tables. */
+---
+<div data-viz="paged-alloc"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, segmented, stats, legend, narration, C, SERIES, rng, hatchDefs, uniq } from '../../lib/viz';
+
+  type Mode = 'contig' | 'paged';
+  interface ReqDef { name: string; arr: number; prompt: number; gen: number }
+  const REQS: ReqDef[] = [
+    { name: 'A', arr: 0, prompt: 5, gen: 7 },
+    { name: 'B', arr: 0, prompt: 3, gen: 9 },
+    { name: 'C', arr: 0, prompt: 6, gen: 3 },
+    { name: 'D', arr: 2, prompt: 6, gen: 5 },
+    { name: 'E', arr: 3, prompt: 4, gen: 6 },
+  ];
+  const BLOCKS = 16, BS = 4, SLOTS = BLOCKS * BS, MAXLEN = 20;
+
+  interface Run { id: number; len: number; done: number; blocks: number[]; start: number; status: 'waiting' | 'running' | 'finished' }
+
+  mountAll('paged-alloc', (root) => {
+    let mode: Mode = 'paged';
+    let t = 0;
+    let runs: Run[] = [];
+    let owner: number[] = []; // per slot: request id or -1 (contig: reservation owner)
+    let freeList: number[] = [];
+    let events: string[] = [];
+
+    const bar = ctrlBar(root);
+    const W = 940, H = 330;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'KV memory allocation: contiguous reservation versus paged blocks' });
+    const hatch = hatchDefs(svg, uniq('pah'), C.waste);
+    const g = s('g', {}, svg);
+    const say = narration(root);
+    const st = stats(root, ['Running', 'Waiting', 'Slots holding real KV', 'Allocated but empty']);
+    legend(root, [['Token KV (one colour per request)', SERIES[0]], ['Reserved / allocated but unused', C.waste], ['Free', C.surface3]]);
+
+    function reset() {
+      t = 0; events = [];
+      runs = REQS.map((r, i) => ({ id: i, len: 0, done: 0, blocks: [], start: -1, status: 'waiting' }));
+      owner = new Array(SLOTS).fill(-1);
+      const r = rng(5);
+      freeList = Array.from({ length: BLOCKS }, (_, i) => i).sort(() => r() - 0.5);
+    }
+
+    function findContig(): number {
+      for (let s0 = 0; s0 + MAXLEN <= SLOTS; s0++) {
+        let ok = true;
+        for (let k = s0; k < s0 + MAXLEN; k++) if (owner[k] !== -1) { ok = false; break; }
+        if (ok) return s0;
+      }
+      return -1;
+    }
+
+    function step() {
+      events = [];
+      // 1) running requests decode one token (or finish)
+      for (const rn of runs) {
+        if (rn.status !== 'running' || rn.start === t) continue;
+        const def = REQS[rn.id];
+        if (rn.done >= def.gen) continue;
+        if (mode === 'paged' && rn.len % BS === 0) {
+          const b = freeList.shift();
+          if (b === undefined) { events.push(`${def.name} stalls: no free block`); continue; }
+          rn.blocks.push(b);
+          events.push(`${def.name}'s last block is full → new block <b>#${b}</b>`);
+        }
+        rn.len++; rn.done++;
+        if (rn.done >= def.gen) {
+          rn.status = 'finished';
+          if (mode === 'paged') { freeList.push(...rn.blocks); events.push(`${def.name} finished → ${rn.blocks.length} blocks back to the free list`); }
+          else { for (let k = 0; k < SLOTS; k++) if (owner[k] === rn.id) owner[k] = -1; events.push(`${def.name} finished → its ${MAXLEN}-slot region is free`); }
+        }
+      }
+      // 2) admit waiting requests (FIFO)
+      for (const rn of runs) {
+        const def = REQS[rn.id];
+        if (rn.status !== 'waiting' || def.arr > t) continue;
+        if (mode === 'contig') {
+          const s0 = findContig();
+          if (s0 < 0) {
+            const free = owner.filter((o) => o === -1).length;
+            events.push(`${def.name} must wait: needs ${MAXLEN} <b>contiguous</b> slots (${free} free in total, but not in one piece)`);
+            break;
+          }
+          for (let k = s0; k < s0 + MAXLEN; k++) owner[k] = rn.id;
+          rn.blocks = [s0];
+        } else {
+          const need = Math.ceil(def.prompt / BS);
+          if (freeList.length < need) { events.push(`${def.name} must wait: needs ${need} blocks, ${freeList.length} free`); break; }
+          rn.blocks = freeList.splice(0, need);
+        }
+        rn.status = 'running'; rn.start = t; rn.len = def.prompt;
+        events.push(`${def.name} admitted: prefill writes ${def.prompt} prompt tokens${mode === 'paged' ? ` into blocks ${rn.blocks.map((b) => '#' + b).join(', ')}` : ` into slots ${rn.blocks[0]}–${rn.blocks[0] + MAXLEN - 1}`}`);
+      }
+      t++;
+      return runs.some((r) => r.status !== 'finished');
+    }
+
+    // slot → {req, used}
+    function slotState(): { req: number; used: boolean; head?: string }[] {
+      const out = Array.from({ length: SLOTS }, () => ({ req: -1, used: false } as { req: number; used: boolean; head?: string }));
+      for (const rn of runs) {
+        if (rn.status !== 'running') continue;
+        if (mode === 'contig') {
+          const s0 = rn.blocks[0];
+          for (let k = 0; k < MAXLEN; k++) out[s0 + k] = { req: rn.id, used: k < rn.len };
+        } else {
+          rn.blocks.forEach((b, li) => {
+            for (let k = 0; k < BS; k++) out[b * BS + k] = { req: rn.id, used: li * BS + k < rn.len };
+            out[b * BS].head = `${REQS[rn.id].name}·${li}`;
+          });
+        }
+      }
+      return out;
+    }
+
+    function render() {
+      clear(g);
+      const ss = slotState();
+      const X0 = 20, BW = (W - 40) / 8, CELL = (BW - 14) / BS, ROWY = [34, 104];
+      text(g, X0, 12, mode === 'paged' ? 'Physical KV memory · 16 blocks × 4 token slots' : 'Physical KV memory · 64 token slots (each request reserves 20 in one piece)', { class: 't-small t-bold t-dim' });
+      for (let b = 0; b < BLOCKS; b++) {
+        const bx = X0 + (b % 8) * BW, by = ROWY[Math.floor(b / 8)];
+        rect(g, bx + 2, by, BW - 6, 52, 'transparent', { stroke: mode === 'paged' ? C.borderStrong : C.border, rx: 8, 'stroke-dasharray': mode === 'paged' ? null : '2 4' });
+        text(g, bx + 8, by + 11, `#${b}`, { class: 't-small t-mono t-faint' });
+        const head = ss[b * BS].head;
+        if (head) text(g, bx + BW - 10, by + 11, head, { 'text-anchor': 'end', class: 't-small t-mono t-bold', fill: SERIES[ss[b * BS].req % SERIES.length] });
+        for (let k = 0; k < BS; k++) {
+          const sl = ss[b * BS + k];
+          const cx = bx + 6 + k * CELL, cy = by + 20;
+          if (sl.req < 0) rect(g, cx, cy, CELL - 3, 26, C.surface3, { rx: 4, opacity: 0.6 });
+          else if (sl.used) rect(g, cx, cy, CELL - 3, 26, SERIES[sl.req % SERIES.length], { rx: 4 });
+          else rect(g, cx, cy, CELL - 3, 26, hatch, { rx: 4, stroke: SERIES[sl.req % SERIES.length], 'stroke-width': 1 });
+          if (mode === 'contig' && sl.req >= 0 && (b * BS + k) === runs[sl.req].blocks[0]) text(g, cx + 3, cy + 13, REQS[sl.req].name, { class: 't-small t-bold', fill: 'var(--bg)' });
+        }
+      }
+
+      // tables
+      const TY = 180;
+      text(g, X0, TY, mode === 'paged' ? 'Block tables (logical → physical)' : 'Reservations', { class: 't-small t-bold t-dim' });
+      text(g, 600, TY, 'Queue', { class: 't-small t-bold t-dim' });
+      let row = 0;
+      for (const rn of runs) {
+        if (rn.status !== 'running') continue;
+        const def = REQS[rn.id];
+        const y = TY + 16 + row * 26; row++;
+        const col = SERIES[rn.id % SERIES.length];
+        rect(g, X0, y, 24, 20, col, { rx: 5 });
+        text(g, X0 + 12, y + 10, def.name, { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+        text(g, X0 + 32, y + 10, `${rn.len} tok`, { class: 't-small t-mono t-dim' });
+        if (mode === 'paged') {
+          rn.blocks.forEach((b, li) => {
+            const bx = X0 + 90 + li * 64;
+            rect(g, bx, y, 58, 20, C.surface2, { rx: 5, stroke: col });
+            text(g, bx + 29, y + 10, `${li} → #${b}`, { 'text-anchor': 'middle', class: 't-small t-mono' });
+          });
+        } else {
+          text(g, X0 + 90, y + 10, `slots ${rn.blocks[0]}–${rn.blocks[0] + MAXLEN - 1} · using ${rn.len} of ${MAXLEN}`, { class: 't-small t-mono' });
+        }
+      }
+      const waiting = runs.filter((r) => r.status === 'waiting' && REQS[r.id].arr <= t);
+      waiting.forEach((rn, i) => {
+        const col = SERIES[rn.id % SERIES.length];
+        rect(g, 600 + i * 34, TY + 16, 28, 22, 'transparent', { rx: 6, stroke: col, 'stroke-dasharray': '3 2' });
+        text(g, 614 + i * 34, TY + 27, REQS[rn.id].name, { 'text-anchor': 'middle', class: 't-small t-bold', fill: col });
+      });
+      if (!waiting.length) text(g, 600, TY + 27, '(empty)', { class: 't-small t-faint' });
+      const fin = runs.filter((r) => r.status === 'finished').map((r) => REQS[r.id].name);
+      text(g, 600, TY + 62, `Finished: ${fin.length ? fin.join(', ') : '—'}`, { class: 't-small t-dim' });
+      text(g, 600, TY + 82, `Step ${t}`, { class: 't-small t-mono t-faint' });
+
+      const used = ss.filter((x) => x.used).length;
+      const alloc = ss.filter((x) => x.req >= 0).length;
+      st.set('Running', String(runs.filter((r) => r.status === 'running').length));
+      st.set('Waiting', String(waiting.length), waiting.length ? 'blocked by memory' : '', waiting.length ? C.waste : undefined);
+      st.set('Slots holding real KV', `${used} / ${SLOTS}`, `${Math.round((used / SLOTS) * 100)}% of memory`, C.kv);
+      st.set('Allocated but empty', String(alloc - used), alloc ? `${Math.round(((alloc - used) / alloc) * 100)}% of what is allocated` : '', alloc - used > 8 ? C.waste : C.good);
+
+      if (t === 0) say(mode === 'paged' ? 'Press <b>Play</b>. Requests get <b>blocks of 4 slots</b> only as they need them, anywhere in memory. Each request keeps a block table mapping its logical blocks to physical ones.' : 'Press <b>Play</b>. Each request reserves <b>max_len = 20</b> contiguous slots up front, because the engine cannot know how long its answer will be.');
+      else say(events.length ? events.join(' · ') : 'Everyone decodes one token.');
+    }
+
+    reset();
+    const pp = player(bar, root, { step, reset, render, interval: 1300, autoplay: true });
+    segmented(bar, [{ value: 'contig', label: 'Contiguous (pre-allocate)' }, { value: 'paged', label: 'Paged blocks' }], mode, (v) => { mode = v as Mode; reset(); render(); });
+  });
+</script>

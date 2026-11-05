@@ -1,0 +1,124 @@
+---
+layout: ../layouts/Chapter.astro
+title: Capacity & Cost
+description: Turn a model, a GPU, a traffic forecast and an SLO into a number of GPUs and a price per million tokens, and learn which knobs move that number.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import CapPlanner from '../components/viz/CapPlanner.astro';
+import CapWorked from '../components/viz/CapWorked.astro';
+import CapBreakEven from '../components/viz/CapBreakEven.astro';
+import CapLongContext from '../components/viz/CapLongContext.astro';
+
+Every earlier chapter feeds into one practical question: **how many GPUs do we need, and what will each token cost?** The answer is a chain of estimates. Each link comes from a chapter you have already seen:
+
+1. **Memory** decides how many sequences *can* be in flight ([KV cache](../kv-cache/)).
+2. **Bandwidth** decides how fast each decode step runs at a given batch ([roofline](../roofline/)).
+3. The **TPOT SLO** decides how big a batch you are *allowed* to run ([metrics](../metrics/)).
+4. That gives **requests per second per replica**. **Little's law** and headroom turn it into a **replica count**.
+5. Replicas × GPUs × price ÷ tokens served = **cost per million tokens**.
+
+## A worked example, step by step
+
+Suppose a team wants to self-host a **70B** model for an internal assistant. They expect **3 req/s** at peak, **3,000-token** prompts (RAG context included), **500-token** answers, and a smooth stream with **TPOT ≤ 50 ms**. They plan FP8 weights on replicas of two H100s.
+
+<Viz title="From requirements to GPUs and $/token" label="Live">
+  <CapWorked />
+  <Fragment slot="caption">
+    <p>Every number is computed by the same first-order model the planner below uses: decode steps read all weights plus the batch's KV cache from HBM at ~75% of peak bandwidth, and prefill runs at ~50% of peak FLOPs. Real engines land within a factor of ~1.5–2 of this. A load test gives the real number.</p>
+  </Fragment>
+</Viz>
+
+Notice what decided the answer. Memory would allow almost 60 sequences, but the **50 ms TPOT SLO** caps the batch first. Loosen the SLO and the same GPUs serve more users. Tighten it and you pay for more replicas.
+
+## Plan your own deployment
+
+Every input below changes something real. Things to try:
+
+- **Switch weights to FP8** on a 70B model and watch both memory and speed improve.
+- **Raise the prompt to 16k** and watch concurrency collapse and TTFT break.
+- **Tighten TPOT to 20 ms** and watch the per-replica throughput drop.
+- Compare **TP=2 vs TP=4** for the same model: more KV room and faster steps, but more GPUs per replica.
+
+<Viz title="Capacity planner" label="Calculator">
+  <CapPlanner />
+  <Fragment slot="caption">
+    <p>Read left to right: each card feeds the next. Concurrency is the smaller of the memory ceiling and the largest batch that still meets the TPOT SLO. Effective TPOT includes time lost to other requests' prefills. The target utilisation is your headroom: 70% means you plan to run at 70% of the knee. All values are estimates, not benchmarks.</p>
+  </Fragment>
+</Viz>
+
+The model behind the planner fits in a few lines:
+
+$$
+t_\text{step}(B) \approx \frac{\text{weight bytes} + B \cdot \overline{\text{ctx}} \cdot \text{KV/token}}{\text{HBM bandwidth}}
+\qquad
+\text{req/s per replica} = \frac{1}{\dfrac{N_\text{out}\, t_\text{step}(B)}{B} + t_\text{prefill}}
+$$
+
+$$
+\text{replicas} = \left\lceil \frac{\lambda}{\text{req/s per replica} \times \text{target utilisation}} \right\rceil
+\qquad
+\frac{\$}{\text{M tokens}} = \frac{\text{GPUs} \times \$/\text{GPU-hour}}{\text{output tokens per hour} / 10^6}
+$$
+
+<Callout type="key" title="Utilisation is the hidden multiplier">
+The per-token price above assumes the GPUs are busy all the time. Real traffic has a daily cycle: a fleet sized for the 10 am peak may average 30–40% utilisation over 24 hours, which makes the **effective** cost per token 2.5–3× the peak-hour figure. Autoscaling, batch backfill at night, and mixing workloads on shared pools all attack this number.
+</Callout>
+
+## Long context is expensive three times over
+
+Context length is the input that most often wrecks a capacity plan. It hurts in three separate ways:
+
+<Viz title="What context length does to a replica" label="Explore">
+  <CapLongContext />
+  <Fragment slot="caption">
+    <p>KV memory grows linearly with tokens, so concurrency falls as 1/context. Prefill grows faster than linearly because the attention term is quadratic in prompt length, so TTFT climbs steeply. Cost per request rises with both. An ✗ means even one request of that length doesn't fit.</p>
+  </Fragment>
+</Viz>
+
+Practical defences:
+
+- Set `max_model_len` to what the product actually needs, not the model's maximum. Engines check at startup that a max-length sequence fits, and a too-large value can stop the server from starting on smaller GPUs.
+- Enforce prompt-size limits at the **gateway**, with clear errors.
+- Run a **dedicated long-context pool** (more TP, FP8 KV after evaluation) so contract reviews don't preempt chat users.
+- Use [prefix caching](../prefix-caching/) for documents that are queried repeatedly, and better retrieval to send fewer tokens.
+
+## Managed API or self-hosted?
+
+Self-hosting changes the cost shape: from **per token** to **per GPU-hour, in whole replicas, whether or not anyone is using them**. That makes the comparison a break-even problem:
+
+<Viz title="Break-even: pay per token vs pay per GPU-hour" label="Explore">
+  <CapBreakEven />
+  <Fragment slot="caption">
+    <p>The self-hosted line is a staircase: you buy capacity a whole replica at a time, plus a fixed operations cost (on-call, platform, storage, networking). Below the break-even point, the managed API's pay-per-use pricing wins. Above it, self-hosting wins only if utilisation stays high. Prices are illustrative.</p>
+  </Fragment>
+</Viz>
+
+Cost is rarely the only factor. Teams self-host for **data residency and privacy** (air-gapped or regulated environments), **latency control**, **custom or fine-tuned models**, and freedom from provider rate limits. They use managed APIs for frontier quality and zero operations. Many organisations run **both behind one gateway**, routing by workload, sensitivity and cost.
+
+<Callout type="warn" title="Load-test before you buy">
+Treat every number on this page as a starting hypothesis. Before committing to hardware, replay your **real** prompt and output length distributions with open-loop (Poisson) arrivals, ramp until you find the goodput knee, include realistic prefix sharing and a cold-cache run, and record TTFT, ITL, preemptions and KV usage against the exact engine version and flags.
+</Callout>
+
+<Interview>
+  <Q q="Estimate the KV cache available and max concurrency for a 14B model (40 layers, 8 KV heads, head dim 128) in BF16 on one 80 GB GPU at 4k tokens per conversation." level="core">
+    Budget ≈ 80 × 0.9 = 72 GB. Weights ≈ 14B × 2 B = 28 GB. Runtime overhead ≈ 3–4 GB, leaving ~40 GB for KV. KV per token = 2 × 40 × 8 × 128 × 2 B = 160 KiB, so ~40 GB holds ~250k tokens, or ~60 conversations at 4k. Plan for fewer (say ~30) to leave room for the long tail of 8k+ conversations.
+  </Q>
+  <Q q="How do you compute cost per million output tokens for a self-hosted deployment?" level="core">
+    (GPU price per hour × GPUs) ÷ (output tokens per hour ÷ 10⁶). Example: 2 GPUs at \$2.50/h = \$5/h. At 1,500 output tok/s that is 5.4M tokens/h, so about \$0.93/M when fully loaded. At 40% average utilisation it is about \$2.30/M. Then add engineering, on-call, storage, networking and spare capacity.
+  </Q>
+  <Q q="Your model barely fits on one GPU. Two independent replicas or one TP=2 replica?" level="mid">
+    Two replicas avoid communication overhead and isolate failures, but each has very little KV room, so concurrency and context are capped. TP=2 roughly doubles KV room and speeds up each step (bandwidth from both GPUs), at the cost of all-reduce overhead and a shared failure domain. Memory-starved replicas usually favour TP=2; otherwise replicas give more total throughput. Load-test both.
+  </Q>
+  <Q q="Walk through a capacity plan for a chat assistant with 3 req/s peak and ~12 s average E2E." level="mid">
+    Little's law: ~3 × 12 = 36 requests in flight at peak. From memory math and a load test, find the concurrency one replica sustains within SLO, say 24. Then 36 ÷ 24 = 1.5, which rounds up to 2 replicas, plus 1 spare for failures and rollouts = 3. Validate the 24 with an open-loop load test at real prompt and output distributions.
+  </Q>
+  <Q q="You switched to 4-bit weights to save GPUs, but throughput under load fell. Why?" level="senior">
+    Weight-only INT4 shrinks bytes read, which helps **small-batch, memory-bound** decode. At large batches the engine becomes compute-bound, and INT4 kernels pay dequantisation overhead on 16-bit tensor cores, so they can lose to FP8 or BF16 on native tensor cores. Check which kernel was selected, throughput across several concurrency levels, output length changes, and any engine flags that changed with the swap.
+  </Q>
+  <Q q="Leadership asks: 'Why does our self-hosted model cost 3× what the spreadsheet said?' What do you check?" level="senior">
+    Real **average utilisation** vs the plan's assumption (daily cycle, over-provisioned minimum replicas, slow scale-down); actual vs assumed output length (longer outputs cut throughput); prefix-cache hit rate; preemptions and recomputation; whether the TPOT SLO forced smaller batches; spare and failed capacity; and hidden costs (ops, storage, egress). The fix is usually autoscaling, backfilling batch work, and right-sizing the pool, not new GPUs.
+  </Q>
+</Interview>

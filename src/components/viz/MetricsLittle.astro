@@ -1,0 +1,57 @@
+---
+/* Little's law, live: requests arrive at rate λ and each stays W seconds.
+   The number in flight converges to L = λ·W. */
+---
+<div data-viz="metrics-little"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, slider, stats, rafLoop, C, rng, SERIES } from '../../lib/viz';
+
+  const W = 940, H = 190, PX0 = 120, PX1 = 820, PY = 50, PH = 90;
+
+  mountAll('metrics-little', (root) => {
+    let lambda = 4, wait = 10, perReplica = 24;
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Arrival rate λ', min: 0.5, max: 10, step: 0.5, value: lambda, format: (v) => `${v} req/s`, onInput: (v) => { lambda = v; } });
+    slider(bar, { label: 'Time in system W', min: 2, max: 30, value: wait, format: (v) => `${v} s`, onInput: (v) => { wait = v; } });
+    slider(bar, { label: 'SLO-safe concurrency / replica', min: 8, max: 128, step: 4, value: perReplica, onInput: (v) => { perReplica = v; } });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Requests flowing through a pipe; the count inside equals arrival rate times time in system' });
+    const st = stats(root, ['L = λ × W (theory)', 'In flight now (live)', 'Replicas needed']);
+
+    const r = rng(3);
+    type Dot = { born: number; w: number; y: number; c: string };
+    let dots: Dot[] = [];
+    let next = -wait, clock = 0, avg = lambda * wait; // start already in steady state
+
+    rafLoop(root, (dt) => {
+      clock += dt;
+      while (next <= clock) {
+        dots.push({ born: next, w: wait, y: PY + 8 + r() * (PH - 16), c: SERIES[Math.floor(r() * 5)] });
+        next += -Math.log(1 - r()) / lambda;
+      }
+      dots = dots.filter((d) => clock - d.born < d.w);
+      avg += (dots.length - avg) * Math.min(1, dt * 0.8);
+      draw();
+    });
+
+    function draw() {
+      clear(svg);
+      text(svg, 12, PY + PH / 2 - 8, 'arrivals', { class: 't-small t-dim' });
+      text(svg, 12, PY + PH / 2 + 8, `λ = ${lambda}/s →`, { class: 't-small t-mono t-bold', fill: C.decode });
+      rect(svg, PX0, PY, PX1 - PX0, PH, C.surface2, { rx: 14, stroke: C.borderStrong });
+      text(svg, (PX0 + PX1) / 2, PY - 14, `the system: queue + prefill + decode · each request stays W = ${wait} s`, { 'text-anchor': 'middle', class: 't-small t-dim' });
+      for (const d of dots) {
+        const p = (clock - d.born) / d.w;
+        s('circle', { cx: PX0 + 8 + p * (PX1 - PX0 - 16), cy: d.y, r: 4, fill: d.c, opacity: 0.9 }, svg);
+      }
+      text(svg, PX1 + 14, PY + PH / 2 - 8, 'completed', { class: 't-small t-dim' });
+      text(svg, PX1 + 14, PY + PH / 2 + 8, `→ ${lambda}/s`, { class: 't-small t-mono t-bold', fill: C.kv });
+      text(svg, (PX0 + PX1) / 2, PY + PH + 22, `in flight right now: ${dots.length}`, { 'text-anchor': 'middle', class: 't-mono t-bold' });
+
+      const L = lambda * wait;
+      st.set('L = λ × W (theory)', `${L.toFixed(0)} requests`, `${lambda}/s × ${wait} s`, C.accent);
+      st.set('In flight now (live)', `${Math.round(avg)}`, 'smoothed count of dots');
+      st.set('Replicas needed', `${Math.ceil(L / perReplica)}`, `${L.toFixed(0)} ÷ ${perReplica} concurrent each (before headroom)`);
+    }
+  });
+</script>

@@ -1,0 +1,103 @@
+---
+/* Logits → penalties → temperature → softmax → top-k → top-p → min-p → sample. */
+---
+<div data-viz="samp-logits"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, group, slider, checkbox, button, stats, legend, C, rng } from '../../lib/viz';
+
+  const CANDS: [string, number][] = [
+    ['␣Paris', 9.1], ['␣a', 6.8], ['␣the', 6.5], ['␣located', 5.9], ['␣known', 5.4], ['␣not', 4.6], ['␣Lyon', 4.1],
+    ['␣one', 3.8], ['␣also', 3.5], ['␣home', 3.2], ['␣famous', 3.0], ['␣beautiful', 2.6], ['␣PARIS', 1.9], ['␣Marseille', 1.5],
+  ];
+  const SEEN = new Set(['␣the', '␣a']); // tokens already present in the output
+  const W = 940, ROW = 24, TOP = 34, H = TOP + CANDS.length * ROW + 16;
+  const LX = 120, BX = 130, BW = 560;
+
+  mountAll('samp-logits', (root) => {
+    let T = 1.0, K = CANDS.length, P = 1.0, MINP = 0, rep = false;
+    let counts = new Array(CANDS.length).fill(0); let draws = 0; let last = -1;
+    const r = rng(1234);
+
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Temperature', min: 0, max: 2, step: 0.05, value: T, format: (v) => (v === 0 ? '0 (greedy)' : v.toFixed(2)), onInput: (v) => { T = v; clearHist(); render(); } });
+    slider(bar, { label: 'top-k', min: 1, max: CANDS.length, value: K, format: (v) => (v === CANDS.length ? 'off' : String(v)), onInput: (v) => { K = v; clearHist(); render(); } });
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'top-p', min: 0.05, max: 1, step: 0.01, value: P, format: (v) => (v >= 1 ? 'off' : v.toFixed(2)), onInput: (v) => { P = v; clearHist(); render(); } });
+    slider(bar2, { label: 'min-p', min: 0, max: 0.5, step: 0.01, value: MINP, format: (v) => (v === 0 ? 'off' : v.toFixed(2)), onInput: (v) => { MINP = v; clearHist(); render(); } });
+    checkbox(bar2, 'repetition penalty 1.3 (“␣the”, “␣a” already used)', rep, (v) => { rep = v; clearHist(); render(); });
+    const bar3 = ctrlBar(root);
+    const g = group(bar3);
+    button(g, 'Sample 1 token', () => sample(1), { primary: true });
+    button(g, 'Sample ×200', () => sample(200));
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Next-token probabilities after sampling filters' });
+    legend(root, [['final probability (after filters, renormalised)', C.token], ['raw softmax at T = 1', C.mem], ['removed by a filter', C.waste], ['times sampled', C.kv]]);
+    const st = stats(root, ['Prompt', 'Candidates kept', 'P(top token)', 'Entropy', 'Last sample']);
+
+    function clearHist() { counts = new Array(CANDS.length).fill(0); draws = 0; last = -1; }
+
+    function compute() {
+      const logits = CANDS.map(([t, l]) => (rep && SEEN.has(t) ? (l > 0 ? l / 1.3 : l * 1.3) : l));
+      const raw = softmax(logits, 1);
+      if (T === 0) {
+        const best = logits.indexOf(Math.max(...logits));
+        return { raw, final: logits.map((_, i) => (i === best ? 1 : 0)), why: logits.map((_, i) => (i === best ? '' : 'greedy')) };
+      }
+      const p = softmax(logits, T);
+      const order = p.map((_, i) => i).sort((a, b) => p[b] - p[a]);
+      const why: string[] = new Array(p.length).fill('');
+      order.forEach((i, rank) => { if (rank >= K) why[i] = 'top-k'; });
+      let cum = 0;
+      order.forEach((i) => { if (why[i]) return; if (cum >= P - 1e-9) why[i] = 'top-p'; cum += p[i]; });
+      const pmax = Math.max(...p);
+      p.forEach((x, i) => { if (!why[i] && x < MINP * pmax) why[i] = 'min-p'; });
+      const kept = p.map((x, i) => (why[i] ? 0 : x));
+      const z = kept.reduce((a, b) => a + b, 0);
+      return { raw, final: kept.map((x) => x / z), why };
+    }
+    function softmax(l: number[], t: number) { const m = Math.max(...l); const e = l.map((x) => Math.exp((x - m) / t)); const z = e.reduce((a, b) => a + b, 0); return e.map((x) => x / z); }
+
+    function sample(n: number) {
+      const { final } = compute();
+      for (let k = 0; k < n; k++) {
+        let u = r(), i = 0;
+        for (; i < final.length - 1; i++) { u -= final[i]; if (u <= 0) break; }
+        counts[i]++; draws++; last = i;
+      }
+      render();
+    }
+
+    function render() {
+      clear(svg);
+      const { raw, final, why } = compute();
+      text(svg, LX, 14, 'token', { 'text-anchor': 'end', class: 't-small t-faint t-bold' });
+      text(svg, BX, 14, 'probability', { class: 't-small t-faint t-bold' });
+      text(svg, BX + BW + 24, 14, draws ? `sampled (of ${draws})` : 'sampled', { class: 't-small t-faint t-bold' });
+      const maxC = Math.max(1, ...counts);
+      CANDS.forEach(([tok], i) => {
+        const y = TOP + i * ROW;
+        const cut = !!why[i];
+        text(svg, LX, y + 9, tok, { 'text-anchor': 'end', class: 't-mono' + (cut ? ' t-faint' : ' t-bold'), 'font-size': 12, 'text-decoration': cut ? 'line-through' : null });
+        rect(svg, BX, y, BW, ROW - 6, C.surface2, { rx: 4 });
+        rect(svg, BX, y + ROW - 9, raw[i] * BW, 3, C.mem, { rx: 1.5, opacity: 0.8 });
+        if (!cut) rect(svg, BX, y, Math.max(2, final[i] * BW), ROW - 9, i === last ? C.kv : C.token, { rx: 4 });
+        else text(svg, BX + 8, y + 7, `✕ ${why[i]}`, { class: 't-small t-bold', style: `fill:${C.waste}` });
+        if (!cut) text(svg, BX + Math.max(2, final[i] * BW) + 6, y + 7, `${(final[i] * 100).toFixed(final[i] < 0.01 ? 2 : 1)}%`, { class: 't-small t-mono' });
+        const cx = BX + BW + 24;
+        if (counts[i]) {
+          rect(svg, cx, y + 2, (counts[i] / maxC) * 120, ROW - 12, C.kv, { rx: 3, opacity: 0.85 });
+          text(svg, cx + (counts[i] / maxC) * 120 + 6, y + 8, String(counts[i]), { class: 't-small t-mono' });
+        }
+      });
+      const keptN = final.filter((x) => x > 0).length;
+      const ent = -final.reduce((a, p) => a + (p > 0 ? p * Math.log2(p) : 0), 0);
+      st.set('Prompt', '…France is', `“The capital of France is”: top ${CANDS.length} of 128K shown`);
+      st.set('Candidates kept', `${keptN} / ${CANDS.length}`, T === 0 ? 'greedy: argmax only' : 'after top-k, top-p, min-p');
+      st.set('P(top token)', `${(Math.max(...final) * 100).toFixed(1)}%`);
+      st.set('Entropy', `${ent.toFixed(2)} bits`, ent < 0.5 ? 'nearly deterministic' : ent > 2 ? 'very random' : 'some variety', C.token);
+      st.set('Last sample', last >= 0 ? CANDS[last][0] : '–', last >= 0 ? `p = ${(final[last] * 100).toFixed(1)}%` : 'press Sample', C.kv);
+    }
+    render();
+  });
+</script>

@@ -1,0 +1,101 @@
+---
+layout: ../layouts/Chapter.astro
+title: Disaggregated Prefill / Decode
+description: Run prefill and decode on separate GPU pools and ship the KV cache between them. Why this tames tail latency, what it costs, and when it is worth the complexity.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import DisaggTimeline from '../components/viz/DisaggTimeline.astro';
+import DisaggRatio from '../components/viz/DisaggRatio.astro';
+import DisaggKV from '../components/viz/DisaggKV.astro';
+
+[Prefill and decode](../prefill-decode/) are different workloads. <span class="chip prefill">Prefill</span> is a burst of compute-bound matmuls over the whole prompt. <span class="chip decode">Decode</span> is a long stream of small, memory-bound steps. Running both on the same GPU causes **interference**: a long prefill occupies the GPU, and every user mid-stream on that GPU sees their tokens freeze until it finishes.
+
+**Disaggregated serving** gives each phase its own pool of GPUs:
+
+1. A request goes to a **prefill worker**, which computes the prompt's KV cache and the first token.
+2. The KV cache is **transferred** to a **decode worker**, over NVLink or RDMA.
+3. The decode worker adds the request to its continuous batch and streams the rest of the tokens.
+
+## Seeing the interference
+
+The same six requests run on the same two GPUs, scheduled two ways. Watch the per-request token rows: each tick is a token reaching a user, and red bars are stalls longer than 60 ms.
+
+<Viz title="Colocated vs disaggregated on an identical trace" label="Live">
+  <DisaggTimeline />
+  <Fragment slot="caption">
+    <p>Top: each GPU runs prefill and decode, and a 4,000-token prefill freezes every stream on that GPU. Switch to <b>chunked prefill</b> to see the usual single-pool fix: stalls shrink, but decode steps get slower while chunks are mixed in. Bottom: the decode GPU never runs a prefill, so streaming is steady. The cost is that prompts now queue for a single prefill GPU, and each request waits for a KV transfer.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key" title="What disaggregation buys, and what it doesn't">
+It **decouples TTFT from ITL**. Each pool can be sized, tuned and even run on different hardware (compute-heavy for prefill, bandwidth-heavy for decode) for its own SLO. On its own it does **not** increase raw throughput; it trades some efficiency and complexity for predictable tail latency.
+</Callout>
+
+## Sizing the two pools
+
+Disaggregation adds a new capacity question: the **xP : yD ratio**. Long prompts with short answers (RAG, summarisation) need more prefill GPUs. Short prompts with long answers (chat, reasoning) need more decode GPUs. If either pool is undersized, it becomes the bottleneck no matter how many GPUs sit idle in the other.
+
+<Viz title="Prefill : decode pool planner" label="Explore">
+  <DisaggRatio />
+  <Fragment slot="caption">
+    <p>TTFT uses a simple queueing model: prefill time plus M/D/1 waiting at the pool's utilisation. ITL comes from the decode bandwidth model, with concurrency from Little's law (<code>N = λ × output × ITL</code>). The colocated comparison adds one full prefill to a single inter-token gap, the worst case without chunking.</p>
+  </Fragment>
+</Viz>
+
+Real systems resize the pools as the traffic mix changes during the day. Some schedulers also let a decode worker run short prefills locally, skipping the transfer when the prompt is small.
+
+## Moving the KV cache
+
+The handoff is the new cost. For Llama 3.1 70B, the KV cache is **320 KiB per token**, so an 8K-token prompt produces **2.5 GiB** that has to move before decoding can start on the other side.
+
+<Viz title="KV transfer time vs prefill compute" label="Calculator">
+  <DisaggKV />
+  <Fragment slot="caption">
+    <p>Prefill FLOPs grow at least linearly with prompt length (and quadratically for attention), while KV bytes grow linearly. Long prompts therefore hide their transfer more easily than you might expect. Sending KV <b>layer by layer</b> while later layers are still computing hides most of it.</p>
+  </Fragment>
+</Viz>
+
+The transfer path matters a lot:
+
+- **Zero-copy RDMA** from GPU memory to GPU memory over InfiniBand or RoCE, through libraries such as **NIXL** (on UCX), **Mooncake**'s transfer engine, or NCCL point-to-point. Data never bounces through CPU memory.
+- **KV connectors** in the engines plug these in. vLLM, SGLang and TensorRT-LLM all support P/D, using connectors such as NIXL, LMCache or Mooncake.
+- **Layouts must match.** If the prefill and decode workers use different TP sizes or block sizes, KV blocks must be re-sharded or re-laid out during transfer.
+- Production stacks such as **llm-d** and **NVIDIA Dynamo** pair this with a router that sends each request to a prefill worker and a decode worker, ideally ones with matching cached prefixes.
+
+## When is it worth it?
+
+| Situation | Better choice |
+|---|---|
+| Small fleet, mixed traffic, moderate SLOs | **Colocated + [chunked prefill](../chunked-prefill/)**: simpler, uses every GPU for both phases |
+| Long prompts with strict ITL SLOs (streaming UX, voice) | **Disaggregated**: ITL no longer depends on other users' prompts |
+| Very large scale, MoE models | **Disaggregated** with different parallelism per pool, for example wide EP for decode |
+| Slow inter-node network, no RDMA | Colocated, or disaggregate only within an NVLink domain |
+| Workload mix changes a lot | Disaggregated only with **dynamic** pool rebalancing, otherwise one pool idles |
+
+<Callout type="warn" title="Common pitfalls">
+Without RDMA, transfers through CPU memory and TCP can cost more than they save. Prefix caching gets harder because each pool keeps its own cache unless the router is aware of both. Failure handling also gets more complex: a decode worker that dies mid-stream loses KV that only it held.
+</Callout>
+
+<Interview>
+  <Q q="What is disaggregated prefill/decode serving?" level="core">
+    Prefill and decode run on separate GPU pools. A prefill worker processes the prompt, produces the first token and builds the KV cache. The KV cache is transferred to a decode worker, which streams the remaining tokens. Each pool is sized and tuned independently.
+  </Q>
+  <Q q="Which metric does disaggregation mainly improve, and why?" level="core">
+    Inter-token latency, especially p99 and worst-case stalls. Decode workers never run prefills, so a user's stream is never paused by someone else's long prompt. TTFT can even get slightly worse because of the transfer step and queueing for the prefill pool.
+  </Q>
+  <Q q="Does disaggregation increase throughput?" level="mid">
+    Not by itself. It removes interference and lets each phase use its best batch sizes and parallelism, which can raise **goodput** under strict SLOs. But it adds transfer overhead and risks idle capacity if the pools are imbalanced. For raw tokens per second, a well-tuned colocated pool with chunked prefill is often just as good.
+  </Q>
+  <Q q="Estimate the KV transfer for a 70B GQA model with an 8K prompt over 400 Gb/s RDMA." level="mid">
+    KV per token = 2 × 80 × 8 × 128 × 2 B = 320 KiB. Times 8,192 tokens ≈ 2.5 GiB. At ~50 GB/s that is ~54 ms. Prefill for that prompt takes on the order of 150–300 ms on a node, so sending layer by layer during prefill hides most of the transfer.
+  </Q>
+  <Q q="How do you choose the prefill:decode ratio?" level="senior">
+    From the workload: prefill demand ∝ request rate × prompt length (compute), and decode demand ∝ concurrent streams × context (bandwidth and KV memory), where concurrency = rate × output length × ITL. Size each pool to stay below about 70–80% utilisation at peak, then rebalance dynamically as the prompt/output mix changes. Measure TTFT and ITL percentiles per pool.
+  </Q>
+  <Q q="When would you not disaggregate?" level="senior">
+    When the fleet is small (pools can't stay balanced), the network lacks RDMA, prompts are short (little interference to remove), SLOs are relaxed, or traffic shifts unpredictably. In those cases chunked prefill with a sensible token budget gets most of the ITL benefit with much less complexity.
+  </Q>
+</Interview>

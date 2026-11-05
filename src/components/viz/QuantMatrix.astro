@@ -1,0 +1,136 @@
+---
+/* Quantize a small weight matrix step by step. Compare per-tensor, per-channel (row) and
+   per-group scales, with and without an outlier input channel. */
+---
+<div data-viz="quant-matrix"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, player, segmented, checkbox, stats, narration, legend, C, rng, s } from '../../lib/viz';
+
+  const R = 8, K = 16, G = 4; // rows (output channels), cols (input channels), group size
+  const W = 940, H = 246;
+  const CELL = 24;
+
+  function makeW(outlier: boolean) {
+    const r = rng(11);
+    const rowScale = [1, 0.5, 1.8, 1, 0.7, 1.3, 0.4, 1.1];
+    const m: number[][] = [];
+    for (let i = 0; i < R; i++) {
+      const row: number[] = [];
+      for (let j = 0; j < K; j++) {
+        const u1 = Math.max(1e-9, r()), u2 = r();
+        let v = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2) * rowScale[i] * 0.5;
+        if (outlier && j === 5) v *= 10;
+        row.push(v);
+      }
+      m.push(row);
+    }
+    return m;
+  }
+
+  mountAll('quant-matrix', (root) => {
+    let gran: 'tensor' | 'channel' | 'group' = 'channel';
+    let bits = 4;
+    let outlier = false;
+    let phase = 0;
+
+    const bar = ctrlBar(root);
+    const bar2 = ctrlBar(root);
+    segmented(bar2, [{ value: 'tensor', label: 'Per-tensor' }, { value: 'channel', label: 'Per-channel' }, { value: 'group', label: `Per-group (g=${G})` }], gran, (v) => { gran = v as typeof gran; render(); });
+    segmented(bar2, [{ value: '8', label: 'INT8' }, { value: '4', label: 'INT4' }, { value: '3', label: 'INT3' }], '4', (v) => { bits = Number(v); render(); });
+    checkbox(bar2, 'Outlier input channel', outlier, (v) => { outlier = v; render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Weight matrix, its quantized version and the error' });
+    const say = narration(root);
+    const st = stats(root, ['Mean error (relative)', 'Worst cell error', 'Scales stored', 'Effective bits / weight']);
+    legend(root, [['Positive weight', C.decode], ['Negative weight', C.weight], ['Group sharing one scale', C.prefill], ['Quantization error', C.waste]]);
+
+    function reset() { phase = 0; }
+    function step() { phase = (phase + 1) % 4; return true; }
+
+    function groupOf(i: number, j: number) {
+      if (gran === 'tensor') return 0;
+      if (gran === 'channel') return i;
+      return i * (K / G) + Math.floor(j / G);
+    }
+
+    function render() {
+      clear(svg);
+      const Wm = makeW(outlier);
+      const qmax = 2 ** (bits - 1) - 1;
+      const nGroups = gran === 'tensor' ? 1 : gran === 'channel' ? R : R * (K / G);
+      const absmax = new Array(nGroups).fill(0);
+      for (let i = 0; i < R; i++) for (let j = 0; j < K; j++) { const g = groupOf(i, j); absmax[g] = Math.max(absmax[g], Math.abs(Wm[i][j])); }
+      const scale = absmax.map((a) => a / qmax || 1);
+      const Q = Wm.map((row, i) => row.map((v, j) => Math.round(v / scale[groupOf(i, j)])));
+      const D = Q.map((row, i) => row.map((q, j) => q * scale[groupOf(i, j)]));
+      const gmax = Math.max(...Wm.flat().map(Math.abs));
+
+      const panels = [
+        { x: 20, title: phase === 0 ? '① FP16 weights' : phase === 1 ? '② find absmax of each group' : phase === 2 ? `③ q = round(w / s), ${bits}-bit ints` : '④ dequantized ŵ = q × s' },
+        { x: 20 + K * CELL + 70, title: 'error |w − ŵ|' },
+      ];
+      text(svg, panels[0].x, 14, panels[0].title, { class: 't-bold' });
+      text(svg, panels[1].x, 14, panels[1].title, { class: 't-bold' });
+      const Y0 = 30;
+
+      // left panel
+      for (let i = 0; i < R; i++) for (let j = 0; j < K; j++) {
+        const x = panels[0].x + j * CELL, y = Y0 + i * CELL;
+        let v = Wm[i][j];
+        if (phase === 2) v = Q[i][j] * (gmax / Math.max(1, ...Q.flat().map(Math.abs)));
+        if (phase === 3) v = D[i][j];
+        const op = Math.min(1, Math.abs(v) / gmax) * 0.9 + 0.08;
+        rect(svg, x, y, CELL - 2, CELL - 2, v >= 0 ? C.decode : C.weight, { rx: 3, opacity: op });
+        if (phase === 2) text(svg, x + (CELL - 2) / 2, y + (CELL - 2) / 2, String(Q[i][j]), { 'text-anchor': 'middle', class: 't-mono', 'font-size': 10.5 });
+        if (phase === 1) {
+          const g = groupOf(i, j);
+          if (Math.abs(Wm[i][j]) === absmax[g]) s('rect', { x: x + 1, y: y + 1, width: CELL - 4, height: CELL - 4, fill: 'none', stroke: C.prefill, 'stroke-width': 2.2, rx: 3 }, svg);
+        }
+      }
+      // group outlines
+      if (phase >= 1) {
+        const outline = (x: number, y: number, w: number, hh: number) => s('rect', { x: x - 1, y: y - 1, width: w, height: hh, fill: 'none', stroke: C.prefill, 'stroke-width': 1.3, rx: 4, opacity: 0.8 }, svg);
+        if (gran === 'tensor') outline(panels[0].x, Y0, K * CELL, R * CELL);
+        else if (gran === 'channel') for (let i = 0; i < R; i++) outline(panels[0].x, Y0 + i * CELL, K * CELL, CELL);
+        else for (let i = 0; i < R; i++) for (let gj = 0; gj < K / G; gj++) outline(panels[0].x + gj * G * CELL, Y0 + i * CELL, G * CELL, CELL);
+      }
+      if (outlier) text(svg, panels[0].x + 5 * CELL + (CELL - 2) / 2, Y0 + R * CELL + 12, '▲ outlier', { 'text-anchor': 'middle', class: 't-small', fill: C.prefill });
+
+      // right panel: error heatmap
+      let errSum = 0, errMax = 0, normSum = 0;
+      for (let i = 0; i < R; i++) for (let j = 0; j < K; j++) {
+        const e = Math.abs(Wm[i][j] - D[i][j]);
+        errSum += e * e; normSum += Wm[i][j] * Wm[i][j]; errMax = Math.max(errMax, e);
+        const x = panels[1].x + j * CELL, y = Y0 + i * CELL;
+        const show = phase === 3;
+        rect(svg, x, y, CELL - 2, CELL - 2, show ? C.waste : C.surface3, { rx: 3, opacity: show ? Math.min(1, (e / (gmax / 2 ** 3)) * 0.95 + 0.05) : 0.5 });
+      }
+      if (phase !== 3) text(svg, panels[1].x + (K * CELL) / 2, Y0 + (R * CELL) / 2, 'appears at step ④', { 'text-anchor': 'middle', class: 't-faint t-small' });
+
+      // scales column
+      const sx = panels[0].x + K * CELL + 8;
+      if (phase >= 1 && gran !== 'group') {
+        text(svg, sx, Y0 - 6, 's', { class: 't-small t-mono t-faint' });
+        if (gran === 'tensor') text(svg, sx, Y0 + 10, scale[0].toFixed(3), { class: 't-small t-mono', fill: C.prefill, 'font-size': 10.5 });
+        else for (let i = 0; i < R; i++) text(svg, sx - 2, Y0 + i * CELL + 11, scale[i].toFixed(2), { class: 't-mono', fill: C.prefill, 'font-size': 10.5 });
+      }
+
+      const relErr = Math.sqrt(errSum / normSum);
+      const effBits = bits + (16 * nGroups) / (R * K);
+      st.set('Mean error (relative)', `${(relErr * 100).toFixed(1)}%`, 'RMS(w − ŵ) / RMS(w)', relErr > 0.15 ? C.waste : relErr > 0.06 ? C.prefill : C.good);
+      st.set('Worst cell error', errMax.toFixed(3), `largest |w| = ${gmax.toFixed(2)}`);
+      st.set('Scales stored', String(nGroups), 'one FP16 scale each');
+      st.set('Effective bits / weight', effBits.toFixed(2), gran === 'group' ? `real kernels use g=128 → ${(bits + 16 / 128).toFixed(2)}` : 'scale overhead is tiny');
+
+      const msgs = [
+        `A tiny weight matrix: <b>${R} output channels × ${K} input channels</b>. Colour intensity shows magnitude.${outlier ? ' One input channel holds <b>outliers</b> 10× larger than the rest.' : ''}`,
+        `Each orange box is a group that shares <b>one scale</b>: s = absmax / ${qmax}. The thick outline marks the absmax that sets it. ${gran === 'tensor' ? 'One scale for everything: a single big value squeezes all the others.' : gran === 'channel' ? 'One scale per output row.' : 'Small groups adapt to local magnitudes.'}`,
+        `Divide by the scale and round: each weight is now one of only <b>${2 ** bits} integer levels</b> (−${qmax + 1}…${qmax}). Small weights in a group with a big absmax round to 0.`,
+        `Multiply back: ŵ = q × s. The red map shows what was lost. ${outlier && gran !== 'group' ? '<b>The outlier inflated the scale for its whole row, so every small weight there lost precision.</b> Try per-group.' : ''}`,
+      ];
+      say(msgs[phase]);
+    }
+    player(bar, root, { step, reset, render, interval: 1600, autoplay: true, loop: true });
+  });
+</script>

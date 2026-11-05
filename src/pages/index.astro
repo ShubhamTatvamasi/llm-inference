@@ -1,0 +1,195 @@
+---
+import Base from '../layouts/Base.astro';
+import Lifecycle from '../components/home/Lifecycle.astro';
+import { chapters, parts } from '../data/chapters';
+import { chapterUrl } from '../lib/url';
+
+const colours = [
+  ['Prefill', 'var(--c-prefill)', 'Processing the prompt: one wide, compute-bound pass'],
+  ['Decode', 'var(--c-decode)', 'Generating one token per step: memory-bound'],
+  ['KV cache', 'var(--c-kv)', 'Keys and values kept for every past token'],
+  ['Weights', 'var(--c-weight)', 'Model parameters streamed from HBM'],
+  ['Tokens', 'var(--c-token)', 'Token IDs, vocab, sampling'],
+  ['Compute', 'var(--c-compute)', 'FLOPs on tensor cores'],
+  ['Memory', 'var(--c-mem)', 'Idle, queued, overhead'],
+  ['Communication', 'var(--c-comm)', 'NVLink, all-reduce, KV transfer'],
+  ['Waste', 'var(--c-waste)', 'Fragmentation, stalls, recompute'],
+];
+const partIcons: Record<string, string> = {
+  model: '<path d="M4 7h16M4 12h10M4 17h13"/>',
+  gpu: '<rect x="4" y="5" width="16" height="14" rx="2"/><path d="M8 9h8v6H8zM2 10h2M2 14h2M20 10h2M20 14h2"/>',
+  engine: '<path d="M4 6h10M4 10h14M4 14h8M4 18h12"/><circle cx="19" cy="17" r="2"/>',
+  faster: '<path d="M13 3 5 14h6l-1 7 8-11h-6z"/>',
+  scale: '<rect x="3" y="4" width="7" height="7" rx="1.5"/><rect x="14" y="4" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+  prod: '<path d="M3 20h18M6 16V9M11 16V5M16 16v-6M21 16v-3"/>',
+};
+---
+<Base>
+  <main class="home">
+    <section class="hero">
+      <div class="hero-glow" aria-hidden="true"></div>
+      <div class="pill"><span class="dot"></span>{chapters.length} chapters · live, interactive diagrams</div>
+      <h1>Watch an LLM serve a request,<br /><span class="grad-text">token by token.</span></h1>
+      <p class="sub">
+        A visual, hands-on guide to LLM inference and serving. It follows a prompt through tokenization, attention, KV caches and GPU kernels, then through batching, schedulers, parallelism and the production stack that streams the answer back.
+      </p>
+      <div class="cta">
+        <a class="btn primary big" href={chapterUrl(chapters[0].slug)}>Start the journey <span aria-hidden="true">→</span></a>
+        <a class="btn big" href={chapterUrl('kv-cache')}>Jump to the KV cache</a>
+        <button class="btn big ghost" type="button" data-palette-open><kbd>⌘K</kbd> Search</button>
+      </div>
+    </section>
+
+    <section class="lifecycle reveal">
+      <div class="sec-head">
+        <span class="eyebrow">The full lifecycle</span>
+        <h2>One request, end to end</h2>
+        <p>The animation runs in slow motion. Click any stage to open the chapter that explains it.</p>
+      </div>
+      <Lifecycle />
+    </section>
+
+    <section class="parts">
+      <div class="sec-head reveal">
+        <span class="eyebrow">Curriculum</span>
+        <h2>Six parts, from a single matmul to a GPU fleet</h2>
+        <p>Read it in order or jump around. Every chapter has live diagrams and ends with interview-style questions.</p>
+      </div>
+      <div class="bento">
+        {parts.map((p, i) => {
+          const list = chapters.filter((c) => c.part === p.id);
+          return (
+            <article class={`card reveal c${i}`} data-spot>
+              <div class="card-top">
+                <span class="card-ic" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" set:html={partIcons[p.id]} /></span>
+                <span class="card-num">Part {p.num}</span>
+              </div>
+              <h3>{p.title}</h3>
+              <p class="card-blurb">{p.blurb}</p>
+              <ol class="card-list">
+                {list.map((c) => (
+                  <li><a href={chapterUrl(c.slug)}><span class="n">{String(chapters.indexOf(c) + 1).padStart(2, '0')}</span><span class="t">{c.title}</span><span class="arr" aria-hidden="true">→</span></a></li>
+                ))}
+              </ol>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+
+    <section class="colours reveal">
+      <div class="sec-head">
+        <span class="eyebrow">Visual language</span>
+        <h2>Learn the colours once</h2>
+        <p>Every diagram on the site uses the same colour for the same concept, so you can read a new chart at a glance.</p>
+      </div>
+      <div class="swatches">
+        {colours.map(([name, col, desc]) => (
+          <div class="sw"><i style={`background:${col}; box-shadow: 0 0 18px ${col}`}></i><div><b style={`color:${col}`}>{name}</b><span>{desc}</span></div></div>
+        ))}
+      </div>
+    </section>
+
+    <section class="features reveal">
+      <div class="feat"><b>Live, not static</b><span>Play, pause, step and scrub every simulation, or change the inputs and watch the result update.</span></div>
+      <div class="feat"><b>Real numbers</b><span>Calculators use real model configs (Llama, Qwen, DeepSeek, Mixtral) and real GPU specs (A100 → B200).</span></div>
+      <div class="feat"><b>Interview-ready</b><span>Each chapter closes with core, mid and senior-level questions you can try before revealing the answer.</span></div>
+      <div class="feat"><b>Keyboard-first</b><span><kbd>⌘K</kbd> or <kbd>/</kbd> to search, <kbd>[</kbd> and <kbd>]</kbd> for the previous and next chapter.</span></div>
+    </section>
+
+    <footer class="home-foot">Token by Token · LLM inference &amp; serving, visualized</footer>
+  </main>
+
+  <script>
+    // scroll reveal
+    const io = new IntersectionObserver((es) => es.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } }), { threshold: 0.12 });
+    document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
+    // cursor spotlight on cards
+    document.querySelectorAll<HTMLElement>('[data-spot]').forEach((card) => {
+      card.addEventListener('pointermove', (e) => {
+        const r = card.getBoundingClientRect();
+        card.style.setProperty('--mx', `${e.clientX - r.left}px`);
+        card.style.setProperty('--my', `${e.clientY - r.top}px`);
+      });
+    });
+  </script>
+
+  <style>
+    .home { max-width: 1200px; margin: 0 auto; padding: 0 24px 60px; }
+    .reveal { opacity: 0; transform: translateY(18px); transition: opacity 0.7s cubic-bezier(.2,.7,.2,1), transform 0.7s cubic-bezier(.2,.7,.2,1); }
+    .reveal.in { opacity: 1; transform: none; }
+    @media (prefers-reduced-motion: reduce) { .reveal { opacity: 1; transform: none; transition: none; } }
+
+    .hero { position: relative; text-align: center; padding: 72px 0 48px; }
+    .hero > :not(.hero-glow) { animation: rise 0.8s cubic-bezier(.2,.7,.2,1) both; }
+    .hero > :nth-child(3) { animation-delay: 0.06s; } .hero > :nth-child(4) { animation-delay: 0.12s; } .hero > :nth-child(5) { animation-delay: 0.18s; }
+    @keyframes rise { from { opacity: 0; transform: translateY(14px); filter: blur(4px); } }
+    .hero-glow { position: absolute; z-index: -1; left: 50%; top: 40px; width: min(820px, 90vw); height: 320px; transform: translateX(-50%); background: radial-gradient(closest-side, rgba(139,124,255,0.28), rgba(34,211,238,0.10) 60%, transparent); filter: blur(30px); pointer-events: none; animation: breathe 8s ease-in-out infinite; }
+    @keyframes breathe { 50% { opacity: 0.6; transform: translateX(-50%) scale(1.08); } }
+    @media (prefers-reduced-motion: reduce) { .hero > *, .hero-glow { animation: none !important; } }
+    .pill { display: inline-flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--text-dim); padding: 6px 14px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface); }
+    .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--c-good); box-shadow: 0 0 10px var(--c-good); animation: pulse 2s infinite; }
+    h1 { font-size: clamp(2.4rem, 6.4vw, 4.6rem); line-height: 1.02; letter-spacing: -0.045em; font-weight: 720; margin: 22px 0 18px; }
+    .sub { max-width: 700px; margin: 0 auto; color: var(--text-dim); font-size: clamp(1rem, 1.6vw, 1.16rem); line-height: 1.65; }
+    .cta { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 30px; }
+    .btn.big { padding: 11px 18px; font-size: 0.95rem; border-radius: 12px; }
+    .btn.ghost { background: transparent; }
+    .btn.ghost kbd { margin-right: 2px; }
+    a.btn { background-size: auto; }
+    a.btn:not(.primary) { color: var(--text); }
+
+    .sec-head { text-align: center; max-width: 680px; margin: 0 auto 28px; }
+    .eyebrow { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); }
+    .sec-head h2 { font-size: clamp(1.7rem, 3.4vw, 2.4rem); letter-spacing: -0.035em; line-height: 1.12; margin: 10px 0 10px; font-weight: 690; }
+    .sec-head p { color: var(--text-dim); margin: 0; }
+    section { margin-top: 64px; }
+    .hero { margin-top: 0; }
+
+    .bento { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; }
+    .card { --mx: 50%; --my: 0%; position: relative; grid-column: span 2; padding: 22px 22px 14px; border: 1px solid var(--border); border-radius: 20px; background: var(--surface); overflow: hidden; isolation: isolate; transition: border-color 0.25s, transform 0.25s; }
+    .card::before { content: ''; position: absolute; inset: 0; z-index: -1; background: radial-gradient(420px circle at var(--mx) var(--my), var(--accent-soft), transparent 60%); opacity: 0; transition: opacity 0.3s; }
+    .card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+    .card:hover::before { opacity: 1; }
+    .card.c0, .card.c1 { grid-column: span 3; }
+    .card.c2 { grid-column: span 3; } .card.c3 { grid-column: span 3; }
+    .card.c4, .card.c5 { grid-column: span 3; }
+    .card-top { display: flex; align-items: center; justify-content: space-between; }
+    .card-ic { width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center; color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); }
+    .card-ic svg { width: 20px; height: 20px; }
+    .card-num { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); letter-spacing: 0.08em; text-transform: uppercase; }
+    .card h3 { font-size: 1.3rem; letter-spacing: -0.025em; margin: 16px 0 4px; font-weight: 660; }
+    .card-blurb { color: var(--text-dim); margin: 0 0 12px; font-size: 0.93rem; }
+    .card-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--border); }
+    .card-list a { display: flex; align-items: center; gap: 12px; padding: 8px 2px; color: var(--text); font-size: 0.92rem; border-bottom: 1px solid var(--border); background: none; }
+    .card-list li:last-child a { border-bottom: 0; }
+    .card-list .n { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); width: 20px; }
+    .card-list .t { flex: 1; }
+    .card-list .arr { color: var(--text-faint); transform: translateX(-4px); opacity: 0; transition: all 0.2s; }
+    .card-list a:hover .t { color: var(--accent); }
+    .card-list a:hover .arr { opacity: 1; transform: none; color: var(--accent); }
+
+    .swatches { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .sw { display: flex; gap: 14px; align-items: flex-start; padding: 14px 16px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); }
+    .sw i { flex: none; width: 14px; height: 14px; border-radius: 4px; margin-top: 4px; }
+    .sw b { display: block; font-size: 0.95rem; }
+    .sw span { font-size: 0.84rem; color: var(--text-dim); line-height: 1.45; }
+
+    .features { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .feat { padding: 18px; border-radius: 16px; border: 1px solid var(--border); background: linear-gradient(180deg, var(--surface), transparent); }
+    .feat b { display: block; margin-bottom: 6px; letter-spacing: -0.01em; }
+    .feat span { color: var(--text-dim); font-size: 0.88rem; line-height: 1.55; }
+    .home-foot { margin-top: 64px; padding-top: 22px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 0.82rem; text-align: center; }
+
+    @media (max-width: 900px) {
+      .bento { grid-template-columns: 1fr; }
+      .card, .card.c0, .card.c1, .card.c2, .card.c3, .card.c4, .card.c5 { grid-column: auto; }
+      .swatches { grid-template-columns: 1fr 1fr; }
+      .features { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 560px) {
+      .home { padding: 0 16px 40px; }
+      .hero { padding: 44px 0 24px; }
+      .swatches, .features { grid-template-columns: 1fr; }
+    }
+  </style>
+</Base>

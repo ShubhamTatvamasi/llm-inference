@@ -1,0 +1,87 @@
+---
+/* Why batch at all: decode step time barely grows with batch size until compute
+   or KV memory runs out, so aggregate throughput scales almost for free. */
+---
+<div data-viz="batching-scale"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, select, slider, stats, legend, C, fmt, hatchDefs, uniq } from '../../lib/viz';
+  import { MODELS, GPUS, getModel, getGPU, kvBytesPerToken } from '../../data/hardware';
+
+  const BS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+
+  mountAll('batching-scale', (root) => {
+    let model = getModel('llama3-8b');
+    let gpu = getGPU('h100');
+    let bi = 5, ctx = 2048;
+
+    const bar = ctrlBar(root);
+    select(bar, 'Model', MODELS.filter((m) => m.params < 1e11).map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(bar, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'Batch size', min: 0, max: BS.length - 1, value: bi, format: (i) => String(BS[i]), onInput: (i) => { bi = i; render(); } });
+    slider(bar2, { label: 'Tokens per sequence', min: 512, max: 16384, step: 512, value: ctx, format: (v) => fmt.num(v, 1), onInput: (v) => { ctx = v; render(); } });
+
+    const W = 940, H = 300;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Throughput and per-user speed versus batch size' });
+    const hatch = hatchDefs(svg, uniq('bsh'), C.waste);
+    const g = s('g', {}, svg);
+    const st = stats(root, ['Decode step time', 'Total throughput', 'Per-user speed', 'Bound by']);
+    legend(root, [['Total throughput', C.decode], ['Per-user speed', C.token], ['Batch does not fit in GPU memory', C.waste]]);
+
+    // simple decode cost model (one iteration, one token per sequence)
+    function cost(B: number) {
+      const wBytes = model.params * 2;
+      const kvB = B * ctx * kvBytesPerToken(model, 2);
+      const bw = gpu.bwTBs * 1e12 * 0.8;               // ~80% achievable bandwidth
+      const memT = (wBytes + kvB) / bw;
+      const flops = 2 * model.activeParams * B;           // matmul FLOPs per step
+      const compT = flops / (gpu.bf16TF * 1e12 * 0.6);    // ~60% MFU
+      const t = Math.max(memT, compT);
+      const fits = wBytes + kvB <= gpu.memGB * 1e9 * 0.9;
+      return { t, wT: wBytes / bw, kvT: kvB / bw, compT, fits, memBound: memT >= compT };
+    }
+
+    function render() {
+      clear(g);
+      const panelW = (W - 60) / 2;
+      const charts: { x0: number; title: string; val: (B: number) => number; unit: string; color: string }[] = [
+        { x0: 40, title: 'Total throughput (tokens/s, all users)', val: (B) => B / cost(B).t, unit: 'tok/s', color: C.decode },
+        { x0: 40 + panelW + 20, title: 'Speed each user sees (tokens/s)', val: (B) => 1 / cost(B).t, unit: 'tok/s', color: C.token },
+      ];
+      const PT = 34, PB = H - 40, ph = PB - PT;
+      for (const ch of charts) {
+        const vals = BS.map(ch.val);
+        const vmax = Math.max(...vals) * 1.1;
+        const xs = (i: number) => ch.x0 + (i / (BS.length - 1)) * (panelW - 20);
+        const ys = (v: number) => PB - (v / vmax) * ph;
+        text(g, ch.x0, 14, ch.title, { class: 't-bold t-small' });
+        s('line', { x1: ch.x0, y1: PB, x2: ch.x0 + panelW - 20, y2: PB, stroke: C.borderStrong }, g);
+        s('line', { x1: ch.x0, y1: PT, x2: ch.x0, y2: PB, stroke: C.borderStrong }, g);
+        // infeasible region
+        const firstBad = BS.findIndex((B) => !cost(B).fits);
+        if (firstBad >= 0) {
+          const xb = xs(Math.max(0, firstBad - 0.5));
+          rect(g, xb, PT, ch.x0 + panelW - 20 - xb, ph, hatch, { rx: 0, opacity: 0.6 });
+          text(g, (xb + ch.x0 + panelW - 20) / 2, PT + 12, 'KV doesn’t fit', { 'text-anchor': 'middle', class: 't-small t-bold', fill: C.waste });
+        }
+        let d = '';
+        BS.forEach((B, i) => { d += `${i ? 'L' : 'M'}${xs(i)},${ys(vals[i])}`; });
+        s('path', { d, fill: 'none', stroke: ch.color, 'stroke-width': 2.5, 'stroke-linejoin': 'round' }, g);
+        BS.forEach((B, i) => {
+          s('circle', { cx: xs(i), cy: ys(vals[i]), r: i === bi ? 6 : 3, fill: i === bi ? ch.color : C.surface, stroke: ch.color, 'stroke-width': 2 }, g);
+          text(g, xs(i), PB + 14, String(B), { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+        });
+        text(g, xs(bi), ys(vals[bi]) - 14, fmt.num(vals[bi], 1), { 'text-anchor': 'middle', class: 't-small t-mono t-bold' });
+        text(g, ch.x0 + (panelW - 20) / 2, H - 8, 'batch size (concurrent sequences)', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      }
+
+      const c = cost(BS[bi]);
+      st.set('Decode step time', fmt.ms(c.t * 1000), `weights ${fmt.ms(c.wT * 1000)} + KV ${fmt.ms(c.kvT * 1000)}`);
+      st.set('Total throughput', `${fmt.num(BS[bi] / c.t, 1)} tok/s`, `${BS[bi]} tokens per step`, C.decode);
+      st.set('Per-user speed', `${fmt.num(1 / c.t, 1)} tok/s`, `${fmt.ms(c.t * 1000)} between tokens`, C.token);
+      st.set('Bound by', !c.fits ? 'Out of memory' : c.memBound ? 'Memory bandwidth' : 'Compute', !c.fits ? 'needs more VRAM' : c.memBound ? 'GPU cores mostly idle' : 'tensor cores saturated', !c.fits ? C.waste : c.memBound ? C.kv : C.compute);
+    }
+    render();
+  });
+</script>

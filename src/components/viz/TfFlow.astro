@@ -1,0 +1,94 @@
+---
+/* One decoder layer, op by op, with real tensor shapes for the chosen model and phase. */
+---
+<div data-viz="tf-flow"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, select, segmented, narration, C, fmt, arrowDefs, uniq } from '../../lib/viz';
+  import { MODELS, getModel, type Model } from '../../data/hardware';
+
+  const W = 940, H = 400;
+  type Node = { id: string; label: string; sub: string; color: string; soft: string; shape: (m: Model, n: number) => string; params: (m: Model) => number; say: string };
+
+  const NODES: Node[][] = [
+    [
+      { id: 'in', label: 'x (residual)', sub: 'input', color: C.mem, soft: C.memSoft, shape: (m, n) => `[${n}, ${m.hidden}]`, params: () => 0, say: 'The layer receives the <b>residual stream</b>: one vector of size d_model per token.' },
+      { id: 'n1', label: 'RMSNorm', sub: 'normalise', color: C.mem, soft: C.memSoft, shape: (m, n) => `[${n}, ${m.hidden}]`, params: (m) => m.hidden, say: '<b>RMSNorm</b> rescales each token vector to unit RMS, times a learned gain. It is cheap and elementwise.' },
+      { id: 'qkv', label: 'Q K V proj', sub: 'matmul', color: C.weight, soft: C.weightSoft, shape: (m, n) => `Q[${n},${m.heads * m.headDim}] K,V[${n},${m.kvHeads * m.headDim}]`, params: (m) => m.hidden * (m.heads + 2 * m.kvHeads) * m.headDim, say: 'One big <b>matmul</b> projects every token into queries, keys and values. GQA makes K and V narrower than Q.' },
+      { id: 'rope', label: 'RoPE', sub: 'rotate q, k', color: C.token, soft: C.tokenSoft, shape: (m, n) => `[${n}, ${m.heads}×${m.headDim}]`, params: () => 0, say: '<b>RoPE</b> rotates q and k by each token\'s position. No weights; just sin/cos.' },
+      { id: 'attn', label: 'Attention', sub: 'softmax(QKᵀ)V', color: C.compute, soft: C.computeSoft, shape: (m, n) => `[${n}, ${m.heads * m.headDim}]`, params: () => 0, say: '<b>Attention</b>: new K and V are <b>written</b> to the KV cache, then each query attends over all cached keys and values. The only step that mixes tokens.' },
+      { id: 'o', label: 'O proj', sub: 'matmul', color: C.weight, soft: C.weightSoft, shape: (m, n) => `[${n}, ${m.hidden}]`, params: (m) => m.heads * m.headDim * m.hidden, say: 'The <b>output projection</b> mixes the heads back into d_model.' },
+      { id: 'r1', label: '⊕', sub: 'residual add', color: C.mem, soft: C.memSoft, shape: (m, n) => `[${n}, ${m.hidden}]`, params: () => 0, say: 'The attention result is <b>added</b> to the residual stream (x + attn(x)), so each sub-block only learns a correction.' },
+    ],
+    [
+      { id: 'n2', label: 'RMSNorm', sub: 'normalise', color: C.mem, soft: C.memSoft, shape: (m, n) => `[${n}, ${m.hidden}]`, params: (m) => m.hidden, say: 'A second <b>RMSNorm</b> before the MLP.' },
+      { id: 'gu', label: 'Gate & Up', sub: 'matmul ×2', color: C.weight, soft: C.weightSoft, shape: (m, n) => `2 × [${n}, ${m.ffn}]`, params: (m) => 2 * m.hidden * m.ffn * (m.experts?.total ?? 1), say: 'The MLP expands each token to the wide <b>FFN dimension</b> with two projections (gate and up). In MoE models a <b>router</b> first picks a few experts per token.' },
+      { id: 'act', label: 'SiLU ⊙', sub: 'SwiGLU', color: C.compute, soft: C.computeSoft, shape: (m, n) => `[${n}, ${m.ffn}]`, params: () => 0, say: '<b>SwiGLU</b>: SiLU(gate) × up, elementwise. This nonlinearity is where much of the model\'s "knowledge lookup" happens.' },
+      { id: 'down', label: 'Down proj', sub: 'matmul', color: C.weight, soft: C.weightSoft, shape: (m, n) => `[${n}, ${m.hidden}]`, params: (m) => m.ffn * m.hidden * (m.experts?.total ?? 1), say: 'The <b>down projection</b> brings each token back to d_model. Together, the MLP holds about two thirds of a dense model\'s weights.' },
+      { id: 'r2', label: '⊕', sub: 'residual add', color: C.mem, soft: C.memSoft, shape: (m, n) => `[${n}, ${m.hidden}]`, params: () => 0, say: 'Added to the residual stream again.' },
+      { id: 'out', label: 'next layer', sub: '× L layers', color: C.mem, soft: C.memSoft, shape: (m, n) => `[${n}, ${m.hidden}]`, params: () => 0, say: 'The same block repeats <b>L times</b> with different weights. After the last layer: a final norm, then the <b>LM head</b> produces logits over the vocabulary.' },
+    ],
+  ];
+  const FLAT = NODES.flat();
+
+  mountAll('tf-flow', (root) => {
+    let model = getModel('llama3-8b');
+    let phase: 'prefill' | 'decode' = 'prefill';
+    let idx = -1;
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Data flow through one transformer decoder layer' });
+    const aid = uniq('tfa');
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      const arrow = arrowDefs(svg, aid, C.faint);
+      const n = phase === 'prefill' ? 512 : 1;
+      const BW = 112, BH = 52, GAP = 16;
+      const rows = [{ y: 80, nodes: NODES[0] }, { y: 262, nodes: NODES[1] }];
+      text(svg, 20, 22, phase === 'prefill' ? `Prefill: all ${n} prompt tokens flow through together` : 'Decode: one new token flows through, reading the KV cache', { class: 't-bold', style: `fill:${phase === 'prefill' ? C.prefill : C.decode}` });
+      text(svg, 20, 44, 'attention block', { class: 't-small t-faint t-bold' });
+      text(svg, 20, 226, 'MLP block', { class: 't-small t-faint t-bold' });
+      rows.forEach((row, ri) => {
+        const total = row.nodes.length * BW + (row.nodes.length - 1) * GAP;
+        const x0 = (W - total) / 2;
+        // residual skip
+        const xs = x0 + BW / 2, xe = x0 + (row.nodes.length - (ri === 0 ? 1 : 2)) * (BW + GAP) + BW / 2;
+        s('path', { d: `M${xs},${row.y} L${xs},${row.y - 18} L${xe},${row.y - 18} L${xe},${row.y}`, fill: 'none', stroke: C.mem, 'stroke-width': 2, 'stroke-dasharray': '5 4', 'marker-end': arrow }, svg);
+        text(svg, (xs + xe) / 2, row.y - 26, 'residual connection', { 'text-anchor': 'middle', class: 't-small t-faint' });
+        row.nodes.forEach((nd, i) => {
+          const x = x0 + i * (BW + GAP);
+          const flatI = FLAT.indexOf(nd);
+          const on = flatI === idx; const done = flatI < idx;
+          if (i > 0) s('line', { x1: x - GAP + 1, y1: row.y + BH / 2, x2: x - 3, y2: row.y + BH / 2, stroke: C.faint, 'stroke-width': 1.5, 'marker-end': arrow }, svg);
+          const g = s('g', {}, svg);
+          rect(g, x, row.y, BW, BH, on ? nd.color : nd.soft, { rx: 10, stroke: nd.color, 'stroke-width': on ? 2 : 1, opacity: done || on || idx < 0 ? 1 : 0.55 });
+          text(g, x + BW / 2, row.y + 20, nd.label, { 'text-anchor': 'middle', class: 't-bold', 'font-size': 12.5, style: on ? 'fill:var(--bg)' : '' });
+          text(g, x + BW / 2, row.y + 37, nd.sub, { 'text-anchor': 'middle', class: 't-small', style: on ? 'fill:var(--bg)' : 'fill:var(--text-dim)' });
+          if (on) {
+            text(svg, x + BW / 2, row.y + BH + 18, nd.shape(model, n), { 'text-anchor': 'middle', class: 't-mono t-small t-bold', style: `fill:${nd.color}` });
+          }
+          if (nd.id === 'attn') {
+            const ky = row.y + BH + 34;
+            rect(svg, x - 6, ky, BW + 12, 34, on ? C.kv : C.kvSoft, { rx: 8, stroke: C.kv });
+            text(svg, x + BW / 2, ky + 17, phase === 'prefill' ? 'KV cache: write n' : 'KV cache: read all, +1', { 'text-anchor': 'middle', class: 't-small t-bold', style: on ? 'fill:var(--bg)' : `fill:${C.kv}` });
+            s('line', { x1: x + BW / 2, y1: row.y + BH, x2: x + BW / 2, y2: ky, stroke: C.kv, 'stroke-width': 2, 'stroke-dasharray': '3 3' }, svg);
+          }
+        });
+      });
+      // connector from row 1 end to row 2 start
+      text(svg, W - 24, 182, '↓', { 'text-anchor': 'end', class: 't-faint', 'font-size': 18 });
+
+      if (idx < 0) say(`One decoder layer of <b>${model.name}</b>. Press <b>Play</b> to follow a ${phase === 'prefill' ? 'prompt' : 'single new token'} through it. Rose boxes hold weights; everything else is elementwise or attention.`);
+      else {
+        const nd = FLAT[idx];
+        const p = nd.params(model);
+        say(`${nd.say}${p > 0 ? ` <span style="color:var(--text-dim)">· ${fmt.num(p, 1)} params in this layer${model.experts && (nd.id === 'gu' || nd.id === 'down') ? ` (${model.experts.total} experts, ${model.experts.active} used per token)` : ''}</span>` : ''}`);
+      }
+    }
+
+    player(bar, root, { step: () => { idx++; return idx < FLAT.length - 1; }, reset: () => { idx = -1; }, render, interval: 1500, autoplay: true });
+    segmented(bar, [{ value: 'prefill', label: 'Prefill (512 tokens)' }, { value: 'decode', label: 'Decode (1 token)' }], phase, (v) => { phase = v as typeof phase; render(); });
+    select(bar, 'Model', MODELS.filter((m) => m.attn !== 'MLA').map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+  });
+</script>
