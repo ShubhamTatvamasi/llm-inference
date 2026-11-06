@@ -22,6 +22,8 @@ const partIcons: Record<string, string> = {
   faster: '<path d="M13 3 5 14h6l-1 7 8-11h-6z"/>',
   scale: '<rect x="3" y="4" width="7" height="7" rx="1.5"/><rect x="14" y="4" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   prod: '<path d="M3 20h18M6 16V9M11 16V5M16 16v-6M21 16v-3"/>',
+  beyond: '<path d="M4 5h16v11H9l-5 4z"/><path d="M12 8v5M9.5 10.5h5"/>',
+  k8s: '<path d="M12 2.5 20.5 7v10L12 21.5 3.5 17V7z"/><circle cx="12" cy="12" r="2.6"/><path d="M12 5.5v3.9M12 14.6v3.9M6.4 8.8l3.3 1.9M14.3 13.3l3.3 1.9M6.4 15.2l3.3-1.9M14.3 10.7l3.3-1.9"/>',
 };
 ---
 <Base>
@@ -146,13 +148,10 @@ const partIcons: Record<string, string> = {
     .hero { margin-top: 0; }
 
     .bento { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; }
-    .card { --mx: 50%; --my: 0%; position: relative; grid-column: span 2; padding: 22px 22px 14px; border: 1px solid var(--border); border-radius: 20px; background: var(--surface); overflow: hidden; isolation: isolate; transition: border-color 0.25s, transform 0.25s; }
+    .card { --mx: 50%; --my: 0%; position: relative; grid-column: span 3; /* two parts per row */ padding: 22px 22px 14px; border: 1px solid var(--border); border-radius: 20px; background: var(--surface); overflow: hidden; isolation: isolate; transition: border-color 0.25s, transform 0.25s; }
     .card::before { content: ''; position: absolute; inset: 0; z-index: -1; background: radial-gradient(420px circle at var(--mx) var(--my), var(--accent-soft), transparent 60%); opacity: 0; transition: opacity 0.3s; }
     .card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
     .card:hover::before { opacity: 1; }
-    .card.c0, .card.c1 { grid-column: span 3; }
-    .card.c2 { grid-column: span 3; } .card.c3 { grid-column: span 3; }
-    .card.c4, .card.c5 { grid-column: span 3; }
     .card-top { display: flex; align-items: center; justify-content: space-between; }
     .card-ic { width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center; color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); }
     .card-ic svg { width: 20px; height: 20px; }
@@ -182,7 +181,7 @@ const partIcons: Record<string, string> = {
 
     @media (max-width: 900px) {
       .bento { grid-template-columns: 1fr; }
-      .card, .card.c0, .card.c1, .card.c2, .card.c3, .card.c4, .card.c5 { grid-column: auto; }
+      .card { grid-column: auto; }
       .swatches { grid-template-columns: 1fr 1fr; }
       .features { grid-template-columns: 1fr 1fr; }
     }
