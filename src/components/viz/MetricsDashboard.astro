@@ -73,7 +73,7 @@
           h('span', { class: 'mdash-t', text: p.title }, top);
           const last = vals[vals.length - 1];
           h('span', { class: 'mdash-v', text: `${p.unit === 's' ? last.toFixed(2) : p.unit === '%' ? last.toFixed(0) : Math.round(last)}${p.unit === 's' ? ' s' : p.unit === 'ms' ? ' ms' : p.unit === '%' ? '%' : p.unit === 'k' ? 'k' : ''}` }, top);
-          const svg = svgRoot(card, 200, 44, { preserveAspectRatio: 'none', class: 'mdash-spark' });
+          const svg = svgRoot(card, 200, 44, { preserveAspectRatio: 'none', class: 'mdash-spark', role: 'presentation', 'aria-hidden': 'true' });
           const max = p.max;
           const pts = vals.map((v, i) => `${(i / (N - 1)) * 200},${42 - Math.min(1, v / max) * 38}`).join(' ');
           const col2 = alarm ? C.waste : p.color;
