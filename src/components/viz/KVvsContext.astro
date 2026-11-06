@@ -1,0 +1,84 @@
+---
+/* Decode step time vs context length: the weight read is flat, the KV read grows linearly,
+   and past a crossover the KV cache, not the weights, sets decode speed.
+   Same first-order model as the Inference Lab (src/components/lab/labModel.ts). */
+---
+<div data-viz="kv-vs-context"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, select, slider, segmented, stats, legend, narration, C, fmt } from '../../lib/viz';
+  import { GPUS, MODELS, getGPU, getModel, kvBytesPerToken } from '../../data/hardware';
+  import { touchedWeightBytes, BW_EFF } from '../lab/labModel';
+
+  const W = 940, H = 340, X0 = 70, X1 = 910, Y0 = 290, Y1 = 24;
+  const BS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+
+  mountAll('kv-vs-context', (root) => {
+    let model = getModel('llama3-8b'), gpu = getGPU('h100'), bi = 0, kvB = 2, wB = 2;
+    const bar = ctrlBar(root);
+    select(bar, 'Model', MODELS.filter((m) => m.maxCtx >= 32768).map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(bar, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    slider(bar, { label: 'Batch', min: 0, max: BS.length - 1, value: bi, format: (i) => String(BS[i]), onInput: (i) => { bi = i; render(); } });
+    segmented(bar, [{ value: '2', label: 'KV BF16' }, { value: '1', label: 'KV FP8' }], '2', (v) => { kvB = Number(v); render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Decode step time against context length, split into weight reads and KV-cache reads' });
+    legend(root, [['weight read (same at any length)', C.weight], ['KV-cache read (grows with context)', C.kv]]);
+    const st = stats(root, ['KV overtakes weights at', 'Step at 4K context', 'Step at max context', 'Per-user speed at max']);
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      const B = BS[bi];
+      const bw = gpu.bwTBs * 1e12 * BW_EFF;
+      // weights may not fit on one GPU; the curve is still per-GPU-bandwidth intuition, so shard notionally
+      const shards = Math.max(1, Math.ceil((model.params * wB) / (gpu.memGB * 1e9 * 0.75)));
+      const wBytes = touchedWeightBytes(model, wB, B) / shards;
+      const kvTok = kvBytesPerToken(model, kvB) / shards;
+      const maxCtx = model.maxCtx;
+      const tW = wBytes / bw;
+      const tKV = (ctx: number) => (B * ctx * kvTok) / bw;
+      const tMax = tW + tKV(maxCtx);
+      const xp = (c: number) => X0 + (c / maxCtx) * (X1 - X0);
+      const yp = (t: number) => Y0 - (t / (tMax * 1.08)) * (Y0 - Y1);
+
+      // grid + axes
+      for (let i = 0; i <= 4; i++) {
+        const c = (maxCtx * i) / 4, t = (tMax * 1.08 * i) / 4;
+        line(svg, xp(c), Y0, xp(c), Y1, C.border, { 'stroke-width': 1 });
+        text(svg, xp(c), Y0 + 14, fmt.num(c, 0), { 'text-anchor': i === 4 ? 'end' : 'middle', class: 't-faint t-small t-mono' });
+        line(svg, X0, yp(t), X1, yp(t), C.border, { 'stroke-width': 1 });
+        text(svg, X0 - 8, yp(t), fmt.ms(t * 1000), { 'text-anchor': 'end', class: 't-faint t-small t-mono' });
+      }
+      text(svg, (X0 + X1) / 2, Y0 + 36, 'context length per sequence (tokens)', { 'text-anchor': 'middle', class: 't-dim t-small' });
+      text(svg, 14, (Y0 + Y1) / 2, 'decode step time', { 'text-anchor': 'middle', class: 't-dim t-small', transform: `rotate(-90 14 ${(Y0 + Y1) / 2})` });
+
+      // stacked areas: weights (flat band) then KV (wedge on top)
+      s('path', { d: `M${xp(0)},${yp(0)} L${xp(maxCtx)},${yp(0)} L${xp(maxCtx)},${yp(tW)} L${xp(0)},${yp(tW)} Z`, fill: C.weightSoft, stroke: 'none' }, svg);
+      line(svg, xp(0), yp(tW), xp(maxCtx), yp(tW), C.weight, { 'stroke-width': 2 });
+      s('path', { d: `M${xp(0)},${yp(tW)} L${xp(maxCtx)},${yp(tW + tKV(maxCtx))} L${xp(maxCtx)},${yp(tW)} Z`, fill: C.kvSoft, stroke: 'none' }, svg);
+      line(svg, xp(0), yp(tW), xp(maxCtx), yp(tW + tKV(maxCtx)), C.kv, { 'stroke-width': 2.4 });
+      text(svg, xp(maxCtx * 0.02), yp(tW / 2), `weights: ${fmt.bytes(wBytes)} read every step`, { class: 't-small t-bold', style: `fill:${C.weight}` });
+
+      // crossover: B·ctx·kvTok = weight bytes
+      const cross = wBytes / (B * kvTok);
+      if (cross < maxCtx) {
+        const cx = xp(cross), cy = yp(2 * tW);
+        line(svg, cx, Y0, cx, cy, C.text, { 'stroke-dasharray': '4 4', 'stroke-width': 1.2 });
+        s('circle', { cx, cy, r: 6, fill: C.kv, stroke: 'var(--bg)', 'stroke-width': 2 }, svg);
+        text(svg, cx + (cx > 700 ? -10 : 10), cy - 14, `KV read = weight read at ${fmt.num(cross, 0)} tokens`, { class: 't-small t-bold', 'text-anchor': cx > 700 ? 'end' : 'start' });
+        text(svg, cx + (cx > 700 ? -10 : 10), cy + 2, '→ beyond here, context sets decode speed', { class: 't-small t-dim', 'text-anchor': cx > 700 ? 'end' : 'start' });
+      } else {
+        text(svg, X1 - 6, yp(tW) - 12, 'KV never catches up within the context window', { 'text-anchor': 'end', class: 't-small t-dim' });
+      }
+
+      st.set('KV overtakes weights at', cross < maxCtx ? `${fmt.num(cross, 0)} tok` : 'never', `batch ${B}, ${kvB === 1 ? 'FP8' : 'BF16'} KV`, C.kv);
+      st.set('Step at 4K context', fmt.ms((tW + tKV(4096)) * 1000), `${fmt.pct(tKV(4096) / (tW + tKV(4096)))} of it KV`);
+      st.set('Step at max context', fmt.ms(tMax * 1000), `${fmt.num(maxCtx, 0)} tokens, ${fmt.pct(tKV(maxCtx) / tMax)} KV`);
+      st.set('Per-user speed at max', `${(1 / tMax).toFixed(0)} tok/s`, `vs ${(1 / (tW + tKV(1024))).toFixed(0)} at 1K`, 1 / tMax < 20 ? C.waste : undefined);
+      const shardNote = shards > 1 ? ` (Weights split over ${shards} GPUs so they fit; the shape does not change.)` : '';
+      say(cross < maxCtx
+        ? `With ${B} sequence${B > 1 ? 's' : ''} in the batch, the KV cache costs as much bandwidth as the whole model once each sequence reaches <b>${fmt.num(cross, 0)} tokens</b>. Raising the batch moves this point <b>left</b>: more sequences means more cache to read every step. ${model.attn === 'MLA' ? 'MLA keeps the line shallow.' : model.attn === 'MHA' ? 'MHA caches every head, so the line is steep.' : 'GQA already shares K/V heads; FP8 KV halves the slope again.'}${shardNote}`
+        : `At batch ${B} this model's KV cache stays cheaper to read than its weights all the way to ${fmt.num(maxCtx, 0)} tokens. Raise the batch to see the crossover appear.${shardNote}`);
+    }
+    render();
+  });
+</script>

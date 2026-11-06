@@ -9,6 +9,7 @@ import Interview from '../components/Interview.astro';
 import Q from '../components/Q.astro';
 import KVGrowth from '../components/viz/KVGrowth.astro';
 import KVCalculator from '../components/viz/KVCalculator.astro';
+import KVvsContext from '../components/viz/KVvsContext.astro';
 
 Every token the model generates has to **attend** to every token that came before it. To do that, each layer needs a **key** vector and a **value** vector for every earlier token. Those vectors depend only on the earlier tokens, so once one is computed it never changes. The **KV cache** saves them so they are never recomputed.
 
@@ -66,6 +67,17 @@ Try it yourself. Push the context to 32K, raise the concurrency, and watch the c
 <Callout type="warn" title="The KV cache, not the weights, caps concurrency">
 Weights are paid for once and shared by every request. KV cache is paid **per request, per token**. In production, the number of users a replica can serve at once is almost always limited by KV capacity.
 </Callout>
+
+## When the cache, not the model, sets decode speed
+
+Every decode step reads all the weights once, whatever the context. It also reads every cached K and V of every sequence in the batch, and that part grows with context length. At some point the second read becomes larger than the first:
+
+<Viz title="Decode step time vs context length" label="Interactive">
+  <KVvsContext />
+  <Fragment slot="caption">
+    <p>Step time ≈ (weight bytes + batch × context × KV bytes per token) ÷ bandwidth. The rose band is fixed; the green wedge grows with context. Raise the batch and the crossover moves left; switch to FP8 KV or to DeepSeek-V3 (MLA) and it moves right. Explore every knob together in the <a href="../lab/">Inference Lab</a>.</p>
+  </Fragment>
+</Viz>
 
 ## Shrinking the cache
 

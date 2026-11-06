@@ -127,7 +127,7 @@ aiperf profile --model meta-llama/Llama-3.1-8B-Instruct --url http://llama-8b.se
   --synthetic-input-tokens-mean 1024 --output-tokens-mean 256
 
 # SGLang's benchmark, against an SGLang server
-python -m sglang.benchmark.serving --backend sglang --host 127.0.0.1 --port 30000 \
+python -m sglang.bench_serving --backend sglang --host 127.0.0.1 --port 30000 \
   --dataset-name random --random-input-len 1024 --random-output-len 256 \
   --num-prompts 1000 --request-rate 8
 ```

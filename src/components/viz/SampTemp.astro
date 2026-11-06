@@ -1,0 +1,78 @@
+---
+/* Temperature as a continuous dial: every candidate's probability as T sweeps from 0 to 2.
+   Drag on the chart (or use the slider) to set T. */
+---
+<div data-viz="samp-temp"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, slider, stats, narration, C, SERIES } from '../../lib/viz';
+
+  const TOK = ['blue', 'clear', 'grey', 'falling', 'purple', 'banana'];
+  const LOGIT = [4.1, 2.9, 2.4, 0.8, 0.2, -1.5];
+  const W = 940, H = 330, X0 = 60, X1 = 600, Y0 = 290, Y1 = 20, TMIN = 0.05, TMAX = 2;
+  const probs = (T: number) => { const m = Math.max(...LOGIT); const e = LOGIT.map((z) => Math.exp((z - m) / T)); const Z = e.reduce((a, b) => a + b, 0); return e.map((x) => x / Z); };
+
+  mountAll('samp-temp', (root) => {
+    let T = 1;
+    const bar = ctrlBar(root);
+    const sl = slider(bar, { label: 'Temperature T', min: TMIN, max: TMAX, step: 0.01, value: T, format: (v) => v.toFixed(2), onInput: (v) => { T = v; render(); } });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Probability of each candidate token as temperature varies' });
+    const st = stats(root, ['P(top token)', 'Entropy', 'Effective choices']);
+    const say = narration(root);
+    const xp = (t: number) => X0 + ((t - TMIN) / (TMAX - TMIN)) * (X1 - X0);
+    const yp = (p: number) => Y0 - p * (Y0 - Y1);
+    const tOf = (clientX: number) => {
+      const r = svg.getBoundingClientRect(); const x = ((clientX - r.left) / r.width) * W;
+      return Math.max(TMIN, Math.min(TMAX, TMIN + ((x - X0) / (X1 - X0)) * (TMAX - TMIN)));
+    };
+    let dragging = false;
+    svg.addEventListener('pointerdown', (e) => { dragging = true; svg.setPointerCapture(e.pointerId); T = tOf(e.clientX); sl.set(T, false); render(); });
+    svg.addEventListener('pointermove', (e) => { if (!dragging) return; T = tOf(e.clientX); sl.set(T, false); render(); });
+    svg.addEventListener('pointerup', () => { dragging = false; });
+    svg.style.touchAction = 'pan-y'; svg.style.cursor = 'ew-resize';
+
+    // precompute curves
+    const ts = Array.from({ length: 160 }, (_, i) => TMIN + (i / 159) * (TMAX - TMIN));
+    const curves = ts.map(probs);
+
+    function render() {
+      clear(svg);
+      for (let i = 0; i <= 4; i++) {
+        const p = i / 4; line(svg, X0, yp(p), X1, yp(p), C.border, { 'stroke-width': 1 });
+        text(svg, X0 - 8, yp(p), `${i * 25}%`, { 'text-anchor': 'end', class: 't-faint t-small t-mono' });
+      }
+      for (const t of [0.05, 0.5, 1, 1.5, 2]) text(svg, xp(t), Y0 + 14, t === 0.05 ? '→0' : t.toFixed(1), { 'text-anchor': 'middle', class: 't-faint t-small t-mono' });
+      text(svg, (X0 + X1) / 2, Y0 + 34, 'temperature T  (drag on the chart)', { 'text-anchor': 'middle', class: 't-dim t-small' });
+      line(svg, xp(1), Y1, xp(1), Y0, C.faint, { 'stroke-dasharray': '2 4', 'stroke-width': 1 });
+      text(svg, xp(1) + 4, Y1 + 8, 'T = 1: the model as trained', { class: 't-faint t-small' });
+      // uniform line
+      line(svg, X0, yp(1 / TOK.length), X1, yp(1 / TOK.length), C.faint, { 'stroke-dasharray': '6 4', 'stroke-width': 1 });
+      text(svg, X1 - 4, yp(1 / TOK.length) - 8, `uniform = ${(100 / TOK.length).toFixed(0)}%`, { 'text-anchor': 'end', class: 't-faint t-small' });
+      TOK.forEach((_, k) => s('polyline', { points: ts.map((t, i) => `${xp(t)},${yp(curves[i][k])}`).join(' '), fill: 'none', stroke: SERIES[k], 'stroke-width': k === 0 ? 2.6 : 1.8 }, svg));
+      // current T
+      const p = probs(T);
+      line(svg, xp(T), Y1, xp(T), Y0, C.text, { 'stroke-width': 1.5 });
+      p.forEach((v, k) => s('circle', { cx: xp(T), cy: yp(v), r: 4.5, fill: SERIES[k], stroke: 'var(--bg)', 'stroke-width': 1.5 }, svg));
+      // bars at current T
+      const BX = 660, BW = 230;
+      text(svg, BX, Y1 + 4, `At T = ${T.toFixed(2)}, after “The sky is …”`, { class: 't-small t-bold' });
+      TOK.forEach((tk, k) => {
+        const y = Y1 + 26 + k * 40;
+        text(svg, BX, y + 9, tk, { class: 't-small t-bold', style: `fill:${SERIES[k]}` });
+        text(svg, BX + 70, y + 9, `z=${LOGIT[k].toFixed(1)}`, { class: 't-small t-faint t-mono' });
+        rect(svg, BX, y + 18, BW, 12, C.surface2, { rx: 3 });
+        rect(svg, BX, y + 18, BW * p[k], 12, SERIES[k], { rx: 3 });
+        text(svg, BX + BW + 6, y + 24, `${(p[k] * 100).toFixed(p[k] < 0.01 ? 2 : 1)}%`, { class: 't-small t-mono' });
+      });
+      const Hbits = -p.reduce((a, v) => a + (v > 0 ? v * Math.log2(v) : 0), 0);
+      st.set('P(top token)', `${(p[0] * 100).toFixed(1)}%`, '“blue”', SERIES[0]);
+      st.set('Entropy', `${Hbits.toFixed(2)} bits`, `max ${Math.log2(TOK.length).toFixed(2)} for ${TOK.length} tokens`);
+      st.set('Effective choices', (2 ** Hbits).toFixed(2), '2^entropy');
+      say(T < 0.25 ? 'Near <b>T → 0</b> the top logit wins almost every time: this is <b>greedy</b> decoding. Dividing by a tiny T stretches the gaps between logits until softmax becomes an argmax.'
+        : T < 0.9 ? 'Below 1 the distribution is <b>sharpened</b>: likely tokens gain, unlikely ones fade, but nothing hits exactly zero. That is why truncation (top-k, top-p, min-p) is still needed.'
+        : T <= 1.1 ? 'At <b>T = 1</b> you sample the model’s own distribution. “banana” still has a real chance, and across a 128K vocabulary those tails add up.'
+        : 'Above 1 the curves <b>converge toward uniform</b>: nonsense like “banana” gains probability fast. High temperature without min-p or top-p is how outputs go off the rails.');
+    }
+    render();
+  });
+</script>

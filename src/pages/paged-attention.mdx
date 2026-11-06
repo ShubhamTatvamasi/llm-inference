@@ -10,6 +10,7 @@ import Q from '../components/Q.astro';
 import PagedAlloc from '../components/viz/PagedAlloc.astro';
 import PagedCoW from '../components/viz/PagedCoW.astro';
 import PagedBlockSize from '../components/viz/PagedBlockSize.astro';
+import PagedGather from '../components/viz/PagedGather.astro';
 
 [Continuous batching](../batching/) creates a memory problem. Every sequence's [KV cache](../kv-cache/) grows by one token per step, sequences start and stop at arbitrary moments, and **nobody knows in advance how long an answer will be**.
 
@@ -57,6 +58,13 @@ For each query token, the kernel walks its sequence's block table, gathers each 
 $$
 \text{physical\_block} = \text{block\_table}[\,\lfloor t / B \rfloor\,], \qquad \text{slot} = t \bmod B
 $$
+
+<Viz title="One query gathering its scattered KV cache" label="Live">
+  <PagedGather />
+  <Fragment slot="caption">
+    <p>Block size 4, a 22-token sequence spread over physical blocks 7, 2, 11, 5, 9 and 0. Grey blocks belong to other requests and dashed ones are free. Each new block costs one table lookup; tokens inside a block are contiguous, so the reads stay coalesced.</p>
+  </Fragment>
+</Viz>
 
 ## Sharing and copy-on-write
 

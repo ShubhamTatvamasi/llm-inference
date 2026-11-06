@@ -45,7 +45,7 @@
       const out = think + ans;
       const wB = model.params * 1; // FP8 weights
       const kvTok = kvBytesPerToken(model, 2);
-      const usable = gpu.memGB * 1e9 * 0.92;
+      const usable = gpu.memGB * 1e9 * 0.9;
       const pool = usable - wB - 4e9;
       const fits = pool > 0;
       const prefillS = (2 * model.params * prompt) / ((gpu.fp8TF ?? gpu.bf16TF) * 1e12 * 0.4) + 0.02;

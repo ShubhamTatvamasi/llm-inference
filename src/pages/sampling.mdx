@@ -9,6 +9,7 @@ import Interview from '../components/Interview.astro';
 import Q from '../components/Q.astro';
 import SampLogits from '../components/viz/SampLogits.astro';
 import SampLoop from '../components/viz/SampLoop.astro';
+import SampTemp from '../components/viz/SampTemp.astro';
 
 The [last layer](../transformer/) hands the LM head one vector, and the LM head returns a **logit**, an unnormalised score, for **every** token in the vocabulary: about 128K numbers for Llama 3. Generation means choosing **one** of them, and doing that again for every output token.
 
@@ -23,6 +24,13 @@ $$
 - $T \to 0$: all mass goes to the largest logit. This is **greedy** decoding.
 - $T = 1$: the model's own distribution.
 - $T > 1$: flatter, so rare tokens get more chances, with more creativity and more mistakes.
+
+<Viz title="Temperature as a dial" label="Interactive">
+  <SampTemp />
+  <Fragment slot="caption">
+    <p>Six candidate next tokens with fixed logits. Each curve is one token's probability as T changes; drag across the chart to move T. Toward the left everything collapses onto “blue” (greedy); toward the right the curves bunch together toward uniform.</p>
+  </Fragment>
+</Viz>
 
 Temperature alone still lets every token have some probability, and among 128K candidates the long tail of nonsense adds up. **Truncation** filters cut that tail before sampling.
 

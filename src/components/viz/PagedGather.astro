@@ -1,0 +1,87 @@
+---
+/* A paged-attention kernel serving one query: walk the logical tokens, look up block_table[⌊t/B⌋],
+   read slot t mod B of a scattered physical block. Other sequences own the grey blocks. */
+---
+<div data-viz="paged-gather"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, narration, legend, C, arrowDefs } from '../../lib/viz';
+
+  const B = 4, N = 22;                         // block size, sequence length
+  const TABLE = [7, 2, 11, 5, 9, 0];           // logical block → physical block
+  const OTHERS = new Set([1, 3, 4, 8]);        // owned by other sequences; 6 and 10 are free
+  const W = 940, H = 380, PB = 12;
+
+  mountAll('paged-gather', (root) => {
+    let t = -1;
+    const bar = ctrlBar(root);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'A query reading its KV cache through a block table' });
+    const arrow = arrowDefs(svg, 'pg-arr', C.accent);
+    legend(root, [['this sequence’s KV', C.kv], ['being read now', C.decode], ['other sequences', C.mem], ['free block', C.surface2]]);
+    const say = narration(root);
+
+    function render() {
+      clear(svg); arrowDefs(svg, 'pg-arr', C.accent);
+      const lb = t >= 0 ? Math.floor(t / B) : -1, slot = t >= 0 ? t % B : -1;
+      // 1. logical view
+      text(svg, 20, 24, 'Logical view: the sequence as the model sees it', { class: 't-small t-bold' });
+      const TW = 34, TX = 20, TY = 38;
+      for (let i = 0; i < N; i++) {
+        const x = TX + i * (TW + 4) + Math.floor(i / B) * 8;
+        const fill = i === t ? C.decode : i < t ? C.kv : C.kvSoft;
+        rect(svg, x, TY, TW, 26, fill, { rx: 4 });
+        text(svg, x + TW / 2, TY + 13, String(i), { 'text-anchor': 'middle', class: 't-small t-mono', style: i <= t ? 'fill:var(--bg)' : '' });
+      }
+      for (let b = 0; b < TABLE.length; b++) {
+        const x = TX + b * B * (TW + 4) + b * 8; // matches the token x formula at i = b·B
+        text(svg, x, TY + 42, `logical block ${b}`, { class: 't-faint t-small', style: b === lb ? `fill:${C.decode}` : '' });
+      }
+      // 2. block table
+      const BTX = 20, BTY = 140;
+      text(svg, BTX, BTY - 12, 'block_table (one small int array per sequence)', { class: 't-small t-bold' });
+      TABLE.forEach((pb, i) => {
+        const x = BTX + i * 62;
+        rect(svg, x, BTY, 56, 40, i === lb ? C.accentSoft : C.surface2, { rx: 6, stroke: i === lb ? C.accent : C.border, 'stroke-width': i === lb ? 2 : 1 });
+        text(svg, x + 28, BTY + 13, `[${i}]`, { 'text-anchor': 'middle', class: 't-faint t-small t-mono' });
+        text(svg, x + 28, BTY + 29, `→ ${pb}`, { 'text-anchor': 'middle', class: 't-mono t-bold', 'font-size': 13 });
+      });
+      // 3. physical pool
+      const PX = 430, PY = 128, CW = 112, CH = 52;
+      text(svg, PX, PY - 12, 'Physical KV pool on the GPU (12 blocks × 4 slots)', { class: 't-small t-bold' });
+      const owner = new Map(TABLE.map((p, l) => [p, l]));
+      for (let p = 0; p < PB; p++) {
+        const x = PX + (p % 4) * (CW + 8), y = PY + Math.floor(p / 4) * (CH + 22);
+        const mine = owner.has(p);
+        rect(svg, x, y, CW, CH, mine ? C.surface2 : OTHERS.has(p) ? C.memSoft : C.surface2, { rx: 6, stroke: owner.get(p) === lb ? C.accent : C.border, 'stroke-width': owner.get(p) === lb ? 2 : 1, 'stroke-dasharray': !mine && !OTHERS.has(p) ? '3 3' : '' });
+        text(svg, x + 6, y + 11, `block ${p}${mine ? ` · logical ${owner.get(p)}` : OTHERS.has(p) ? ' · other seq' : ' · free'}`, { class: 't-faint', 'font-size': 9.5 });
+        for (let k = 0; k < B; k++) {
+          const sx = x + 6 + k * 25, sy = y + 20;
+          let fill: string = C.surface3;
+          if (mine) { const tok = owner.get(p)! * B + k; fill = tok >= N ? C.surface3 : tok === t ? C.decode : tok < t ? C.kv : C.kvSoft; }
+          else if (OTHERS.has(p)) fill = C.mem;
+          rect(svg, sx, sy, 21, 24, fill, { rx: 3, opacity: OTHERS.has(p) ? 0.45 : 1 });
+          if (mine && owner.get(p)! * B + k < N) text(svg, sx + 10.5, sy + 12, String(owner.get(p)! * B + k), { 'text-anchor': 'middle', 'font-size': 9.5, class: 't-mono', style: owner.get(p)! * B + k <= t ? 'fill:var(--bg)' : '' });
+        }
+      }
+      // arrows: token → table entry → physical slot
+      if (t >= 0) {
+        const tx = TX + t * (TW + 4) + Math.floor(t / B) * 8 + TW / 2;
+        const ex = BTX + lb * 62 + 28;
+        s('path', { d: `M${tx},${TY + 28} C${tx},${BTY - 30} ${ex},${BTY - 50} ${ex},${BTY - 2}`, fill: 'none', stroke: C.accent, 'stroke-width': 1.8, 'marker-end': arrow }, svg);
+        const p = TABLE[lb];
+        const px = PX + (p % 4) * (CW + 8) + 6 + slot * 25 + 10.5, py = PY + Math.floor(p / 4) * (CH + 22) + 20;
+        s('path', { d: `M${ex + 28},${BTY + 20} C${ex + 120},${BTY + 20} ${px},${py - 40} ${px},${py - 2}`, fill: 'none', stroke: C.accent, 'stroke-width': 1.8, 'marker-end': arrow }, svg);
+        text(svg, 20, 230, `t = ${t}`, { class: 't-mono t-bold', 'font-size': 14 });
+        text(svg, 20, 252, `block_table[⌊${t}/${B}⌋] = block_table[${lb}] = ${p}`, { class: 't-mono t-small' });
+        text(svg, 20, 270, `slot = ${t} mod ${B} = ${slot}`, { class: 't-mono t-small' });
+        text(svg, 20, 296, `gathered so far: ${t + 1} of ${N} keys`, { class: 't-small t-dim' });
+      }
+      say(t < 0
+        ? 'The newest token’s query must attend to <b>all 22</b> cached tokens, but their K and V are scattered across the pool. Press <b>Play</b> to watch the kernel gather them.'
+        : t === N - 1
+          ? 'Done: one integer lookup per block turned scattered memory into a complete K/V sequence. The kernel never needed the blocks to be contiguous, which is why vLLM can hand out any free block to any request.'
+          : `Token <b>${t}</b> lives in logical block <b>${lb}</b>. The table says that is physical block <b>${TABLE[lb]}</b>, slot <b>${slot}</b>. ${slot === 0 ? 'A new block: one table lookup, then 4 contiguous reads.' : 'Same block as the previous token, so no new lookup is needed.'}`);
+    }
+    player(bar, root, { step: () => { t++; return t < N - 1; }, reset: () => { t = -1; }, render, interval: 650, autoplay: true });
+  });
+</script>
