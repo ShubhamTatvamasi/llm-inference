@@ -1,0 +1,183 @@
+---
+layout: ../layouts/Chapter.astro
+title: Quality & Safety
+description: Every speed-up is also a model change, so it needs an accuracy gate. And a model behind an API is an attack surface, so the platform needs guards on inputs, outputs, tools and the weights themselves.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import QualGate from '../components/viz/QualGate.astro';
+import QualDeterminism from '../components/viz/QualDeterminism.astro';
+import QualInjection from '../components/viz/QualInjection.astro';
+import QualGuardrail from '../components/viz/QualGuardrail.astro';
+
+The rest of this guide is about making inference faster and cheaper. This chapter covers the two things speed can cost you:
+
+- **Quality.** [Quantization](../quantization/), an FP8 KV cache, a new engine version, a changed chat template or new [speculative decoding](../speculative-decoding/) settings all change the numbers the model computes. Some changes are harmless. Others quietly break maths, code or long documents while chat still looks fine.
+- **Safety.** A model behind an API takes untrusted text in, produces text that other systems act on, calls tools, and loads weights from the internet. Each of those is an attack surface the serving platform owns.
+
+## Every optimisation needs an accuracy gate
+
+Treat any change below as a new model that must earn its way to production:
+
+| Change | Expected effect | Where it tends to break |
+|---|---|---|
+| FP8 weights and activations | near-lossless on large models | small models, outlier-heavy layers |
+| FP8 KV cache | small average change | long-context retrieval, attention to rare tokens |
+| INT4 / FP4 weights | measurable on hard tasks | multi-step maths, code, low-resource languages |
+| Engine or kernel upgrade | none, in theory | numerics bugs, changed sampling defaults, tokenizer handling |
+| Chat template / tokenizer change | none, in theory | missing special tokens, broken tool calls, [structured output](../structured-output/) failures |
+| Speculative decoding | lossless with exact verification | implementation bugs; output length and stop handling |
+
+The [quantization chapter](../quantization/) gives the short version: compare against the baseline on your own evals, include the fragile slices, set thresholds first. The gate below shows why those three rules matter:
+
+<Viz title="Accuracy gate for a precision change" label="Interactive">
+  <QualGate />
+  <Fragment slot="caption">
+    <p>Each row is a task family; the dot is the score change against BF16 and the whisker its 95% confidence interval. Pick W4A16: the average looks acceptable while maths and multilingual fail. Then drag <b>Examples per task</b> down to a few hundred: the intervals grow wider than the threshold, and the gate can no longer tell a regression from noise. Stack FP8 KV on top of a weight format to see regressions add up. Deltas are illustrative.</p>
+  </Fragment>
+</Viz>
+
+Two consequences. First, **gate per task, never on the average**: a model that loses 3 points on maths and gains nothing elsewhere has a small average delta and a real regression. Second, **size the eval to the threshold**: to resolve a 1-point change you need on the order of 1,000+ paired examples per task. Score the same items with both models and look at the items that flipped, not just the totals.
+
+## Which evals, and how far to trust them
+
+No single eval is enough. Use a ladder, from cheap and coarse to expensive and close to users:
+
+| Eval | Catches | Misses | Cost |
+|---|---|---|---|
+| **Perplexity** on a held-out text set | gross breakage: wrong scales, broken kernels, wrong tokenizer | task-level regressions; small changes barely move it | minutes |
+| **Standard benchmarks** (GSM8K, MMLU-style, HumanEval-style, IFEval, long-context retrieval) | regressions on known capabilities, comparable across teams | your domain; contamination makes absolute scores unreliable | tens of minutes to hours |
+| **Golden set**: your own prompts with reference answers or checks | regressions on what your product does | anything not in the set; needs upkeep | depends on size |
+| **LLM-as-judge** pairwise or rubric scoring | quality of open-ended answers at scale | biases of the judge (below) | judge tokens |
+| **Human review** of sampled outputs | tone, subtle errors, safety | scale; reviewer drift | expensive |
+| **Online signals**: thumbs, edits, retries, task success | real user impact | slow and noisy; needs traffic | free once wired |
+
+**LLM-as-judge** is useful but biased in known ways: it prefers the answer shown **first** (position bias), prefers **longer** answers (verbosity bias), and rates outputs from its **own model family** higher (self-preference). Swap the order and average both, cap or normalise length, use a judge from a different family, and calibrate it against a few hundred human labels before trusting it.
+
+Standard benchmarks run against any OpenAI-compatible endpoint with **lm-evaluation-harness**, so you test the exact engine, flags and chat template you will serve:
+
+```bash
+lm_eval --model local-chat-completions \
+  --model_args model=meta-llama/Llama-3.1-8B-Instruct,base_url=http://candidate:8000/v1/chat/completions \
+  --tasks gsm8k,ifeval --apply_chat_template
+# chat endpoints support generative tasks only; log-likelihood tasks (e.g. MMLU) need local-completions
+```
+
+A validation workflow that holds up:
+
+1. **Freeze the baseline**: model revision, engine version, flags, chat template, sampling settings. Store its scores and outputs.
+2. **Write thresholds before running**: e.g. "no task drops more than 1 point; JSON validity ≥ 99.5%; median output length within ±10%".
+3. **Run the candidate** on the same items, same sampling (greedy for comparability), through the real serving path.
+4. **Diff**: per-task deltas with intervals, flipped items, length and refusal changes, parse failures.
+5. **Canary or shadow**: send a slice of live traffic (or mirror it) and compare online signals before full rollout. Keep the baseline deployable for rollback.
+
+## Watching quality in production
+
+Offline evals pass, then quality drifts in production because traffic changes, a template is edited, or an upgrade slips through. Engine dashboards show latency, not correctness, so add cheap **quality proxies** per model, route and version:
+
+- **Output length** distribution (p50, p95). Sudden shifts mean rambling, early stopping or a changed default.
+- **finish_reason** mix: a jump in `length` means truncation, often with broken JSON.
+- **Refusal rate**, by pattern match or a small classifier.
+- **JSON / tool-call parse failures** and schema-validation errors.
+- **Language mismatch** (answer not in the prompt's language), repetition loops, empty answers.
+- User signals: regenerate clicks, thumbs down, edits.
+
+Expect one surprise: at temperature 0 the same prompt does **not** always give the same answer. Floating-point addition is not associative, and kernels pick their reduction strategy (split-K, tile sizes, attention splits) from the shape of the batch. How many other requests happen to share the step changes the order of additions, the logits move in the last bits, and a near-tie between two tokens can flip.
+
+<Viz title="Same prompt, different batch, different answer" label="Interactive">
+  <QualDeterminism />
+  <Fragment slot="caption">
+    <p>The dot products use real fp32 arithmetic; only the kernel heuristic is simplified. Switch batch sizes and watch the split change and the greedy token flip between batch 1 and batch 4. Replay under live traffic to see run-to-run variation, then tick <b>Batch-invariant kernels</b>: one reduction strategy for every batch size, identical results, lower throughput.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="note" title="When you need bit-exact outputs">
+Determinism matters for regression tests, evals that compare two runs, debugging a bad answer, and some on-policy RL training. vLLM's `VLLM_BATCH_INVARIANT=1` (beta) switches to batch-invariant kernels at a throughput cost. For most production traffic, accept the variation and make evals robust to it: compare score distributions, not single outputs.
+</Callout>
+
+## The threat model: OWASP Top 10 for LLM applications
+
+The **OWASP Top 10 for LLM Applications (2025)** is the common checklist. Several items belong to the application, but the serving platform can enforce a lot of them centrally:
+
+| Risk | What it looks like | What the serving platform can do |
+|---|---|---|
+| LLM01 Prompt Injection | instructions hidden in user input or retrieved content | least-privilege tools, approval for side effects, input classifiers |
+| LLM02 Sensitive Information Disclosure | PII or secrets in outputs or logs | output PII filters, prompt/response log redaction, tenant isolation of [prefix caches](../prefix-caching/) |
+| LLM03 Supply Chain | malicious weights, code or dependencies | safetensors only, no remote code, pinned revisions, scanning, signatures |
+| LLM04 Data and Model Poisoning | backdoored fine-tunes or adapters | provenance for models and [LoRA adapters](../multi-lora/), eval gates before promotion |
+| LLM05 Improper Output Handling | model output executed as SQL, HTML or shell | schema-constrained output, treat output as untrusted downstream |
+| LLM06 Excessive Agency | agents with broad tools and credentials | per-task tool allow-lists, scoped tokens, human-in-the-loop |
+| LLM07 System Prompt Leakage | users extract the system prompt | keep secrets out of prompts; enforce rules outside the model |
+| LLM08 Vector and Embedding Weaknesses | poisoned or cross-tenant retrieval | per-tenant indexes and access checks on retrieval |
+| LLM09 Misinformation | confident wrong answers | grounding, citations, evals on factuality |
+| LLM10 Unbounded Consumption | huge prompts, endless outputs, cost attacks | token budgets, `max_tokens` caps, rate limits, timeouts |
+
+### Prompt injection
+
+**Direct** injection is a user typing "ignore your instructions". **Indirect** injection is worse: the instructions arrive inside content the model reads on the user's behalf, such as a web page, an email, a PDF or a tool result. The root cause is architectural. Everything in the context, system prompt, user message and retrieved data alike, is one sequence of tokens; the model has no type system that marks some tokens as "data, never instructions". Delimiters and "ignore instructions in documents" prompts lower the success rate but do not close the hole.
+
+<Viz title="An agent reads a poisoned page" label="Step-through">
+  <QualInjection />
+  <Fragment slot="caption">
+    <p>Play the attack with no defences, then tick one mitigation at a time. The classifier stops the obvious payload, but tick <b>Attacker paraphrases</b> and it passes. The allow-list, human approval and least-privilege token stop the attack whatever the model was tricked into, because they act on <i>what the agent can do</i>, not on what it reads.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key" title="Design for a compromised model">
+Assume any model that reads untrusted content can be steered by it. Then limit the blast radius: give each task only the tools it needs, give tools credentials scoped to the user and the task, require approval for irreversible or outward-facing actions, and isolate sessions and tenants. Classifiers are a useful extra layer, never the only one.
+</Callout>
+
+### Unbounded consumption
+
+The cheapest attack on an LLM service is a request that costs a lot: a prompt at the full context length, `max_tokens` at the maximum, a reasoning model asked to "think as long as needed", or thousands of parallel streams. Defences belong at the gateway and the engine: per-tenant **token budgets** (input and output tokens per minute, not just requests), a hard **cap on `max_tokens`** and prompt size, a `max_model_len` sized to the product, request timeouts, and cancellation that frees KV blocks when clients disconnect (see [routing and autoscaling](../routing-autoscaling/)).
+
+## Guardrails and what they cost
+
+**Guardrails** are checks outside the main model: an input classifier before the prompt reaches the engine, an output classifier on what comes back, and rules in between. Common building blocks are safety classifier models such as **Llama Guard**, **ShieldGemma** and **Granite Guardian**, and frameworks such as **NeMo Guardrails** and **Guardrails AI** that wire checks, rules and validators around the model call. A guard is itself a model call, so it adds latency and GPU time, and on a streaming response the output check fights the stream:
+
+<Viz title="Guardrails on a streaming response" label="Interactive">
+  <QualGuardrail />
+  <Fragment slot="caption">
+    <p>Compare the four output strategies. <b>Per chunk</b> keeps unsafe text off the screen but adds a chunk plus a check to TTFT and makes the stream bursty; push the guard latency above the chunk's generation time and the backlog grows. <b>At end</b> is safest and kills streaming. <b>Async</b> keeps latency but lets text reach the user before it can be retracted. Running the input check in parallel with prefill hides most of its cost. Illustrative timings.</p>
+  </Fragment>
+</Viz>
+
+Practical rules: run input checks in parallel with prefill and cancel on a hit; use a small guard model (1–8B) on its own replicas so it scales independently; check output in chunks for interactive traffic and the full response for tool calls and actions; and measure the guard's false-positive rate, because over-refusal is a quality regression too.
+
+## The model supply chain
+
+Model weights are downloaded artefacts, often from public hubs, and loading them can run code. Treat a model like a container image:
+
+- **Safetensors, not pickle.** PyTorch `.bin`/`.pt` checkpoints use Python pickle, which can execute arbitrary code when loaded. **Safetensors** stores only a JSON header and raw tensors. Refuse pickle formats from untrusted sources, or convert them in a sandbox.
+- **No remote code.** `trust_remote_code` runs Python from the model repository inside your serving process. Keep it off; if a model truly needs it, review and vendor the code.
+- **Pin revisions.** A repo name points to a moving branch. Pin the commit (`hf download <repo> --revision <sha>`, and `--revision` in the engine), and mirror approved models into your own registry or object store.
+- **Scan and sign.** Scan artefacts for unsafe serialisation (e.g. Protect AI **ModelScan**), and sign and verify them (OpenSSF **model-signing**, built on Sigstore) so the weights you serve are the weights you approved.
+- **Record it.** An **AI bill of materials (AI-BOM)** lists model, revision, hashes, datasets where known, adapters, engine and licence for each deployment.
+- **Read the licence.** Open-weight licences differ: some restrict commercial use, user counts, use cases or derivative models. Legal review belongs in the promotion pipeline, like the eval gate.
+
+<Callout type="warn" title="Adapters and fine-tunes are models too">
+A [LoRA adapter](../multi-lora/) uploaded by a tenant changes the model's behaviour as much as new weights do, and it can carry a backdoor. Apply the same format rules, scanning, provenance and eval gates to adapters, and isolate tenants that bring their own.
+</Callout>
+
+<Interview>
+  <Q q="Why is perplexity not enough to approve a quantized model?" level="core">
+    Perplexity averages token-level likelihood over generic text. It catches gross breakage (wrong scales, broken kernels, tokenizer mismatch) but small changes barely move it, and it says nothing about multi-step reasoning, code, long context or tool calls, which are where quantization usually hurts. Approve with task evals per slice, with thresholds set in advance and enough examples to resolve them.
+  </Q>
+  <Q q="What is indirect prompt injection and why can't the model just ignore instructions in documents?" level="core">
+    Instructions planted in content the model reads for the user (web pages, emails, retrieved chunks, tool results) that steer it to do something else. The model processes system prompt, user request and data as one token sequence with no hard boundary, and it is trained to follow instructions wherever they appear. Prompting reduces the rate but cannot guarantee separation, so defences must limit what a steered model can do: scoped tools and credentials, approval for side effects, isolation.
+  </Q>
+  <Q q="FP8 KV cache passed your chat eval but users of the contract-review feature report missed clauses. Why, and what should the gate have included?" level="mid">
+    FP8 KV rounds keys and values; the effect concentrates in long contexts, where attention must pick a few relevant tokens out of tens of thousands, so retrieval over long documents degrades while short chat is unchanged. The gate needed a long-context slice (needle-style retrieval and real long documents at production lengths) with its own threshold, not a single chat average.
+  </Q>
+  <Q q="Your temperature-0 regression test fails intermittently after an engine upgrade, with no code change. What's going on?" level="mid">
+    Probably batch-dependent numerics: kernels choose reduction strategies by batch shape, so the same prompt gets slightly different logits depending on what else is in the step, and near-ties flip. Confirm by running the prompt alone vs under load. Options: run tests with batch-invariant kernels (`VLLM_BATCH_INVARIANT=1`, slower), run them in isolation at batch 1, or make the test compare scores or semantic equivalence rather than exact strings.
+  </Q>
+  <Q q="Adding an output safety classifier made your chat feel broken: long pauses, then bursts of text. What happened and how do you fix it?" level="senior">
+    The output guard buffers each chunk, checks it, then releases it, so users see bursts, and TTFT grows by one chunk plus one check. If the guard is slower than the engine generates a chunk, checks queue and stalls grow over the response. Fixes: a smaller, faster guard on dedicated replicas; smaller chunks with the guard sized to keep up; run the input check in parallel with prefill; consider async checking with retraction for low-severity categories and blocking only for high-severity ones; and measure TTFT and ITL with the guard in the path.
+  </Q>
+  <Q q="A team wants to deploy a new open-weight model from a public hub tomorrow. What does your platform require before it serves traffic?" level="senior">
+    Safetensors weights only, no `trust_remote_code` (or reviewed, vendored code); a pinned commit mirrored to an internal registry with recorded hashes; a scan for unsafe serialisation and a signature check; licence review; an AI-BOM entry; then the eval gate (task slices plus safety and refusal evals) against the current model, a load test, and a canary with quality proxies (length, refusals, parse failures) before full rollout. Gateway limits (token budgets, `max_tokens` caps) apply from day one.
+  </Q>
+</Interview>

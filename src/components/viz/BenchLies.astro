@@ -1,0 +1,102 @@
+---
+/* "How benchmarks lie": one server, one true user experience, and a set of common benchmark
+   choices. Each toggle changes only the number the benchmark report would print, never what
+   users actually get. Multipliers are illustrative but each mechanism is real. */
+---
+<div data-viz="bench-lies"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, group, checkbox, segmented, stats, legend, narration, C } from '../../lib/viz';
+
+  // What production users really get on this replica (real prompts, ~40% prefix hits,
+  // natural output lengths, Poisson arrivals at the goodput knee).
+  const TRUE = { tps: 2100, ttft: 1.8, itl: 42 };
+  const ISL = 2000, OSL = 400;
+
+  type Prompts = 'real' | 'random' | 'same';
+  interface Lie { key: string; label: string; why: string; }
+  const LIES: Lie[] = [
+    { key: 'input', label: 'Count input tokens in tok/s', why: '<b>Total tok/s</b> adds prompt tokens to output tokens. With 2,000-token prompts and 400-token answers the headline is 6× the number users can read.' },
+    { key: 'eos', label: 'ignore_eos with fixed output length', why: '<b>ignore_eos</b> forces every answer to the same length, so the batch never drains unevenly and fewer prefills interrupt decode. Throughput and TTFT look better than with natural lengths, and a quantized model that would ramble or stop early looks identical.' },
+    { key: 'peak', label: 'Report peak throughput (no SLO)', why: '<b>Peak throughput</b> comes from saturating the server (e.g. request rate = inf). It is real, but only at a latency nobody would accept; the report quietly omits that latency.' },
+    { key: 'mean', label: 'Report mean instead of p99', why: 'The <b>mean</b> sits near the median of a long-tailed distribution. It hides the slow 1–5% of requests that make users give up.' },
+    { key: 'warm', label: 'No warm-up, short run', why: '<b>No warm-up</b> puts compilation, CUDA graph capture and a cold cache into the measured window. Here it makes the tail look worse than production. Different start-up costs per engine then decide a head-to-head comparison.' },
+  ];
+
+  const W = 940, H = 220;
+
+  mountAll('bench-lies', (root) => {
+    const on: Record<string, boolean> = {};
+    let prompts: Prompts = 'real';
+    const bar = ctrlBar(root);
+    const g = group(bar);
+    segmented(g, [{ value: 'real', label: 'Real prompts' }, { value: 'random', label: 'Random tokens' }, { value: 'same', label: 'One prompt repeated' }], prompts, (v) => { prompts = v as Prompts; render(); });
+    const bar2 = ctrlBar(root);
+    LIES.forEach((l) => { on[l.key] = false; checkbox(bar2, l.label, false, (v) => { on[l.key] = v; render(); }); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Reported benchmark numbers compared with what users actually experience' });
+    const st = stats(root, ['Headline in the report', 'What users get', 'Distortions active']);
+    legend(root, [['What users actually get', C.decode], ['What the benchmark reports', C.accent], ['Reported number flatters', C.prefill], ['Reported number is pessimistic', C.waste]]);
+    const say = narration(root);
+
+    function reported() {
+      let tps = TRUE.tps, ttft = TRUE.ttft, itl = TRUE.itl, tpsLabel = 'output tok/s', latLabel = 'p99', latShown = true;
+      if (prompts === 'random') { ttft *= 1.55; tps *= 0.86; }   // no prefix hits: every prompt fully prefilled
+      if (prompts === 'same') { ttft *= 0.22; tps *= 1.35; }     // ~100% prefix hits: prefill nearly free
+      if (on.eos) { tps *= 1.22; ttft *= 0.85; }
+      if (on.peak) { tps *= 1.45; latShown = false; }
+      if (on.warm) { ttft *= 2.6; itl *= 1.3; }
+      if (on.mean) { ttft *= 0.3; itl *= 0.62; latLabel = 'mean'; }
+      if (on.input) { tps *= (ISL + OSL) / OSL; tpsLabel = 'total tok/s'; }
+      return { tps, ttft, itl, tpsLabel, latLabel, latShown };
+    }
+
+    function render() {
+      clear(svg);
+      const r = reported();
+      const rows: { name: string; truth: number; rep: number; max: number; unit: (v: number) => string; higherBetter: boolean; shown: boolean; repLabel: string; }[] = [
+        { name: 'Throughput', truth: TRUE.tps, rep: r.tps, max: 26000, unit: (v) => `${Math.round(v).toLocaleString('en-US')} tok/s`, higherBetter: true, shown: true, repLabel: r.tpsLabel },
+        { name: 'TTFT', truth: TRUE.ttft, rep: r.ttft, max: 5, unit: (v) => (v < 1 ? `${Math.round(v * 1000)} ms` : `${v.toFixed(2)} s`), higherBetter: false, shown: r.latShown, repLabel: r.latLabel },
+        { name: 'ITL', truth: TRUE.itl, rep: r.itl, max: 70, unit: (v) => `${Math.round(v)} ms`, higherBetter: false, shown: r.latShown, repLabel: r.latLabel },
+      ];
+      const X0 = 150, X1 = 760;
+      rows.forEach((row, i) => {
+        const y = 16 + i * 68;
+        text(svg, 20, y + 20, row.name, { class: 't-bold' });
+        text(svg, 20, y + 38, i === 0 ? 'users: output tok/s' : 'users: p99', { class: 't-small t-faint' });
+        const sc = (v: number) => Math.min(1, v / row.max) * (X1 - X0);
+        rect(svg, X0, y + 6, sc(row.truth), 18, C.decode, { rx: 3 });
+        text(svg, X0 + sc(row.truth) + 6, y + 15, row.unit(row.truth), { class: 't-small t-mono t-bold' });
+        if (row.shown) {
+          rect(svg, X0, y + 30, sc(row.rep), 18, C.accent, { rx: 3, opacity: 0.85 });
+          text(svg, X0 + sc(row.rep) + 6, y + 39, `${row.unit(row.rep)} (${row.repLabel})`, { class: 't-small t-mono' });
+          const ratio = row.rep / row.truth;
+          const flatter = row.higherBetter ? ratio > 1.02 : ratio < 0.98;
+          const pess = row.higherBetter ? ratio < 0.98 : ratio > 1.02;
+          const lab = ratio >= 1 ? `×${ratio.toFixed(ratio >= 10 ? 0 : 1)}` : `÷${(1 / ratio).toFixed(1)}`;
+          rect(svg, 800, y + 14, 120, 26, flatter ? C.prefill : pess ? C.waste : C.surface2, { rx: 13, opacity: flatter || pess ? 0.9 : 1, stroke: C.border });
+          text(svg, 860, y + 27, Math.abs(ratio - 1) < 0.02 ? 'honest' : `${lab} ${flatter ? 'flatters' : 'worse'}`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: flatter || pess ? 'var(--bg)' : C.text });
+        } else {
+          rect(svg, X0, y + 30, X1 - X0, 18, C.surface2, { rx: 3, stroke: C.border, 'stroke-dasharray': '4 3' });
+          text(svg, X0 + 8, y + 39, 'not reported (peak-throughput run)', { class: 't-small t-dim' });
+          rect(svg, 800, y + 14, 120, 26, C.waste, { rx: 13 });
+          text(svg, 860, y + 27, 'hidden', { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+        }
+      });
+      line(svg, X0, 8, X0, 214, C.borderStrong, { 'stroke-width': 1 });
+
+      const active = LIES.filter((l) => on[l.key]);
+      const nAct = active.length + (prompts !== 'real' ? 1 : 0);
+      st.set('Headline in the report', `${Math.round(r.tps).toLocaleString('en-US')} ${r.tpsLabel}`, r.latShown ? `${r.latLabel} TTFT ${r.ttft < 1 ? Math.round(r.ttft * 1000) + ' ms' : r.ttft.toFixed(2) + ' s'}` : 'no latency given', C.accent);
+      st.set('What users get', `${TRUE.tps.toLocaleString('en-US')} output tok/s`, `p99 TTFT ${TRUE.ttft} s · p99 ITL ${TRUE.itl} ms`, C.decode);
+      st.set('Distortions active', String(nAct), nAct ? 'same server, same users' : 'an honest benchmark', nAct ? C.waste : C.good);
+
+      const parts: string[] = [];
+      if (prompts === 'random') parts.push('<b>Random-token prompts</b> share no prefixes, so the prefix cache never hits and every token is prefilled. Here that makes the server look worse than it is in production, where system prompts repeat.');
+      if (prompts === 'same') parts.push('<b>One prompt repeated</b> hits the prefix cache almost every time, so prefill is nearly free and TTFT looks 4–5× better than any real workload.');
+      active.forEach((l) => parts.push(l.why));
+      say(parts.length ? parts.join(' ') : 'Every toggle above changes the report, never the users. Start by ticking <b>Count input tokens</b> and <b>Report peak throughput</b>: the combination behind many headline numbers.');
+    }
+    render();
+  });
+</script>

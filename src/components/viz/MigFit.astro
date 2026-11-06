@@ -1,0 +1,105 @@
+---
+/* "Will my model fit in this MIG slice?" For a chosen GPU, every MIG profile gets a stacked bar:
+   weights + runtime overhead + KV cache for the chosen context × concurrency, against the slice's
+   memory × gpu-memory-utilization. Also shows the slice's share of memory bandwidth and a rough
+   single-stream decode ceiling. First-order model; numbers are illustrative. */
+---
+<div data-viz="mig-fit"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, group, select, slider, stats, legend, narration, C, fmt, hatchDefs, uniq } from '../../lib/viz';
+  import { MODELS, getModel, kvBytesPerToken } from '../../data/hardware';
+
+  interface P { name: string; gb: number; c: number; mfrac: number; }
+  interface G { id: string; name: string; bw: number; cs: number; profs: P[]; }
+  const mk = (names: string[], gb: number[], c: number[], m: number[]): P[] => names.map((n, i) => ({ name: n, gb: gb[i], c: c[i], mfrac: m[i] }));
+  const GS: G[] = [
+    { id: 'h100', name: 'H100 80GB', bw: 3.35, cs: 7, profs: mk(['1g.10gb', '1g.20gb', '2g.20gb', '3g.40gb', '4g.40gb', '7g.80gb'], [10, 20, 20, 40, 40, 80], [1, 1, 2, 3, 4, 7], [1 / 8, 2 / 8, 2 / 8, 4 / 8, 4 / 8, 1]) },
+    { id: 'h200', name: 'H200 141GB', bw: 4.8, cs: 7, profs: mk(['1g.18gb', '1g.35gb', '2g.35gb', '3g.71gb', '4g.71gb', '7g.141gb'], [18, 35, 35, 71, 71, 141], [1, 1, 2, 3, 4, 7], [1 / 8, 2 / 8, 2 / 8, 4 / 8, 4 / 8, 1]) },
+    { id: 'b200', name: 'B200 180GB', bw: 8.0, cs: 7, profs: mk(['1g.23gb', '1g.45gb', '2g.45gb', '3g.90gb', '4g.90gb', '7g.180gb'], [23, 45, 45, 90, 90, 180], [1, 1, 2, 3, 4, 7], [1 / 8, 2 / 8, 2 / 8, 4 / 8, 4 / 8, 1]) },
+    { id: 'rtx', name: 'RTX PRO 6000 96GB', bw: 1.6, cs: 4, profs: mk(['1g.24gb', '2g.48gb', '4g.96gb'], [24, 48, 96], [1, 2, 4], [1 / 4, 2 / 4, 1]) },
+  ];
+  const CTX = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const SMALL = ['llama3-8b', 'qwen3-8b', 'qwen3-30b-a3b', 'qwen3-32b', 'mixtral-8x7b', 'llama3-70b', 'llama2-7b'];
+  const W = 940, LX = 12, BX = 128, BW = 560, RX = BX + BW + 14, ROW = 32, Y0 = 34;
+
+  mountAll('mig-fit', (root) => {
+    let g = GS[0], model = getModel('llama3-8b'), wB = 1, kvB = 2, ctxI = 3, conc = 8, util = 0.92;
+
+    const b1 = ctrlBar(root);
+    const g1 = group(b1);
+    select(g1, 'GPU', GS.map((x) => ({ value: x.id, label: x.name })), g.id, (v) => { g = GS.find((x) => x.id === v)!; build(); render(); });
+    select(g1, 'Model', MODELS.filter((m) => SMALL.includes(m.id)).map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    const b2 = ctrlBar(root);
+    select(b2, 'Weights', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }, { value: '0.5', label: 'INT4 / FP4' }], '1', (v) => { wB = Number(v); render(); });
+    select(b2, 'KV cache', [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }], '2', (v) => { kvB = Number(v); render(); });
+    const b3 = ctrlBar(root);
+    slider(b3, { label: 'Context per sequence', min: 0, max: CTX.length - 1, value: ctxI, format: (i) => fmt.num(CTX[i], 0), onInput: (i) => { ctxI = i; render(); } });
+    slider(b3, { label: 'Concurrent sequences', min: 1, max: 64, value: conc, onInput: (v) => { conc = v; render(); } });
+    slider(b3, { label: '--gpu-memory-utilization', min: 0.5, max: 0.98, step: 0.01, value: util, format: (v) => v.toFixed(2), onInput: (v) => { util = v; render(); } });
+
+    let svg: SVGSVGElement | undefined;
+    const hid = uniq('mfh');
+    const st = stats(root, ['Weights', 'KV for this load', 'Smallest slice that fits', 'Its bandwidth share']);
+    legend(root, [['Weights', C.weight], ['Runtime overhead (est.)', C.mem], ['KV cache needed', C.kv], ['Over the slice budget', C.waste]]);
+    const say = narration(root);
+
+    function build() {
+      if (svg) svg.remove();
+      svg = svgRoot(root, W, Y0 + g.profs.length * ROW + 30, { 'aria-label': 'Memory needed vs each MIG profile' });
+      root.insertBefore(svg, st.el);
+    }
+
+    function render() {
+      if (!svg) return;
+      const svgEl = svg;
+      clear(svgEl);
+      const hp = hatchDefs(svgEl, hid, C.waste);
+      const ctx = CTX[ctxI];
+      const weights = model.params * wB / 1e9;
+      const kv = kvBytesPerToken(model, kvB) * ctx * conc / 1e9;
+      const maxGB = g.profs[g.profs.length - 1].gb;
+      const sx = (gb: number) => (gb / maxGB) * BW;
+      text(svgEl, LX, 14, 'Profile', { class: 't-small t-faint t-bold' });
+      text(svgEl, BX, 14, `memory: weights + overhead + KV  vs  slice × ${util.toFixed(2)}`, { class: 't-small t-faint t-bold' });
+      text(svgEl, RX, 14, 'verdict · decode ceiling, 1 stream', { class: 't-small t-faint t-bold' });
+      let best: P | null = null;
+      g.profs.forEach((p, i) => {
+        const y = Y0 + i * ROW;
+        const overhead = Math.max(1.0, 0.04 * p.gb);
+        const budget = p.gb * util;
+        const need = weights + overhead + kv;
+        const kvRoom = budget - weights - overhead;
+        const fitsW = kvRoom > 0;
+        const fits = need <= budget;
+        if (fits && !best) best = p;
+        text(svgEl, LX, y + 10, p.name, { class: 't-small t-mono t-bold', fill: fits ? C.text : C.faint });
+        text(svgEl, LX, y + 23, `${p.c}/${g.cs} SMs · ${Math.round(p.mfrac * 100)}% BW`, { class: 't-small t-faint' });
+        rect(svgEl, BX, y + 4, sx(p.gb), 20, C.surface2, { rx: 4, stroke: C.border });
+        let x = BX;
+        const seg = (gb: number, fill: string) => { const w = Math.max(0, Math.min(sx(gb), BX + sx(p.gb) - x)); if (w > 0) rect(svgEl, x, y + 4, w, 20, fill, { rx: 0 }); x += sx(gb); };
+        seg(weights, C.weight); seg(overhead, C.mem); seg(kv, C.kv);
+        if (need > p.gb) rect(svgEl, BX + sx(p.gb), y + 4, Math.min(sx(need - p.gb), BW - sx(p.gb)), 20, hp, { rx: 0, stroke: C.waste });
+        const bx = BX + sx(budget);
+        line(svgEl, bx, y + 1, bx, y + 27, C.text, { 'stroke-width': 1.5, 'stroke-dasharray': '3 2' });
+        const maxSeqs = fitsW ? Math.floor(kvRoom / (kvBytesPerToken(model, kvB) * ctx / 1e9)) : 0;
+        const tps = fitsW ? (g.bw * p.mfrac * 1e12 * 0.75) / (model.activeParams * wB) : 0;
+        const verdict = !fitsW ? '✗ weights do not fit' : fits ? `✓ fits · ${maxSeqs} seqs max` : maxSeqs < 1 ? '✗ not even 1 seq at this ctx' : `~ only ${maxSeqs} seq${maxSeqs === 1 ? '' : 's'} at this ctx`;
+        text(svgEl, RX, y + 10, verdict, { class: 't-small t-bold', fill: !fitsW || maxSeqs < 1 ? C.waste : fits ? C.good : C.prefill });
+        if (fitsW) text(svgEl, RX, y + 23, `≈ ${Math.round(tps)} tok/s per stream`, { class: 't-small t-mono t-dim' });
+      });
+      text(svgEl, BX, Y0 + g.profs.length * ROW + 14, 'dashed line = the budget the engine may use (slice memory × --gpu-memory-utilization)', { class: 't-small t-faint' });
+
+      const b = best as P | null;
+      st.set('Weights', `${weights.toFixed(1)} GB`, `${fmt.num(model.params, 1)} params × ${wB} B`);
+      st.set('KV for this load', `${kv.toFixed(1)} GB`, `${conc} × ${fmt.num(ctx, 0)} tokens`);
+      st.set('Smallest slice that fits', b ? b.name : 'none', b ? `${b.gb} GB instance` : 'shrink context, concurrency or precision', b ? C.good : C.waste);
+      st.set('Its bandwidth share', b ? `${(g.bw * b.mfrac).toFixed(2)} TB/s` : '–', b ? `of ${g.bw} TB/s for the whole GPU` : '');
+      say(b
+        ? `On a MIG slice the engine only sees the instance: <code>--gpu-memory-utilization</code> is a fraction of <b>${b.gb} GB</b>, not of the whole GPU. The slice also gets only ~${Math.round(b.mfrac * 100)}% of the memory bandwidth, so decode is proportionally slower than on a full GPU even when everything fits.${model.experts ? ' MoE models still have to hold <i>all</i> experts in memory, even though each token reads only a few.' : ''}`
+        : 'Nothing fits. Weights are a fixed cost per replica; the KV cache scales with context × concurrency. Lower the context, quantize the weights or KV cache, or give this model a whole GPU.');
+    }
+    build();
+    render();
+  });
+</script>

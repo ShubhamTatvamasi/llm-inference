@@ -208,7 +208,7 @@ export function stats(parent: Element, keys: string[]) {
     set(k: string, v: string, sub?: string, color?: string) {
       const t = map.get(k); if (!t) return;
       t.v.textContent = v; if (sub !== undefined) t.s.textContent = sub;
-      if (color) t.v.style.color = color;
+      t.v.style.color = color ?? ''; // reset when no colour, so a warning colour does not stick
     },
   };
 }

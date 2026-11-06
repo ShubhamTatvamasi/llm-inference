@@ -1,0 +1,194 @@
+---
+layout: ../layouts/Chapter.astro
+title: Benchmarking
+description: A benchmark should answer one question, how much of your traffic this configuration serves within your SLOs. Most published numbers answer an easier one. This chapter covers workload shapes, load models, sweeps, the tools, and how to spot a misleading result.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import BenchWorkload from '../components/viz/BenchWorkload.astro';
+import BenchSweep from '../components/viz/BenchSweep.astro';
+import BenchSamples from '../components/viz/BenchSamples.astro';
+import BenchLies from '../components/viz/BenchLies.astro';
+
+The [metrics chapter](../metrics/) defined what to measure: TTFT, ITL, TPOT, E2E and **goodput**. This chapter is about producing those numbers so they predict production. A useful benchmark has three parts, and getting any one wrong makes the result meaningless:
+
+- **The workload.** Prompt and output length distributions, prefix sharing, and the request mix of *your* traffic, not a default `1024 / 128`.
+- **The load model.** How requests arrive: a fixed number in flight, or a rate that ignores how fast the server answers.
+- **The method.** Warm-up, run length, sweep points, and where the client sits.
+
+The output is a single sentence you can plan with: "**N req/s at p99 TTFT ≤ X and p99 ITL ≤ Y**, for this workload, on this engine version and these flags." That sentence feeds [capacity planning](../capacity-planning/).
+
+## Start from the workload shape
+
+Two numbers describe most requests: the **input sequence length (ISL)** and the **output sequence length (OSL)**. Their ratio decides which phase of the engine does the work. Long inputs stress [prefill](../prefill-decode/) and TTFT; long outputs stress decode, ITL and [KV cache](../kv-cache/) capacity. Their *spread* matters as much as their median: a p99 prompt ten times the median is what breaks TTFT.
+
+<Viz title="Workload shape explorer" label="Explore">
+  <BenchWorkload />
+  <Fragment slot="caption">
+    <p>Switch between workloads and watch the two histograms and the GPU-time bar. Summarisation and agent steps are prefill-heavy per token, yet decode can still dominate wall time because long contexts make every decode step read more KV. Reasoning is almost all decode. Embeddings have no decode at all. Turn the prefix cache off to see what a benchmark with random prompts measures instead. Distributions and costs are illustrative first-order estimates.</p>
+  </Fragment>
+</Viz>
+
+| Workload | Typical ISL : OSL | Prefix sharing | What it stresses | Benchmark must include |
+|---|---|---|---|---|
+| Chat | ~3 : 1, wide spread | system prompt, history | TTFT and ITL together | multi-turn history, real length spread |
+| RAG / search | 10–20 : 1 | low (chunks vary) | prefill, TTFT | realistic retrieved context sizes |
+| Summarisation | 15–30 : 1 | almost none | prefill, long-context KV | the long tail of documents |
+| Code completion | 30–50 : 1, tiny outputs | very high (same file) | TTFT at high request rate | repeated prefixes, short timeouts |
+| [Reasoning](../reasoning-agents/) | 1 : 5–10 | moderate | decode, KV per request | real output lengths; no `ignore_eos` |
+| Agents | 50+ : 1, growing per turn | very high (history) | prefill and prefix-cache hit rate | whole sessions, not single turns |
+| [Embeddings](../embedding-serving/) | prefill only | low | compute, batch size | input tokens/s, not output tokens/s |
+
+The best source of a workload is your own traffic: sample request logs (lengths and, where allowed, prompts), keep the session structure for multi-turn and agent traffic, and replay it. Synthetic data is fine for sweeps if you match the **distribution** and the **prefix structure**, not only the means.
+
+## Closed loop vs open loop
+
+Load generators drive the server in one of two ways, and they produce different curves from the same server:
+
+- **Closed loop (fixed concurrency).** *N* virtual users each send a request, wait for the full response, then send the next. `--max-concurrency 32` in `vllm bench serve` is a closed loop. When the server slows down, the client slows down with it, so the queue can never exceed *N*.
+- **Open loop (fixed request rate).** Requests arrive at rate λ, usually as a **Poisson process**, whether or not earlier requests have finished. `--request-rate 8` is an open loop. Real users behave like this: they do not wait for each other.
+
+A closed loop hides queueing. The client stops sending exactly when the server falls behind, so the bursts that build queues in production never happen. This is a version of **coordinated omission**: the test avoids measuring the moments that would have been worst. Below the knee the two models roughly agree. Near the knee, a Poisson stream at the same average rate has a much worse tail, and past capacity an open-loop queue grows without limit.
+
+<Viz title="Same replica, two sweeps" label="Simulation">
+  <BenchSweep />
+  <Fragment slot="caption">
+    <p>Each dot is one sweep point: a full benchmark run at one concurrency (closed loop) or one arrival rate (open loop), plotted as latency against the throughput it achieved. The green ring marks the highest-throughput point that meets both p99 SLOs, which is your capacity. Compare the two curves at about 1,750 tok/s: same throughput, roughly 2× worse p99 TTFT under Poisson arrivals, so the open-loop capacity at the same SLO is about 20% lower. Tighten the ITL SLO to see it, rather than TTFT, set the limit. Illustrative model of one 64-slot replica with chunked prefill.</p>
+  </Fragment>
+</Viz>
+
+**Sweeping** means running the benchmark at a series of load levels and plotting latency against throughput. A good sweep has many points near the knee and a few beyond it. Practical rules:
+
+- Use concurrency sweeps to find the knee quickly and to compare engines at **equal concurrency**. Then confirm the capacity with an **open-loop** run at the rate you plan to serve, ideally with some burstiness.
+- `vllm bench serve` sends every request at time zero when `--request-rate` is left at its default of `inf`. That measures a thundering herd, not a service. Always set a rate or a concurrency.
+- Read the knee off the **p99** curves against your SLO, not off the throughput curve. Throughput keeps rising slowly long after users have started to suffer.
+
+<Callout type="key" title="Two numbers, never one">
+A throughput figure without the latency it was measured at means nothing. Report **throughput at a stated latency percentile and SLO**, or the whole latency–throughput curve. "3,000 tok/s" is a marketing number; "2,000 output tok/s at p99 TTFT 400 ms and p99 ITL 30 ms, 1k/200 tokens, Poisson" is an engineering number.
+</Callout>
+
+## Running it properly
+
+**Warm-up.** The first requests after start-up pay for kernel compilation, [CUDA graph](../kernels/) capture, lazy allocation and a cold [prefix cache](../prefix-caching/). Send a warm-up phase and exclude it (`--num-warmups` in `vllm bench serve`, `--warmup-requests` in SGLang's benchmark), and benchmark only after readiness passes.
+
+**Duration and sample size.** A p99 is decided by the slowest 1% of requests. With 200 requests that is two requests. Run each sweep point long enough for **at least a few hundred, ideally 1,000+ requests**, and for open-loop tests at least a few minutes so queues reach steady state. Repeat the run before believing a 5–10% difference.
+
+<Viz title="How many requests does a p99 need?" label="Simulation">
+  <BenchSamples />
+  <Fragment slot="caption">
+    <p>Eight runs draw from the same latency distribution. Drag the run length down to 100 and the "p99" of each run is just its slowest request; the eight runs disagree by 2× or more. Above ~1,000 requests they converge on the true value. Tick <b>Skip warm-up</b> to see 20 cold requests dominate short runs. Illustrative distribution.</p>
+  </Fragment>
+</Viz>
+
+**Client-side bottlenecks.** The load generator is a program too. A single Python process parsing hundreds of concurrent token streams can run out of CPU, and then it measures its own event loop: ITL rises and throughput plateaus while the GPU is half idle. Watch the client's CPU, run it on a separate machine close to the server, and spread very high concurrency over several client processes. Check which tokenizer the client uses to count tokens; counting with a different tokenizer than the server shifts every per-token number.
+
+**Where to point it.** Measure twice, at two places:
+
+| Target | What it measures | Use it for |
+|---|---|---|
+| Directly at one pod (pod IP or a per-pod Service) | the engine alone, one replica | engine flags, model and quantization choices, per-replica capacity |
+| Through the gateway / InferencePool | everything users see: TLS, auth, routing, queueing across replicas | end-to-end SLOs, routing policies, autoscaling behaviour |
+
+The difference between the two is your **platform overhead**; it should be a few milliseconds of TTFT, not hundreds. Avoid `kubectl port-forward` for load tests: it tunnels through the API server and becomes the bottleneck long before the GPU does. Through a gateway, remember that [routing](../routing-autoscaling/) changes results: a prefix-aware router turns repeated prompts into cache hits that a direct-to-pod test never sees.
+
+## The tools
+
+All of these speak the OpenAI-compatible API, stream responses, and report TTFT, ITL and throughput percentiles. They differ in load models, datasets and reporting.
+
+| Tool | From | Load models | Strengths |
+|---|---|---|---|
+| `vllm bench serve` | vLLM | concurrency, Poisson or gamma rate (`--burstiness`) | quick, many datasets (`random`, `sharegpt`, `prefix_repetition`), built-in `--goodput` SLO counting |
+| **GuideLLM** | vLLM ecosystem | synchronous, throughput, constant and Poisson rates, automatic sweep | sweeps from idle to saturation in one command; rich reports |
+| **AIPerf** | NVIDIA (successor to GenAI-Perf) | concurrency and request rate | detailed per-request records, synthetic and trace-based inputs |
+| **inference-perf** | Kubernetes Serving working group | multi-stage rate profiles from a config file | Kubernetes-native; built for benchmarking model servers and gateways in-cluster |
+| SGLang benchmark | SGLang | concurrency and request rate | same flags across engines; random, ShareGPT and generated datasets |
+
+```bash
+# vLLM: one closed-loop sweep point, with SLO-based goodput
+vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
+  --base-url http://llama-8b.serving.svc:8000 --model meta-llama/Llama-3.1-8B-Instruct \
+  --dataset-name random --random-input-len 1024 --random-output-len 256 \
+  --max-concurrency 32 --num-prompts 1000 --num-warmups 50 \
+  --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99 \
+  --goodput ttft:500 tpot:50
+# ...the same, open loop: replace --max-concurrency with --request-rate 8
+
+# GuideLLM: automatic sweep from synchronous to max throughput
+guidellm run --backend kind=openai_http,target=http://llama-8b.serving.svc:8000 \
+  --profile kind=sweep \
+  --data kind=synthetic_text,prompt_tokens=1024,output_tokens=256 \
+  --constraint kind=max_duration,seconds=120
+
+# AIPerf: fixed concurrency, streaming
+aiperf profile --model meta-llama/Llama-3.1-8B-Instruct --url http://llama-8b.serving.svc:8000 \
+  --endpoint-type chat --streaming --concurrency 32 \
+  --synthetic-input-tokens-mean 1024 --output-tokens-mean 256
+
+# SGLang's benchmark, against an SGLang server
+python -m sglang.benchmark.serving --backend sglang --host 127.0.0.1 --port 30000 \
+  --dataset-name random --random-input-len 1024 --random-output-len 256 \
+  --num-prompts 1000 --request-rate 8
+```
+
+<Callout type="warn" title="Output length is a request, not a guarantee">
+`--random-output-len 256` or `--output-tokens-mean 256` only *asks* for 256 tokens. The model stops at its end-of-sequence token unless the client sets `ignore_eos` (or `min_tokens`) and the server honours it. Check the measured output lengths in the report before comparing two runs.
+</Callout>
+
+## How benchmarks lie
+
+Most misleading benchmarks contain no false numbers. Each choice below is defensible on its own; together they can make the same server look 10–30× better, or worse, than what users get.
+
+<Viz title="Same server, different headline" label="Interactive">
+  <BenchLies />
+  <Fragment slot="caption">
+    <p>The blue bars never move: they are what users of this replica actually get. Each toggle changes only the number a benchmark report would print. Try <b>Count input tokens</b> + <b>Report peak throughput</b> + <b>One prompt repeated</b>, then switch to <b>Random tokens</b> and notice that a benchmark can also be unfairly pessimistic. Multipliers are illustrative.</p>
+  </Fragment>
+</Viz>
+
+The usual suspects, and the question that exposes each:
+
+- **Aggregate tok/s with no latency.** *At what p99 TTFT and ITL?* Peak throughput is measured where users have already left.
+- **Counting input tokens.** *Output or total tokens?* `vllm bench serve` prints both output and total token throughput; prompt-heavy workloads make "total" several times larger.
+- **`ignore_eos` with fixed lengths.** Uniform outputs keep batches neat and hide models that ramble or stop early, which is exactly what a [quantized](../quantization/) model can do.
+- **Random prompts** have no shared prefixes, so prefix caching never helps and the benchmark understates production. **Identical prompts** hit the cache every time and overstate it. Use real prompts or a dataset with your prefix structure (`--random-prefix-len`, `prefix_repetition`).
+- **Mismatched engine defaults.** Comparing engines "out of the box" compares their defaults: prefix caching, chunked-prefill budget, max batched sequences, CUDA graphs, [speculative decoding](../speculative-decoding/), KV-cache dtype, even the chat template. Pin and list every flag on both sides.
+- **Averages.** Means hide the tail; report p50, p90 and p99.
+- **Ignoring cold start.** No warm-up penalises engines with long compilation; a warm-only benchmark hides the [cold start](../routing-autoscaling/) users hit after every scale-up. Measure both, separately.
+
+### A reporting template
+
+Every benchmark result should travel with its context, or nobody can reproduce or compare it:
+
+| Field | Example |
+|---|---|
+| Model, revision, precision | Llama-3.1-8B-Instruct @ pinned commit, BF16 weights, FP8 KV |
+| Hardware | 1 × H100 SXM 80 GB, driver and CUDA version |
+| Engine, version, full flags | vLLM x.y.z, `--max-num-seqs 64 --enable-prefix-caching …` |
+| Workload | ISL/OSL distributions (p50/p99), prefix structure, dataset source, `ignore_eos` yes/no |
+| Load model | closed loop at N, or Poisson at λ req/s (burstiness), duration, warm-up excluded |
+| Client and path | tool and version, client location, direct-to-pod or via gateway |
+| Results per sweep point | output tok/s, req/s, TTFT/ITL/E2E p50/p90/p99, error rate, measured OSL |
+| Verdict | max load at SLO (goodput knee), with the SLO stated |
+
+<Interview>
+  <Q q="What is the difference between a concurrency sweep and a request-rate sweep, and which predicts production latency better?" level="core">
+    A concurrency sweep is a **closed loop**: N clients each wait for a response before sending again, so the client slows down with the server and queues stay bounded. A request-rate sweep is an **open loop**: requests arrive (usually Poisson) regardless of responses, as real users do. The open loop predicts production tails better because it creates the bursts and queues that a closed loop avoids. Use concurrency to find the knee quickly and to compare configs, and confirm capacity with an open-loop run.
+  </Q>
+  <Q q="Why is 'output tokens per second' alone not a useful benchmark result?" level="core">
+    It has no latency attached. Throughput keeps rising until saturation while TTFT and ITL get worse, so the highest number is measured at a latency no user would accept. The useful result is throughput **at a stated SLO** (p99 TTFT and ITL), or the full latency–throughput curve, for a stated workload shape.
+  </Q>
+  <Q q="How many requests do you need per sweep point to report a p99?" level="mid">
+    Enough that the p99 rests on a meaningful number of slow samples: at least several hundred, ideally 1,000+, so 10 or more requests lie above it. With 100 requests the "p99" is just the slowest request. Exclude warm-up, run open-loop points long enough to reach steady state, and repeat runs to see the noise before calling a small difference real.
+  </Q>
+  <Q q="A vendor claims engine A has 2× the throughput of engine B on the same GPU. What do you ask?" level="mid">
+    At what latency percentile and SLO; output or total tokens; what ISL/OSL distribution, and whether `ignore_eos` forced lengths; random, real or repeated prompts (prefix caching); which flags and defaults on each side (prefix caching, chunked prefill, max sequences, speculative decoding, KV dtype, quantization); closed or open loop; warm-up; and the exact versions. Then rerun both on your own workload with matched settings.
+  </Q>
+  <Q q="Your load test showed 12 req/s per replica within SLO, but production replicas miss SLO at 7 req/s. Walk through the likely causes." level="senior">
+    Compare the test against production on each axis. **Load model**: a closed-loop test hides Poisson and bursty arrivals. **Workload**: production prompts or outputs are longer or more spread out (check p99 ISL/OSL), or reasoning traffic grew. **Prefix structure**: the test reused one prompt (inflated cache hits) or production routing scatters prefixes. **Path**: the test hit pods directly; production goes through a gateway with auth and a router. **Engine**: different flags or version in production. Also check the client was not the bottleneck, and look at preemptions and KV usage in production. Fix the benchmark to replay real traffic, then re-derive capacity.
+  </Q>
+  <Q q="Benchmarking at 256 concurrency, ITL rises and throughput plateaus while GPU SM activity is only 50%. What's happening?" level="senior">
+    Likely a **client-side bottleneck**: one load-generator process cannot parse that many token streams, so it delays reading tokens and inflates ITL. Check the client's CPU, split the load across processes or machines, and move the client close to the server. If the client is fine, check for a proxy in the path (port-forward, a buffering ingress), the engine's max-sequences limit (extra requests just queue), and the API server's own CPU (tokenisation and detokenisation in the frontend).
+  </Q>
+</Interview>

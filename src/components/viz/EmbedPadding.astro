@@ -1,0 +1,124 @@
+---
+/* Padding waste for an embedding server: the same 32 texts batched three ways —
+   naive arrival-order padding, length-sorted buckets, and packed (varlen) sequences.
+   Shows wasted token slots, truncation and relative throughput. Illustrative. */
+---
+<div data-viz="embed-padding"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, group, segmented, slider, button, stats, legend, narration, hatchDefs, uniq, rng, C, fmt } from '../../lib/viz';
+
+  type Mode = 'naive' | 'sorted' | 'packed';
+  const COUNT = 32;
+  const W = 940, H = 330, X0 = 70, X1 = 930;
+
+  mountAll('embed-padding', (root) => {
+    let mode: Mode = 'naive';
+    let batch = 8;
+    let maxLen = 512;
+    let seed = 3;
+    let lens: number[] = [];
+
+    function sample() {
+      const r = rng(seed);
+      // skewed: many short queries / titles, some paragraphs, a few long documents
+      lens = Array.from({ length: COUNT }, () => {
+        const u = r();
+        if (u < 0.55) return Math.round(12 + r() * 50);
+        if (u < 0.88) return Math.round(80 + r() * 220);
+        return Math.round(400 + r() * 1200);
+      });
+    }
+    sample();
+
+    const bar = ctrlBar(root);
+    segmented(bar, [{ value: 'naive', label: 'Naive padding' }, { value: 'sorted', label: 'Length-sorted buckets' }, { value: 'packed', label: 'Packed (varlen)' }], mode, (v) => { mode = v; render(); });
+    button(bar, 'New texts', () => { seed++; sample(); render(); }, { icon: 'reset' });
+    const bar2 = ctrlBar(root);
+    const g = group(bar2);
+    slider(g, { label: 'Batch size', min: 4, max: 16, step: 4, value: batch, onInput: (v) => { batch = v; render(); } });
+    slider(g, { label: 'Max sequence length', min: 128, max: 2048, step: 128, value: maxLen, onInput: (v) => { maxLen = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Batches of variable-length texts with padding shown as waste' });
+    const hid = uniq('eph');
+    const st = stats(root, ['Real tokens', 'Computed slots', 'Padding waste', 'Relative throughput', 'Truncated']);
+    legend(root, [['Real tokens', C.prefill], ['Padding (computed, thrown away)', C.waste], ['Truncated (never seen)', C.faint]]);
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      const hatch = hatchDefs(svg, hid, C.waste);
+      const eff = lens.map((l) => Math.min(l, maxLen));
+      const real = eff.reduce((a, b) => a + b, 0);
+      const truncated = lens.reduce((a, l) => a + Math.max(0, l - maxLen), 0);
+      const nTrunc = lens.filter((l) => l > maxLen).length;
+
+      // rows: each row = list of segments {len, idx} and padded width
+      type Row = { segs: number[]; width: number; batchId: number };
+      const rows: Row[] = [];
+      let computed = 0, attnReal = 0, attnComputed = 0;
+      if (mode === 'packed') {
+        // first-fit decreasing into rows of capacity maxLen; a "batch" = token budget of batch × maxLen
+        const order = eff.map((l, i) => i).sort((a, b) => eff[b] - eff[a]);
+        const cap: number[] = [];
+        const rowSegs: number[][] = [];
+        for (const i of order) {
+          let r = cap.findIndex((c) => c + eff[i] <= maxLen);
+          if (r < 0) { r = cap.length; cap.push(0); rowSegs.push([]); }
+          cap[r] += eff[i]; rowSegs[r].push(i);
+        }
+        // varlen kernels compute only real tokens; the last partial row is not padded either
+        rowSegs.forEach((sg, k) => rows.push({ segs: sg, width: cap[k], batchId: Math.floor(k / batch) }));
+        computed = real;
+        attnComputed = eff.reduce((a, l) => a + l * l, 0);
+      } else {
+        const order = eff.map((_, i) => i);
+        if (mode === 'sorted') order.sort((a, b) => eff[a] - eff[b]);
+        for (let b = 0; b * batch < COUNT; b++) {
+          const ids = order.slice(b * batch, (b + 1) * batch);
+          const w = Math.max(...ids.map((i) => eff[i]));
+          for (const i of ids) { rows.push({ segs: [i], width: w, batchId: b }); computed += w; attnComputed += w * w; }
+        }
+      }
+      attnReal = eff.reduce((a, l) => a + l * l, 0);
+
+      // draw
+      const nRows = rows.length;
+      const nGroups = rows.length ? rows[rows.length - 1].batchId + 1 : 1;
+      const rowH = Math.min(mode === 'packed' ? 16 : 8, (H - 30 - nGroups * 5) / Math.max(nRows, 1) - 1.2);
+      const sx = (t: number) => ((X1 - X0) * t) / maxLen;
+      text(svg, X0, 10, '0', { class: 't-small t-faint t-mono' });
+      text(svg, X1, 10, `${maxLen} tokens`, { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      let y = 22, lastB = -1;
+      rows.forEach((r) => {
+        if (r.batchId !== lastB) {
+          if (lastB >= 0) y += 5;
+          text(svg, 6, y + rowH / 2 + 1, mode === 'packed' ? `budget ${r.batchId + 1}` : `batch ${r.batchId + 1}`, { class: 't-small t-dim' });
+          lastB = r.batchId;
+        }
+        let x = X0;
+        for (const i of r.segs) {
+          const w = sx(eff[i]);
+          rect(svg, x, y, Math.max(w - (mode === 'packed' ? 1 : 0), 1), rowH, C.prefill, { rx: 1.5 });
+          x += w;
+          if (lens[i] > maxLen && mode !== 'packed') rect(svg, X1 + 2, y, 6, rowH, C.faint, { rx: 1 });
+        }
+        if (mode !== 'packed' && r.width > eff[r.segs[0]]) rect(svg, x, y, sx(r.width - eff[r.segs[0]]), rowH, hatch, { rx: 1.5, stroke: C.waste, 'stroke-width': 0.6 });
+        y += rowH + 1.2;
+      });
+      line(svg, X1, 18, X1, y, C.borderStrong, { 'stroke-dasharray': '3 3', 'stroke-width': 1 });
+
+      const waste = 1 - real / computed;
+      st.set('Real tokens', fmt.int(real), `${COUNT} texts`);
+      st.set('Computed slots', fmt.int(computed), mode === 'packed' ? 'varlen: no padding' : `${Math.ceil(COUNT / batch)} padded batches`);
+      st.set('Padding waste', fmt.pct(waste), `attention: ${fmt.pct(1 - attnReal / attnComputed)} wasted`, waste > 0.4 ? C.waste : waste < 0.05 ? C.good : undefined);
+      st.set('Relative throughput', `${(real / computed).toFixed(2)}×`, 'useful tokens per computed slot', real / computed > 0.9 ? C.good : undefined);
+      st.set('Truncated', `${nTrunc} texts`, `${fmt.int(truncated)} tokens dropped`, nTrunc ? C.waste : undefined);
+
+      if (mode === 'naive') say(`Batches are formed in arrival order, and every row is padded to the <b>longest text in its batch</b>. A single long document drags the other ${batch - 1} texts in its batch up to its length: <b>${fmt.pct(waste)}</b> of the encoder’s work is spent on padding.`);
+      else if (mode === 'sorted') say(`Sorting by length before batching puts similar texts together, so padding shrinks to <b>${fmt.pct(waste)}</b>. This is easy for offline indexing, where the whole corpus is known. For online traffic, sorting needs a small queueing window, which adds latency.`);
+      else say('<b>Packed</b> sequences are concatenated into one long row, and variable-length attention kernels keep each text from attending to its neighbours. No padding is computed at all. Engines with varlen attention batch by a <b>token budget</b> rather than a sequence count.');
+    }
+    render();
+  });
+</script>

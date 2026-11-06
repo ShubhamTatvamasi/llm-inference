@@ -1,0 +1,111 @@
+---
+/* Xid explorer: click an Xid code to see whether it usually means an application or a hardware
+   problem, its blast radius on an 8-GPU node (process / GPU / NVLink peers / whole node), and the
+   runbook action. Classifications follow NVIDIA's Xid catalogue; "likelihood" is a rough lean. */
+---
+<div data-viz="obs-xid"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, narration, stats, C } from '../../lib/viz';
+
+  type Radius = 'process' | 'gpu' | 'peers' | 'node';
+  interface X { code: string; name: string; hw: number; radius: Radius; action: string; note: string; }
+  const XIDS: X[] = [
+    { code: '13', name: 'Graphics engine exception', hw: 0.2, radius: 'process', note: 'Usually an application fault: an illegal instruction or out-of-range access inside a kernel.', action: 'Read the application log, reproduce with compute-sanitizer. Only if it repeats across different workloads on the same GPU, run dcgmi diag.' },
+    { code: '31', name: 'GPU memory page fault', hw: 0.2, radius: 'process', note: 'An illegal memory access, typically an application or kernel bug, occasionally a driver bug.', action: 'Correlate with the last engine, kernel or driver change. Re-run with CUDA_LAUNCH_BLOCKING=1 to find the faulting kernel. Restart the pod.' },
+    { code: '43', name: 'GPU stopped processing', hw: 0.15, radius: 'process', note: 'The GPU stopped the faulting application’s work. The GPU itself is still healthy.', action: 'Restart the workload. Look for the Xid that came just before it (often 13 or 31).' },
+    { code: '45', name: 'Preemptive cleanup', hw: 0.1, radius: 'process', note: 'The driver cleaned up after a process was killed or hit another error. A consequence, not a cause.', action: 'Not actionable alone. Find the earlier error or the OOMKill/SIGKILL that triggered it.' },
+    { code: '48', name: 'Double-bit ECC error', hw: 0.95, radius: 'gpu', note: 'An uncorrectable memory error. Applications using that GPU are affected.', action: 'Cordon and drain. Reset the GPU, check remapped rows and the ECC counters. Repeated DBEs: RMA.' },
+    { code: '63', name: 'Row remap event', hw: 0.85, radius: 'gpu', note: 'HBM rows were marked for remapping after ECC errors. The remap takes effect at the next GPU reset.', action: 'Not an emergency. Schedule a drain and GPU reset at a convenient time; track the remapped-rows count.' },
+    { code: '64', name: 'Row remap failure', hw: 1.0, radius: 'gpu', note: 'The GPU ran out of spare rows or could not remap. Memory errors will keep surfacing.', action: 'Cordon, drain and take the GPU out of service. Open a hardware ticket / RMA.' },
+    { code: '74', name: 'NVLink error', hw: 0.85, radius: 'peers', note: 'A link error between GPUs. Any TP or EP group spanning the link stalls or fails, typically as an NCCL timeout.', action: 'Drain the node, check per-link error counters (nvidia-smi nvlink), reset GPUs. Persistent: hardware ticket.' },
+    { code: '79', name: 'GPU has fallen off the bus', hw: 0.95, radius: 'node', note: 'The host can no longer talk to the GPU over PCIe: power, thermal, PCIe or board fault.', action: 'Cordon and drain. A node reboot is usually required. Repeats on the same slot: hardware ticket.' },
+    { code: '94', name: 'Contained ECC error', hw: 0.9, radius: 'process', note: 'An uncorrectable error that the GPU contained to the application that touched the memory. Other work continues.', action: 'Restart the affected workload. Drain and reset the GPU at the next window so the row is remapped.' },
+    { code: '95', name: 'Uncontained ECC error', hw: 0.95, radius: 'gpu', note: 'An uncorrectable error that could not be contained. Every application on the GPU is affected.', action: 'Drain the GPU (or node) and reset it. Check remapped rows; repeated errors: RMA.' },
+    { code: '119', name: 'GSP RPC timeout', hw: 0.55, radius: 'node', note: 'The GPU System Processor firmware stopped answering the driver. Driver/firmware issue or a hung GPU.', action: 'Collect nvidia-bug-report, reset the GPU or reboot the node. Check the driver version for known issues.' },
+    { code: '120', name: 'GSP error', hw: 0.55, radius: 'node', note: 'An error reported by the GSP firmware itself.', action: 'As for 119: collect logs, reset or reboot, compare driver/firmware versions across the fleet.' },
+  ];
+  const RAD: Record<Radius, string> = { process: 'One process', gpu: 'Whole GPU', peers: 'GPU + NVLink peers', node: 'Whole node' };
+  const W = 920, H = 300;
+
+  mountAll('obs-xid', (root) => {
+    let sel = XIDS.findIndex((x) => x.code === '79');
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Xid codes with their likely cause, blast radius and action' });
+    const st = stats(root, ['Xid', 'Usually', 'Blast radius']);
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      const x = XIDS[sel];
+      // tiles
+      const TW = 62, TG = 6;
+      text(svg, 20, 14, 'Click an Xid (dmesg: "NVRM: Xid (PCI:…): <code>, …"; DCGM_FI_DEV_XID_ERRORS = last code)', { class: 't-small t-faint' });
+      XIDS.forEach((xi, i) => {
+        const tx = 20 + i * (TW + TG), ty = 26;
+        const on = i === sel;
+        const col = xi.hw >= 0.8 ? C.waste : xi.hw >= 0.5 ? C.prefill : C.decode;
+        const g = s('g', { style: 'cursor:pointer', tabindex: 0, role: 'button', 'aria-label': `Xid ${xi.code}: ${xi.name}` }, svg);
+        rect(g, tx, ty, TW, 40, on ? col : C.surface2, { rx: 8, stroke: col, 'stroke-width': on ? 2 : 1.2 });
+        text(g, tx + TW / 2, ty + 20, xi.code, { 'text-anchor': 'middle', class: 't-big t-mono', fill: on ? 'var(--bg)' : col });
+        const pick = () => { sel = i; render(); };
+        g.addEventListener('click', pick);
+        g.addEventListener('keydown', (e) => { const k = (e as KeyboardEvent).key; if (k === 'Enter' || k === ' ') { e.preventDefault(); pick(); } });
+      });
+
+      // app ↔ hardware scale
+      const SX = 20, SW = 380, SY = 104;
+      text(svg, SX, SY - 14, `Xid ${x.code}: ${x.name}`, { class: 't-bold' });
+      rect(svg, SX, SY, SW, 10, C.surface2, { rx: 5, stroke: C.border });
+      const grad = [C.decode, C.prefill, C.waste];
+      grad.forEach((c, i) => rect(svg, SX + (i * SW) / 3, SY, SW / 3, 10, c, { rx: 0, opacity: 0.35 }));
+      const mx = SX + x.hw * SW;
+      s('path', { d: `M${mx - 7},${SY - 6} L${mx + 7},${SY - 6} L${mx},${SY + 4} z`, fill: C.text }, svg);
+      text(svg, SX, SY + 24, 'application / driver', { class: 't-small t-faint' });
+      text(svg, SX + SW, SY + 24, 'hardware', { 'text-anchor': 'end', class: 't-small t-faint' });
+      // wrap note
+      const words = x.note.split(' '); const lines: string[] = []; let cur = '';
+      words.forEach((w) => { if ((cur + ' ' + w).length > 62) { lines.push(cur); cur = w; } else cur = cur ? cur + ' ' + w : w; });
+      if (cur) lines.push(cur);
+      lines.forEach((l, i) => text(svg, SX, SY + 50 + i * 16, l, { class: 't-small' }));
+      const act = x.action.split(' '); const al: string[] = []; cur = '';
+      act.forEach((w) => { if ((cur + ' ' + w).length > 62) { al.push(cur); cur = w; } else cur = cur ? cur + ' ' + w : w; });
+      if (cur) al.push(cur);
+      const AY = SY + 60 + lines.length * 16;
+      rect(svg, SX - 6, AY - 4, SW + 12, al.length * 16 + 26, C.accentSoft, { rx: 8, stroke: C.accent });
+      text(svg, SX + 4, AY + 8, 'Runbook', { class: 't-small t-bold', fill: C.accent });
+      al.forEach((l, i) => text(svg, SX + 4, AY + 24 + i * 16, l, { class: 't-small' }));
+
+      // node diagram: 8 GPUs, NVSwitch, one process on GPU 2 in a TP group of 4 (GPUs 0-3)
+      const NX = 440, NY = 90, NW = 460, NH = 186;
+      rect(svg, NX, NY, NW, NH, x.radius === 'node' ? C.wasteSoft : C.surface2, { rx: 12, stroke: x.radius === 'node' ? C.waste : C.border, 'stroke-width': x.radius === 'node' ? 2 : 1 });
+      text(svg, NX + 12, NY + 16, 'GPU node (8 GPUs, NVSwitch)', { class: 't-small t-bold' });
+      text(svg, NX + NW - 12, NY + 16, `affected: ${RAD[x.radius]}`, { 'text-anchor': 'end', class: 't-small t-bold', fill: C.waste });
+      rect(svg, NX + 20, NY + 98, NW - 40, 14, C.commSoft, { rx: 4 });
+      text(svg, NX + NW / 2, NY + 105, 'NVSwitch fabric', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      const BAD = 2;
+      for (let g = 0; g < 8; g++) {
+        const gx = NX + 20 + g * ((NW - 40) / 8) + 3, gw = (NW - 40) / 8 - 6, gy = NY + 30;
+        const inTP = g < 4;
+        const hit = x.radius === 'node' || (x.radius === 'peers' && inTP) || ((x.radius === 'gpu' || x.radius === 'process') && g === BAD);
+        const gpuHit = hit && x.radius !== 'process';
+        rect(svg, gx, gy, gw, 56, gpuHit ? C.wasteSoft : C.surface, { rx: 7, stroke: gpuHit ? C.waste : C.borderStrong, 'stroke-width': gpuHit ? 2 : 1 });
+        text(svg, gx + gw / 2, gy + 12, `GPU ${g}`, { 'text-anchor': 'middle', class: 't-small t-mono' });
+        // process box
+        const pFill = inTP ? C.weightSoft : C.kvSoft;
+        const procHit = hit || (x.radius === 'peers' && inTP);
+        rect(svg, gx + 5, gy + 22, gw - 10, 26, procHit ? C.waste : pFill, { rx: 5, opacity: procHit ? 0.85 : 1 });
+        text(svg, gx + gw / 2, gy + 35, inTP ? `TP r${g}` : `pod ${g - 3}`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: procHit ? 'var(--bg)' : C.text });
+        line(svg, gx + gw / 2, gy + 56, gx + gw / 2, NY + 98, x.radius === 'peers' && inTP ? C.waste : C.border, { 'stroke-width': x.radius === 'peers' && inTP ? 2.5 : 1.2 });
+      }
+      text(svg, NX + 20, NY + 132, 'GPUs 0–3 run one TP=4 replica; 4–7 run four single-GPU pods. The error hits GPU 2.', { class: 't-small t-faint' });
+      text(svg, NX + 20, NY + 150, x.radius === 'process' ? 'Only the process on GPU 2 dies, but with TP its 3 peers then stall in the next all-reduce.' : x.radius === 'gpu' ? 'Everything on GPU 2 is lost until it is reset; the TP replica goes down as a unit.' : x.radius === 'peers' ? 'The link fault breaks every collective across the TP group.' : 'Every pod on the node is affected; plan for a reboot.', { class: 't-small' });
+      text(svg, NX + 20, NY + 168, x.hw >= 0.8 ? 'Do not just restart the pod onto the same GPU: cordon first.' : 'Restarting the pod is a reasonable first response.', { class: 't-small t-bold', fill: x.hw >= 0.8 ? C.waste : C.good });
+
+      st.set('Xid', x.code, x.name);
+      st.set('Usually', x.hw >= 0.8 ? 'hardware' : x.hw >= 0.5 ? 'driver / firmware' : 'application', x.hw >= 0.8 ? 'GPU or board' : x.hw >= 0.5 ? 'collect bug report' : 'look at the code first', x.hw >= 0.8 ? C.waste : x.hw >= 0.5 ? C.prefill : C.decode);
+      st.set('Blast radius', RAD[x.radius]);
+      say(`<b>Xid ${x.code}</b> · ${x.name}. ${x.hw >= 0.8 ? 'Treat this as a hardware signal: the next pod scheduled onto this GPU will hit it too.' : 'Most of the time the code running on the GPU caused it. One occurrence after a deploy points at the deploy, while the same Xid across many workloads on one GPU points at the GPU.'}`);
+    }
+    render();
+  });
+</script>

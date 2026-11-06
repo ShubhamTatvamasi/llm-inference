@@ -1,0 +1,127 @@
+---
+/* Workload shape explorer. Pick a workload type and see sampled input (ISL) and output (OSL)
+   length distributions, the shared-prefix fraction, and how one request's GPU time splits
+   between prefill and decode for an 8B model on one H100-class GPU at a chosen decode batch.
+   Distributions are illustrative log-normals, not measurements of any specific product. */
+---
+<div data-viz="bench-workload"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, select, slider, stats, legend, narration, C, rng, fmt } from '../../lib/viz';
+
+  interface WL { id: string; name: string; isl: number; isd: number; osl: number; osd: number; pfx: number; note: string; }
+  const WLS: WL[] = [
+    { id: 'chat', name: 'Chat assistant', isl: 900, isd: 0.8, osl: 280, osd: 0.7, pfx: 0.35, note: 'Moderate prompts (system prompt + history), medium answers. Shared system prompt gives some prefix reuse.' },
+    { id: 'rag', name: 'RAG / search QA', isl: 4000, isd: 0.45, osl: 220, osd: 0.5, pfx: 0.15, note: 'Retrieved chunks make prompts long and fairly uniform; answers are short. Prefill-heavy, and chunks rarely repeat in the same order.' },
+    { id: 'sum', name: 'Summarisation', isl: 9000, isd: 0.7, osl: 450, osd: 0.4, pfx: 0.02, note: 'Whole documents in, a page out. Prefill dominates and TTFT scales with document length.' },
+    { id: 'code', name: 'Code completion', isl: 2500, isd: 0.6, osl: 50, osd: 0.7, pfx: 0.6, note: 'Editor context in, a few lines out, at very high request rates. Each keystroke re-sends mostly the same file, so prefix reuse is high.' },
+    { id: 'reason', name: 'Reasoning model', isl: 600, isd: 0.7, osl: 4500, osd: 0.6, pfx: 0.3, note: 'Short questions, thousands of hidden thinking tokens. Decode dominates and KV per request grows long.' },
+    { id: 'agent', name: 'Agent step (multi-turn)', isl: 14000, isd: 0.5, osl: 180, osd: 0.6, pfx: 0.85, note: 'Each turn re-sends the whole history plus tool results. Huge prompts, short tool-call outputs, and most of the prompt is a prefix of the previous turn.' },
+    { id: 'emb', name: 'Embeddings / rerank', isl: 350, isd: 0.6, osl: 0, osd: 0, pfx: 0, note: 'Prefill only: no decode at all. Throughput is input tokens per second and batching is limited by compute, not KV.' },
+  ];
+
+  // first-order H100 + 8B BF16 model: prefill ≈ 2·P·params FLOPs at ~50% of 989 TFLOP/s;
+  // decode step ≈ (16 GB weights + batch KV) / (~75% of 3.35 TB/s), amortised over the batch.
+  const PREFILL_S_PER_TOK = (2 * 8e9) / (989e12 * 0.5);
+  const KV_PER_TOK = 128 * 1024; // Llama-3.1-8B BF16: 2·32·8·128·2 B
+  const BW = 3.35e12 * 0.75, WEIGHTS = 16e9;
+
+  const W = 940, H = 280;
+
+  mountAll('bench-workload', (root) => {
+    let wl = WLS[0], batch = 32, cache = true;
+    const bar = ctrlBar(root);
+    select(bar, 'Workload', WLS.map((w) => ({ value: w.id, label: w.name })), wl.id, (v) => { wl = WLS.find((w) => w.id === v)!; render(); });
+    slider(bar, { label: 'Decode batch', min: 1, max: 128, value: batch, onInput: (v) => { batch = v; render(); } });
+    select(bar, 'Prefix cache', [{ value: 'on', label: 'on (real prompts)' }, { value: 'off', label: 'off / random prompts' }], 'on', (v) => { cache = v === 'on'; render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Input and output length histograms and the prefill versus decode split of GPU time' });
+    const st = stats(root, ['Input tokens p50 / p99', 'Output tokens p50 / p99', 'Prefill : decode GPU time', 'Shared prefix (p50 prompt)']);
+    legend(root, [['Prefill (input tokens)', C.prefill], ['Prefill skipped by prefix cache', C.kvSoft], ['Decode (output tokens)', C.decode]]);
+    const say = narration(root);
+
+    function sample(w: WL) {
+      const r = rng(w.id.length * 97 + 3);
+      const g = () => { let u = 0; while (u === 0) u = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * r()); };
+      const isl: number[] = [], osl: number[] = [];
+      for (let i = 0; i < 600; i++) {
+        isl.push(Math.max(8, Math.min(120000, Math.round(w.isl * Math.exp(w.isd * g())))));
+        osl.push(w.osl ? Math.max(1, Math.min(32000, Math.round(w.osl * Math.exp(w.osd * g())))) : 0);
+      }
+      return { isl, osl };
+    }
+    const pct = (a: number[], p: number) => { const so = [...a].sort((x, y) => x - y); return so[Math.min(so.length - 1, Math.floor(p * so.length))]; };
+
+    function hist(vals: number[], x0: number, x1: number, y0: number, y1: number, col: string, title: string) {
+      const lmin = 0, lmax = 5; // 1 .. 100k tokens
+      const lx = (v: number) => x0 + ((Math.log10(Math.max(1, v)) - lmin) / (lmax - lmin)) * (x1 - x0);
+      text(svg, x0, y0 - 12, title, { class: 't-small t-bold' });
+      line(svg, x0, y1, x1, y1, C.borderStrong, { 'stroke-width': 1 });
+      for (const [v, lab] of [[1, '1'], [10, '10'], [100, '100'], [1000, '1k'], [10000, '10k'], [100000, '100k']] as [number, string][]) {
+        line(svg, lx(v), y1, lx(v), y1 + 3, C.borderStrong, { 'stroke-width': 1 });
+        text(svg, lx(v), y1 + 12, lab, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      }
+      if (!vals.some((v) => v > 0)) { text(svg, (x0 + x1) / 2, (y0 + y1) / 2, 'no output tokens: prefill only', { 'text-anchor': 'middle', class: 't-small t-dim' }); return; }
+      const B = 50; const cnt = new Array(B).fill(0);
+      for (const v of vals) cnt[Math.min(B - 1, Math.max(0, Math.floor(((Math.log10(Math.max(1, v)) - lmin) / (lmax - lmin)) * B)))]++;
+      const cm = Math.max(...cnt); const bw = (x1 - x0) / B;
+      cnt.forEach((c, i) => { if (c) { const hh = (c / cm) * (y1 - y0 - 6); rect(svg, x0 + i * bw + 0.5, y1 - hh, bw - 1, hh, col, { rx: 1, opacity: 0.85 }); } });
+      for (const [p, lab] of [[0.5, 'p50'], [0.99, 'p99']] as [number, string][]) {
+        const x = lx(pct(vals, p));
+        line(svg, x, y0, x, y1, C.text, { 'stroke-width': 1, 'stroke-dasharray': '3 3', opacity: 0.6 });
+        text(svg, x + 3, y0 + 2, lab, { class: 't-small t-mono t-bold' });
+      }
+    }
+
+    function render() {
+      clear(svg);
+      const { isl, osl } = sample(wl);
+      hist(isl, 20, 470, 36, 116, C.prefill, 'Input length (ISL), tokens, log scale');
+      hist(osl, 20, 470, 176, 256, C.decode, 'Output length (OSL), tokens, log scale');
+
+      // GPU-time split for the mean request
+      const mIn = isl.reduce((a, b) => a + b, 0) / isl.length;
+      const mOut = osl.reduce((a, b) => a + b, 0) / osl.length;
+      const hit = cache ? wl.pfx : 0;
+      const tPreAll = mIn * PREFILL_S_PER_TOK;
+      const tPre = tPreAll * (1 - hit);
+      const ctx = mIn + mOut / 2;
+      const tStep = (WEIGHTS + batch * ctx * KV_PER_TOK) / BW;
+      const tDec = mOut * tStep / batch;
+      const tot = tPreAll + tDec;
+
+      const X0 = 540, X1 = 920;
+      text(svg, X0, 24, 'GPU time per average request', { class: 't-bold' });
+      text(svg, X0, 42, `8B BF16 on one H100-class GPU · decode batch ${batch}`, { class: 't-small t-dim' });
+      const sx = (t: number) => (t / tot) * (X1 - X0);
+      let x = X0; const y = 64, bh = 44;
+      rect(svg, X0, y, X1 - X0, bh, C.surface2, { rx: 6, stroke: C.border });
+      const seg = (w: number, fill: string, lab: string, txt: string = 'var(--bg)') => { if (w <= 0) return; rect(svg, x, y, w, bh, fill, { rx: 0 }); if (w > 70) text(svg, x + 6, y + bh / 2, lab, { class: 't-small t-bold', fill: txt }); x += w; };
+      seg(sx(tPre), C.prefill, 'prefill');
+      seg(sx(tPreAll - tPre), C.kvSoft, 'cached', C.text);
+      seg(sx(tDec), C.decode, 'decode');
+      const domPre = tPre > tDec;
+      const rows: [string, string, string][] = [
+        ['Prefill compute', fmt.ms(tPre * 1000), `${fmt.int(mIn * (1 - hit))} of ${fmt.int(mIn)} tokens computed`],
+        ['Decode share', fmt.ms(tDec * 1000), mOut ? `${fmt.int(mOut)} tokens × ${fmt.ms(tStep * 1000)} step ÷ ${batch}` : 'none'],
+        ['KV held per request', mOut ? fmt.bytes((mIn + mOut) * KV_PER_TOK) : 'none kept', mOut ? `${fmt.int(mIn + mOut)} tokens at 128 KiB each` : 'released right after the forward pass'],
+        ['Bound by', mOut === 0 ? 'compute (prefill)' : domPre ? 'prefill → TTFT' : 'decode → ITL', mOut === 0 ? 'batch for FLOPs, not KV' : domPre ? 'tune chunked prefill, cache prefixes' : 'tune batch size, KV room, spec decode'],
+      ];
+      rows.forEach(([k, v, sub], i) => {
+        const yy = 140 + i * 34;
+        text(svg, X0, yy, k, { class: 't-small t-dim' });
+        text(svg, X0 + 150, yy, v, { class: 't-mono t-bold' });
+        text(svg, X0 + 150, yy + 14, sub, { class: 't-small t-faint' });
+      });
+
+      const pfx = Math.round(pct(isl, 0.5) * wl.pfx);
+      st.set('Input tokens p50 / p99', `${fmt.num(pct(isl, 0.5))} / ${fmt.num(pct(isl, 0.99))}`, `${fmt.pct(wl.pfx)} typically shared prefix`, C.prefill);
+      st.set('Output tokens p50 / p99', wl.osl ? `${fmt.num(pct(osl, 0.5))} / ${fmt.num(pct(osl, 0.99))}` : '0', wl.osl ? `ISL:OSL ≈ ${(pct(isl, 0.5) / Math.max(1, pct(osl, 0.5))).toFixed(1)} : 1` : 'pooling model', C.decode);
+      st.set('Prefill : decode GPU time', `${Math.round((tPre / (tPre + tDec || 1)) * 100)} : ${Math.round((tDec / (tPre + tDec || 1)) * 100)}`, cache && wl.pfx ? `prefix cache saves ${fmt.pct(wl.pfx)} of prefill` : 'no prefill reuse');
+      st.set('Shared prefix (p50 prompt)', `${pfx} tokens`, wl.pfx > 0.3 ? 'model it in the benchmark' : 'little to reuse');
+      const flags = wl.osl ? `<code>--random-prefix-len ${pfx} --random-input-len ${pct(isl, 0.5) - pfx} --random-output-len ${pct(osl, 0.5)}</code>` : '';
+      say(`<b>${wl.name}.</b> ${wl.note} A fixed-length benchmark at the p50 shape${flags ? ` (${flags})` : ''} misses the p99 prompts, which are what break TTFT. Replay the distribution, not the average.`);
+    }
+    render();
+  });
+</script>

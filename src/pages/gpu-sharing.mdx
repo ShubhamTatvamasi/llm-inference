@@ -1,0 +1,132 @@
+---
+layout: ../layouts/Chapter.astro
+title: Sharing a GPU
+description: A whole H100 for an 8B model, an embedding service or a notebook mostly buys idle silicon. Time-slicing, MPS, MIG and vGPU each split a GPU differently, and they trade utilisation against isolation in different ways.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import ShareSim from '../components/viz/ShareSim.astro';
+import ShareReplicas from '../components/viz/ShareReplicas.astro';
+import MigPacker from '../components/viz/MigPacker.astro';
+import MigFit from '../components/viz/MigFit.astro';
+
+[GPUs on Kubernetes](../gpus-on-kubernetes/) ended with a hard rule: `nvidia.com/gpu` is an integer, and one GPU goes to one pod. For a 70B model on four GPUs that is fine. For many real workloads it is wasteful:
+
+- An **8B model in FP8** needs about 8 GB of weights. On an 80 GB H100 most of the memory is idle, and at low traffic most of the SMs are too.
+- An [embedding or reranker](../embedding-serving/) service is bursty and small. It might use 5% of a GPU on average.
+- **Dev notebooks and CI jobs** hold a GPU for hours and use it for minutes.
+
+Sharing turns one physical GPU into several schedulable devices. The four mechanisms differ in one key question: **what does a tenant's neighbour do to it?** Can a neighbour slow it down, take its memory, or crash it?
+
+## Three ways to share, side by side
+
+Four tenants share one H100: a chat model with steady decode, a bursty embedding service, a mostly idle notebook and a batch evaluation job. Switch the mechanism, then break something:
+
+<Viz title="Four tenants, one GPU" label="Simulation">
+  <ShareSim />
+  <Fragment slot="caption">
+    <p>Compare SM utilisation and the worst slowdown across the three modes. Then press <b>C leaks memory</b> and <b>C hits a kernel fault</b> in each mode and watch which cards turn red. <b>GPU falls off the bus</b> takes out everyone in every mode, MIG included. Illustrative model: MPS uses replicas=4 (1/4 of SMs and memory each), MIG uses 3g.40gb + 2g.20gb + 2 × 1g.10gb.</p>
+  </Fragment>
+</Viz>
+
+**Time-slicing** is the CUDA default for several processes on one GPU: each context gets the whole GPU for a time slice, then the driver switches to the next. Nothing runs concurrently, so a tenant using half the SMs leaves the other half idle during its slice, and each active neighbour adds another slice to wait through. Memory is one shared pool, so one tenant can take everything and make the next allocation fail, in someone else's process.
+
+**MPS** (Multi-Process Service) runs a server process that funnels every client's kernels into one shared context, so kernels from different tenants run **at the same time**. Throughput is much better. The device plugin's MPS mode gives each of N replicas **1/N of the memory and 1/N of the SMs**, and the MPS control daemon enforces those limits. The weakness is faults: a fatal error in one client is reported to every client of that server.
+
+**MIG** (Multi-Instance GPU) partitions the hardware: each GPU instance gets its own SMs, its own L2 cache slices, its own memory and its own share of memory bandwidth. A neighbour cannot slow you down or crash you. The price is rigidity: an idle instance's SMs cannot be lent to a busy one, and the layout changes only by repartitioning.
+
+## Time-slicing on Kubernetes
+
+The device plugin implements time-slicing by **advertising each GPU several times**. You give it a config, usually a ConfigMap referenced from the ClusterPolicy (`spec.devicePlugin.config.name` and `.default`), and can select per node with the label `nvidia.com/device-plugin.config=<key>`:
+
+<Viz title="Replicas are tickets, not GPUs" label="Interactive">
+  <ShareReplicas />
+  <Fragment slot="caption">
+    <p>Add a pod asking for <b>2</b> replicas with the default settings: it gets two tickets to the same GPU and no extra compute. Tick <b>failRequestsGreaterThanOne</b> and add it again. Tick <b>renameByDefault</b> to see the resource renamed to <code>nvidia.com/gpu.shared</code>. Replica placement is illustrative.</p>
+  </Fragment>
+</Viz>
+
+Three settings matter. **`replicas`** is how many pods may share each GPU. **`renameByDefault: true`** advertises `nvidia.com/gpu.shared` instead of `nvidia.com/gpu`, so a pod only gets a shared GPU if it explicitly asks for one. Without it, GFD marks the product label with a `-SHARED` suffix and adds `nvidia.com/gpu.replicas`. **`failRequestsGreaterThanOne: true`** rejects any request for more than one replica with `UnexpectedAdmissionError`. Turn it on: a pod that asks for two replicas never gets more GPU, so the request is a mistake. MPS uses the same config shape under `sharing.mps`.
+
+<Callout type="warn" title="Two engines on one time-sliced GPU">
+vLLM sizes its KV cache from `--gpu-memory-utilization` (default 0.92 in recent releases), a fraction of the **whole** device's memory, and checks at start-up that this much is free. The first engine on a time-sliced GPU takes 92%, and the second fails to start. Give each engine an explicit fraction that adds up to less than 1 (for example 0.45 each), and remember that nothing enforces it: a neighbour that ignores its share can still push you out of memory.
+</Callout>
+
+## MIG: real partitions
+
+An H100 (and H200, B200) has **7 compute slices** and **8 memory slices**. A profile name says what an instance gets: **`3g.40gb`** is 3 compute slices and 40 GB of memory (4 memory slices). Instances must start at fixed positions, so not every combination fits even when the totals add up:
+
+<Viz title="MIG packer" label="Interactive">
+  <MigPacker />
+  <Fragment slot="caption">
+    <p><code>all-balanced</code> already uses all 7 compute slices, so even a <b>1g.10gb</b> is refused. Clear, then add <b>4g.40gb</b> and two <b>1g.20gb</b>: one compute slice is left, but no memory slice to go with it. Try <code>all-1g.10gb</code> and memory slice 7 is stranded. Try four <b>1g.20gb</b>: memory is full while 3 compute slices sit idle. Switch to <b>single</b> strategy with a mixed layout to see why <b>mixed</b> exists. Placement rules are approximate; product strings are illustrative.</p>
+  </Fragment>
+</Viz>
+
+| GPU | Smallest | Mid | Largest split | Whole |
+|---|---|---|---|---|
+| H100 80GB | 1g.10gb ×7, 1g.20gb ×4 | 2g.20gb ×3 | 3g.40gb ×2, 4g.40gb ×1 | 7g.80gb |
+| H200 141GB | 1g.18gb ×7, 1g.35gb ×4 | 2g.35gb ×3 | 3g.71gb ×2, 4g.71gb ×1 | 7g.141gb |
+| B200 180GB | 1g.23gb ×7, 1g.45gb ×4 | 2g.45gb ×3 | 3g.90gb ×2, 4g.90gb ×1 | 7g.180gb |
+| RTX PRO 6000 96GB | 1g.24gb ×4 | 2g.48gb ×2 | | 4g.96gb |
+
+L4 and L40S do not support MIG; on them, time-slicing or MPS is the only option.
+
+On Kubernetes the **MIG manager** owns the layout. You set a label such as `nvidia.com/mig.config=all-1g.10gb` on the node, and it reconfigures the GPUs and reports progress in `nvidia.com/mig.config.state` (`pending`, `rebooting`, `success`, `failed`). Recent versions generate a per-node `<node>-mig-config` ConfigMap of valid layouts. GPUs must be idle to repartition, so **cordon and drain** GPU workloads first. The device plugin then advertises the instances in one of two ways:
+
+- **`single`** (the Helm default): every instance appears as `nvidia.com/gpu`. Existing pod specs work unchanged, but a node should have one profile everywhere.
+- **`mixed`**: each profile is its own resource, such as `nvidia.com/mig-1g.10gb` or `nvidia.com/mig-3g.40gb`, and pods request the exact profile.
+
+## Will the model fit in a slice?
+
+A MIG instance is, to the engine, a smaller GPU: less memory, fewer SMs and a proportional share of bandwidth. The [KV cache](../kv-cache/) math is the same, applied to the slice:
+
+<Viz title="Will my model fit in this slice?" label="Calculator">
+  <MigFit />
+  <Fragment slot="caption">
+    <p>Llama 3.1 8B in FP8 with 8 × 8K-token sequences fits a 20 GB slice, not a 1g.10gb. Raise the context to 32K and only the whole GPU is left. Compare 1g.20gb and 2g.20gb: same memory, but half the SMs. The decode ceiling is a bandwidth-only estimate for one stream at ~75% of the slice's share; real engines land lower.</p>
+  </Fragment>
+</Viz>
+
+Two consequences matter in practice. First, `--gpu-memory-utilization` on a MIG instance is a fraction of the **instance**, and the engine sees only that instance, which makes MIG the safest way to run several vLLM servers on one GPU. Second, a slice with 1/8 of the memory bandwidth decodes about 8 times slower per stream than the whole GPU. MIG suits **many small, latency-tolerant** models. It does not make a single model faster.
+
+## Choosing a mechanism
+
+| | Time-slicing | MPS | MIG | vGPU |
+|---|---|---|---|---|
+| Concurrency | Takes turns | Concurrent kernels | Parallel, partitioned | Takes turns (or MIG-backed) |
+| Memory isolation | None | Per-client limit | Hardware | Per-VM framebuffer |
+| Fault isolation | None guaranteed | Weak: fatal fault hits all clients | Strong (per instance) | Per VM |
+| Performance isolation | None | Partial (SM cap; L2 and bandwidth shared) | Full (own SMs, L2, bandwidth) | Scheduler-dependent |
+| Granularity | Any replica count | Any replica count | Fixed profiles (up to 7) | Fixed vGPU profiles |
+| GPUs | Any | Volta and newer | A100/A30, H100/H200, B200, RTX PRO 6000… | Licensed; needs a hypervisor |
+| Reconfigure | Edit config | Edit config | Drain + relabel | VM-level |
+
+**vGPU** is the virtualisation answer: a hypervisor gives each VM a slice of a GPU with its own guest driver, either time-sliced or backed by MIG. It needs a licence and a hypervisor, and matters on Kubernetes mainly when nodes are VMs (for example with KubeVirt) or when tenants need VM-level separation.
+
+<Callout type="key" title="Rule of thumb">
+**MIG for isolation, MPS for throughput, time-slicing for convenience.** Use MIG when tenants are different teams or customers, or when one tenant's latency must not depend on another. Use MPS for many cooperating small processes you own. Keep time-slicing for dev, notebooks and CI, where a crash or slowdown is cheap.
+</Callout>
+
+<Interview>
+  <Q q="Compare time-slicing, MPS and MIG in one sentence each." level="core">
+    Time-slicing lets processes take turns on the whole GPU with no memory or fault isolation. MPS runs kernels from several processes concurrently through one server, with per-client memory and SM limits but shared fault fate. MIG splits the GPU into hardware instances with dedicated SMs, L2, memory and bandwidth: strong isolation at fixed sizes.
+  </Q>
+  <Q q="What does a MIG profile name like 3g.40gb mean, and why can't you always fit 3 compute slices into 3 free ones?" level="core">
+    3 compute slices (of 7) and 40 GB of memory (4 of the 8 memory slices on an H100). Instances have to start at specific memory-slice positions, and a 3g instance needs memory slices 0–3 or 4–7 in one piece. With 1g.10gb instances at positions 0, 1, 2 and 4, three compute slices are free, but neither half is, so 3g.40gb does not fit. Repartitioning means picking a known-valid layout, not adding up totals.
+  </Q>
+  <Q q="What is the difference between the single and mixed MIG strategies?" level="mid">
+    With single, every MIG instance is advertised as `nvidia.com/gpu`, so pods do not change, but a node should use one profile throughout. With mixed, each profile is its own resource (`nvidia.com/mig-1g.10gb`, `nvidia.com/mig-3g.40gb`), so one node can mix sizes and pods ask for exactly the profile they need.
+  </Q>
+  <Q q="Why does time-slicing with replicas: 4 not let a pod request 2 replicas to get half a GPU?" level="mid">
+    Replicas are just extra advertisements of the same device. Two replicas may be on the same GPU, giving no more time than one, and either way the pod's share depends on how many neighbours are active, not on its request. That is why `failRequestsGreaterThanOne: true` is worth setting: such requests fail with `UnexpectedAdmissionError` instead of silently misleading.
+  </Q>
+  <Q q="Two vLLM pods share a time-sliced GPU. The second one crash-loops at start-up with a memory error, and later the first one occasionally OOMs too. What is happening?" level="senior">
+    Both engines default to `--gpu-memory-utilization` 0.92 of the whole GPU, so the second finds too little free memory at start-up. Even after you set fractions that add up below 1, nothing enforces them under time-slicing: a CUDA graph capture, a sampler buffer or another process on the GPU can push one engine into an OOM at runtime. Fixes: explicit fractions with headroom; MPS with per-client memory limits; or, best, MIG instances, where each engine sees only its own memory.
+  </Q>
+  <Q q="Product asks you to put 20 internal teams' small models on a pool of H100s. How do you design it?" level="senior">
+    Group by isolation need. Teams with production SLOs get MIG instances sized by the fit math (weights + KV for their context and concurrency), using the mixed strategy so pods request exact profiles. Pick a few standard layouts per node pool (for example all-balanced, all-2g) instead of per-team layouts, because repartitioning requires draining. Dev and experimentation go to a separate time-sliced pool with `failRequestsGreaterThanOne` and renamed resources so nobody gets a shared GPU by accident. Consider [multi-LoRA](../multi-lora/) on one shared base model for teams fine-tuning the same base: one engine with adapters beats 20 engines. Watch per-instance utilisation with DCGM and resize layouts quarterly.
+  </Q>
+</Interview>

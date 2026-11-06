@@ -1,0 +1,146 @@
+---
+/* Scheduler filter walk-through for a GPU pod on a small mixed cluster. The reader builds a pod spec
+   (GPU count, product selector, memory affinity, toleration, scoring strategy) and sees, per node,
+   which filter plugin rejects it first (TaintToleration → NodeAffinity → NodeResourcesFit),
+   the score of the survivors, and the exact-shaped FailedScheduling event when nothing fits. */
+---
+<div data-viz="k8s-sched-filter"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, group, select, segmented, checkbox, stats, narration, C } from '../../lib/viz';
+
+  interface Node { name: string; product: string; short: string; memMiB: number; total: number; used: number; taint: boolean; }
+  const NODES: Node[] = [
+    { name: 'cpu-pool-1', product: '', short: '-', memMiB: 0, total: 0, used: 0, taint: false },
+    { name: 'l4-pool-1', product: 'NVIDIA-L4', short: 'L4', memMiB: 23034, total: 1, used: 0, taint: true },
+    { name: 'l40s-pool-1', product: 'NVIDIA-L40S', short: 'L40S', memMiB: 46068, total: 4, used: 2, taint: true },
+    { name: 'h100-pool-1', product: 'NVIDIA-H100-80GB-HBM3', short: 'H100', memMiB: 81559, total: 8, used: 6, taint: true },
+    { name: 'h100-pool-2', product: 'NVIDIA-H100-80GB-HBM3', short: 'H100', memMiB: 81559, total: 8, used: 5, taint: true },
+    { name: 'h200-pool-1', product: 'NVIDIA-H200', short: 'H200', memMiB: 143771, total: 8, used: 6, taint: true },
+  ];
+  const MEM: Record<string, number> = { any: 0, '40': 40000, '80': 80000, '140': 140000 };
+  type Res = 'pass' | 'fail' | 'skip';
+  const W = 940, H = 362, GX = 340, ROW = 40, Y0 = 46;
+  const COLS = [
+    { x: GX + 236, name: 'TaintToleration' },
+    { x: GX + 344, name: 'NodeAffinity' },
+    { x: GX + 452, name: 'NodeResourcesFit' },
+    { x: GX + 545, name: 'Score' },
+  ];
+
+  mountAll('k8s-sched-filter', (root) => {
+    let count = '1', product = 'NVIDIA-H100-80GB-HBM3', mem = 'any', tol = true, strat: 'spread' | 'pack' = 'pack';
+    const b1 = ctrlBar(root);
+    const g1 = group(b1);
+    select(g1, 'nvidia.com/gpu', ['0.5', '1', '2', '4', '8'].map((v) => ({ value: v, label: v })), count, (v) => { count = v; render(); });
+    select(g1, 'gpu.product', [{ value: 'any', label: '(any)' }, { value: 'NVIDIA-H100-80GB-HBM3', label: 'H100' }, { value: 'NVIDIA-H200', label: 'H200' }, { value: 'NVIDIA-L40S', label: 'L40S' }, { value: 'NVIDIA-L4', label: 'L4' }], product, (v) => { product = v; render(); });
+    select(g1, 'gpu.memory', [{ value: 'any', label: '(any)' }, { value: '40', label: '> 40000 MiB' }, { value: '80', label: '> 80000 MiB' }, { value: '140', label: '> 140000 MiB' }], mem, (v) => { mem = v; render(); });
+    const b2 = ctrlBar(root);
+    checkbox(b2, 'Tolerate nvidia.com/gpu taint', tol, (v) => { tol = v; render(); });
+    segmented(b2, [{ value: 'pack', label: 'Score: bin-pack GPUs' }, { value: 'spread', label: 'Score: spread GPUs' }], strat, (v) => { strat = v as 'spread' | 'pack'; render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Pod spec and per-node scheduler filter results' });
+    const say = narration(root);
+    const st = stats(root, ['Feasible nodes', 'Chosen node', 'Free GPUs in cluster']);
+
+    function render() {
+      clear(svg);
+      const n = Number(count);
+      const invalid = !Number.isInteger(n);
+
+      // pod spec
+      rect(svg, 8, 4, GX - 24, H - 8, C.surface2, { rx: 10, stroke: C.border });
+      const y0 = 22, lh = 15.5;
+      const lines: [string, string?][] = [['kind: Pod', 't-bold'], ['spec:']];
+      if (product !== 'any') { lines.push(['  nodeSelector:'], [`    nvidia.com/gpu.product: ${product.replace('NVIDIA-', 'NVIDIA-')}`, 'hl']); }
+      if (mem !== 'any') lines.push(['  affinity: { nodeAffinity: … }'], ['    key: nvidia.com/gpu.memory', 'hl'], [`    operator: Gt  values: ["${MEM[mem]}"]`, 'hl']);
+      if (tol) lines.push(['  tolerations:'], ['  - key: nvidia.com/gpu', 'hl'], ['    operator: Exists', 'hl'], ['    effect: NoSchedule', 'hl']);
+      lines.push(['  containers:'], ['  - name: vllm'], ['    resources:'], ['      limits:'], [`        nvidia.com/gpu: ${invalid ? '500m' : n}`, invalid ? 'bad' : 'hl']);
+      lines.forEach(([l, cls], i) => text(svg, 22, y0 + i * lh, l, { style: 'white-space:pre', class: 't-small t-mono' + (cls === 't-bold' ? ' t-bold' : ''), fill: cls === 'bad' ? C.waste : cls === 'hl' ? C.accent : C.dim }));
+
+      // header
+      text(svg, GX, 18, 'Node', { class: 't-small t-faint t-bold' });
+      text(svg, GX + 168, 18, 'free', { class: 't-small t-faint t-bold' });
+      COLS.forEach((c) => text(svg, c.x, 18, c.name, { class: 't-small t-faint t-bold', 'text-anchor': 'middle' }));
+      text(svg, GX + 344, 33, 'filters run left → right; the first failure stops the node', { class: 't-small t-faint', 'text-anchor': 'middle' });
+
+      if (invalid) {
+        rect(svg, GX, Y0, W - GX - 10, ROW * NODES.length - 8, C.wasteSoft, { rx: 10, stroke: C.waste });
+        text(svg, GX + 20, Y0 + 40, 'The API server rejects the pod before the scheduler ever sees it:', { class: 't-bold', fill: C.waste });
+        text(svg, GX + 20, Y0 + 66, 'spec.containers[0].resources.limits[nvidia.com/gpu]:', { class: 't-small t-mono' });
+        text(svg, GX + 20, Y0 + 84, 'Invalid value: "500m": must be an integer', { class: 't-small t-mono t-bold' });
+        text(svg, GX + 20, Y0 + 116, 'Extended resources are whole devices. Fractions need sharing (time-slicing, MPS, MIG)', { class: 't-small t-dim' });
+        text(svg, GX + 20, Y0 + 134, 'or DRA, which advertise smaller devices that you then request as 1.', { class: 't-small t-dim' });
+        st.set('Feasible nodes', '–', 'pod rejected at admission', C.waste);
+        st.set('Chosen node', 'none', 'nothing to schedule', C.waste);
+        st.set('Free GPUs in cluster', String(NODES.reduce((a, x) => a + x.total - x.used, 0)), 'but none usable as 0.5', C.text);
+        say('<b>No fractions.</b> <code>nvidia.com/gpu</code> is an extended resource: integers only, set in <code>limits</code> (a request, if given, must equal the limit), and never overcommitted. Half a GPU has to come from a sharing mechanism. See <a href="../gpu-sharing/">sharing a GPU</a>.');
+        return;
+      }
+
+      const reasons = { taint: 0, aff: 0, res: 0 };
+      const feas: { i: number; score: number }[] = [];
+      const rows = NODES.map((nd, i) => {
+        const free = nd.total - nd.used;
+        const r: Res[] = ['skip', 'skip', 'skip'];
+        r[0] = nd.taint && !tol ? 'fail' : 'pass';
+        if (r[0] === 'pass') {
+          const prodOk = product === 'any' || nd.product === product;
+          const memOk = mem === 'any' || nd.memMiB > MEM[mem];
+          r[1] = prodOk && memOk ? 'pass' : 'fail';
+        }
+        if (r[1] === 'pass') r[2] = free >= n ? 'pass' : 'fail';
+        if (r[0] === 'fail') reasons.taint++; else if (r[1] === 'fail') reasons.aff++; else if (r[2] === 'fail') reasons.res++;
+        let score = -1;
+        if (r[2] === 'pass') {
+          const after = (nd.used + n) / Math.max(1, nd.total);
+          score = Math.round((strat === 'pack' ? after : 1 - after) * 100);
+          feas.push({ i, score });
+        }
+        return { nd, r, free, score };
+      });
+      const best = feas.length ? feas.reduce((a, b) => (b.score > a.score ? b : a)) : null;
+
+      rows.forEach(({ nd, r, free, score }, i) => {
+        const y = Y0 + i * ROW;
+        const chosen = best && best.i === i;
+        rect(svg, GX - 6, y, W - GX - 4, ROW - 6, chosen ? C.kvSoft : C.surface2, { rx: 8, stroke: chosen ? C.kv : C.border });
+        text(svg, GX + 4, y + 11, nd.name, { class: 't-small t-mono t-bold' });
+        text(svg, GX + 4, y + 25, nd.total ? `${nd.short} · ${nd.memMiB} MiB` : 'no GPUs', { class: 't-small t-faint' });
+        // GPU pips
+        for (let g = 0; g < nd.total; g++) rect(svg, GX + 104 + (g % 8) * 7, y + 9, 5, 14, g < nd.used ? C.mem : C.kv, { rx: 1.5, opacity: g < nd.used ? 0.5 : 1 });
+        text(svg, GX + 168, y + 16, nd.total ? `${free}/${nd.total}` : '0', { class: 't-small t-mono', 'text-anchor': 'start' });
+        r.forEach((res, c) => {
+          const cx = COLS[c].x;
+          const lab = res === 'pass' ? (c === 0 ? (nd.taint ? '✓ tolerated' : '✓ no taint') : '✓ pass') : res === 'fail' ? (c === 0 ? '✗ taint' : c === 1 ? '✗ no match' : '✗ insufficient') : '—';
+          text(svg, cx, y + 16, lab, { 'text-anchor': 'middle', class: 't-small t-bold', fill: res === 'pass' ? C.good : res === 'fail' ? C.waste : C.faint });
+        });
+        text(svg, COLS[3].x, y + 16, score >= 0 ? (chosen ? `${score} ★` : String(score)) : '—', { 'text-anchor': 'middle', class: 't-small t-mono t-bold', fill: chosen ? C.kv : score >= 0 ? C.text : C.faint });
+      });
+
+      const ey = Y0 + NODES.length * ROW + 6;
+      if (!best) {
+        const parts: string[] = [];
+        if (reasons.res) parts.push(`${reasons.res} Insufficient nvidia.com/gpu`);
+        if (reasons.aff) parts.push(`${reasons.aff} node(s) didn't match Pod's node affinity/selector`);
+        if (reasons.taint) parts.push(`${reasons.taint} node(s) had untolerated taint {nvidia.com/gpu: present}`);
+        text(svg, GX - 6, ey + 8, `Warning  FailedScheduling  0/${NODES.length} nodes are available:`, { class: 't-small t-mono t-bold', fill: C.waste });
+        parts.forEach((pt, j) => text(svg, GX + 10, ey + 24 + j * 15, pt + (j === parts.length - 1 ? '.' : ','), { class: 't-small t-mono', fill: C.waste }));
+      } else {
+        text(svg, GX - 6, ey + 8, `Normal  Scheduled  Successfully assigned default/vllm to ${NODES[best.i].name}`, { class: 't-small t-mono', fill: C.good });
+        text(svg, GX - 6, ey + 24, strat === 'pack' ? 'Bin-packing fills the busiest feasible node and keeps whole nodes free for 8-GPU jobs.' : 'Spreading picks the emptiest node: fine for CPU, but it fragments GPUs across nodes.', { class: 't-small t-dim' });
+      }
+
+      const freeAll = NODES.reduce((a, x) => a + x.total - x.used, 0);
+      const freeMatch = rows.filter((r) => r.r[1] === 'pass').reduce((a, r) => a + r.free, 0);
+      st.set('Feasible nodes', `${feas.length} / ${NODES.length}`, 'passed every filter', feas.length ? C.good : C.waste);
+      st.set('Chosen node', best ? NODES[best.i].name : 'Pending', best ? `score ${best.score}` : 'pod stays Pending', best ? C.text : C.waste);
+      st.set('Free GPUs in cluster', String(freeAll), n > 1 && !best && freeMatch >= n ? `${freeMatch} on matching nodes, but not ${n} on one` : `${freeMatch} on nodes that match the pod`, C.text);
+
+      if (!tol) say('Without the toleration every GPU node rejects the pod at the first filter, and the CPU node has no <code>nvidia.com/gpu</code> at all. Many clusters run the <b>ExtendedResourceToleration</b> admission plugin, which adds this toleration automatically to pods that request the resource.');
+      else if (!best && reasons.res && freeMatch >= n) say(`<b>Fragmentation.</b> The nodes that match this pod have ${freeMatch} free GPUs between them, but no single node has ${n}. A pod's GPUs must all come from one node. Bin-packing, gang-aware schedulers and descheduling keep whole nodes free for large requests.`);
+      else if (!best) say('Nothing passes. Read the event bottom-up: it counts nodes by the <b>first</b> filter that rejected them, so "Insufficient nvidia.com/gpu" only covers the nodes that got that far.');
+      else say(`The pod lands on <b>${NODES[best.i].name}</b>. GFD labels make the hardware selectable: <code>gpu.product</code> for an exact model, and <code>gpu.memory</code> with <code>Gt</code> for "at least this much" across products.`);
+    }
+    render();
+  });
+</script>

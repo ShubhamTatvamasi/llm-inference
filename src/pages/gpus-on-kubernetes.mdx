@@ -1,0 +1,142 @@
+---
+layout: ../layouts/Chapter.astro
+title: GPUs on Kubernetes
+description: A GPU node is useless to Kubernetes until a driver, a container runtime hook, a device plugin and a handful of labels are in place. This chapter follows a node from bare metal to schedulable, then looks at how pods ask for GPUs, from integer counts to DRA claims and multi-node gangs.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import K8sBringup from '../components/viz/K8sBringup.astro';
+import K8sSchedFilter from '../components/viz/K8sSchedFilter.astro';
+import K8sDraCompare from '../components/viz/K8sDraCompare.astro';
+import K8sGang from '../components/viz/K8sGang.astro';
+
+The [serving stack](../serving-stack/) chapter wrote `nvidia.com/gpu: 4` into a pod spec and moved on. That one line rests on a lot of machinery. Plug eight H100s into a fresh Kubernetes node and the scheduler sees **none of them**:
+
+- There is **no kernel driver**, so there are no `/dev/nvidia*` device files and nothing can talk to the GPU.
+- The **container runtime** does not know how to put those device files and the driver's user-space libraries (`libcuda.so`, NVML) into a container.
+- **kubelet** only knows about CPU, memory and storage. GPUs reach it as an **extended resource**, and something has to advertise them.
+- The scheduler has **no labels** to tell an L4 from an H200, so it cannot place a 70B model on hardware that can hold it.
+
+The **NVIDIA GPU Operator** installs and manages all of this as a set of DaemonSets, driven by a single custom resource, the `ClusterPolicy` named `cluster-policy`.
+
+## From bare node to schedulable
+
+Each operand depends on the one before it. Step through a node coming up and watch the labels and the allocatable count appear:
+
+<Viz title="A GPU node coming up, operand by operand" label="Step-through">
+  <K8sBringup />
+  <Fragment slot="caption">
+    <p>Play the default first: the driver compile dominates. Switch to a <b>precompiled</b> driver and it drops to under a minute. Then tick <b>Kernel was just patched</b> with the precompiled driver: there is no image for the new kernel, and the whole node stalls behind one DaemonSet. Durations are illustrative.</p>
+  </Fragment>
+</Viz>
+
+| Operand (DaemonSet) | Job | You notice it when… |
+|---|---|---|
+| `node-feature-discovery-worker` | Labels nodes with PCI vendor `10de` (`feature.node.kubernetes.io/pci-10de.present=true`) | Operands never start on a node: it was never identified as a GPU node |
+| `nvidia-driver-daemonset` | Installs user-space libraries, builds or loads the kernel module (`nvidia-driver-ctr`) | Node stuck after a kernel update; everything else waits on it |
+| `nvidia-container-toolkit-daemonset` | Configures containerd, writes the **CDI** spec | Pods start but see no GPU, or fail with a runtime error |
+| `nvidia-device-plugin-daemonset` | Registers with kubelet, advertises `nvidia.com/gpu: N`, marks unhealthy devices | Allocatable is 0 or lower than the number of GPUs |
+| `gpu-feature-discovery` | Labels product, memory, count, compute capability, MIG and MPS capability | Selectors on `nvidia.com/gpu.product` match nothing |
+| `nvidia-mig-manager` | Applies the MIG layout named in `nvidia.com/mig.config` | `nvidia.com/mig.config.state=failed` |
+| `nvidia-dcgm-exporter` | Per-GPU metrics for Prometheus | Dashboards go blank (see [observability](../observability/)) |
+| `nvidia-operator-validator` | Init containers: driver, toolkit, CUDA and plugin validation | Stays in `Init:` while something earlier is broken |
+
+To exclude a node from one operand, label it, for example `nvidia.com/gpu.deploy.driver=false` when the node image already ships a driver. `nvidia.com/gpu.deploy.operands=false` opts a node out of all of them.
+
+<Callout type="note" title="CDI is the default">
+Older setups swapped containerd's default runtime for `nvidia-container-runtime`, or made each GPU pod set `runtimeClassName: nvidia`. Since GPU Operator v25.10 the toolkit generates a **Container Device Interface** (CDI) spec instead: a file that lists exactly which device nodes, libraries and environment a GPU needs. The runtime applies it natively, so ordinary pods no longer need a `runtimeClassName`.
+</Callout>
+
+## The driver, and the kernel-upgrade trap
+
+The driver is the only operand tied to the **exact running kernel**, so it is where most node incidents start. There are three ways to deliver it:
+
+| Option | How it works | Start-up | Kernel patch |
+|---|---|---|---|
+| **Operator-built** (default) | Driver container downloads kernel headers and compiles the module on the node | Minutes, every boot | Rebuilds itself, if headers for the new kernel are available from the package mirror |
+| **Precompiled** (`driver.usePrecompiled=true`) | Image tag is `<driver-branch>-<kernel-version>-<os>`; it just loads the module | Under a minute | Breaks if no image exists for the new kernel: ImagePullBackOff |
+| **Host / node image** (`driver.enabled=false` or per-node label) | Cloud or OS image ships the driver; operator skips it | None | Kernel and driver move together with the image; you own testing them |
+
+Whichever you choose, the failure mode is the same shape: an automatic OS patch reboots the node into a kernel the driver was not built for, the driver pod crash-loops or cannot pull, and every downstream operand stays Pending. **Pin kernel versions** on GPU nodes, roll patches through a canary node pool first, and alert on the driver DaemonSet's ready count, not just on pods.
+
+## Asking for a GPU
+
+From the pod's side, a GPU is an **extended resource** with strict rules:
+
+- **Integers only.** `nvidia.com/gpu: 1` is valid; `0.5` is rejected by the API server. Anything smaller than a GPU has to be advertised as its own device by a [sharing mechanism](../gpu-sharing/).
+- **Set it in `limits`.** If you also set `requests`, it must equal the limit. There is no overcommit.
+- **All GPUs come from one node.** A pod asking for 4 GPUs needs a node with 4 free, however many are free across the cluster.
+- **GPUs are exclusive by default.** Two pods never get the same device unless the node is configured to share it.
+
+Choosing *which* GPU is done with node labels from GPU Feature Discovery. `nvidia.com/gpu.product` gives an exact model, and `nvidia.com/gpu.memory` (in MiB) with a `Gt` node-affinity rule lets you say "at least 80 GB" across products. GPU node pools are usually **tainted** (for example `nvidia.com/gpu=present:NoSchedule`) so CPU-only pods do not take up space on expensive nodes. GPU pods then need a matching toleration.
+
+<Viz title="Why is my GPU pod Pending?" label="Interactive">
+  <K8sSchedFilter />
+  <Fragment slot="caption">
+    <p>Start with 1 GPU on H100 and switch the toleration off: every GPU node fails at the first filter. Ask for <b>4 GPUs</b> with any product: the cluster has 10 free, but no single node has 4 of them. Try <b>0.5</b> to see the admission error. Switch scoring between bin-pack and spread and watch where a 1-GPU pod lands. Cluster and labels are illustrative.</p>
+  </Fragment>
+</Viz>
+
+The `FailedScheduling` event counts each node under the **first** filter that rejected it. "3 Insufficient nvidia.com/gpu" only counts nodes that passed taints and affinity. When a large pod is Pending and the cluster has free GPUs in total, the problem is almost always **fragmentation**: free GPUs are scattered across nodes. Bin-packing (score GPU nodes by how full they will be) keeps whole nodes free for 8-GPU replicas.
+
+## Beyond counting: Dynamic Resource Allocation
+
+The device plugin model has one number per node. It cannot say "an H100 or H200 with at least 80 GiB", "these two containers share one GPU", or "these 16 GPUs must sit in one NVLink domain". **Dynamic Resource Allocation** (DRA, `resource.k8s.io/v1`, GA in Kubernetes 1.34) replaces the count with a structured request:
+
+- A DRA driver publishes every device with typed **attributes** and **capacities** in `ResourceSlice` objects.
+- A **DeviceClass** names a kind of device. The NVIDIA DRA driver (now the kubernetes-sigs `dra-driver-nvidia-gpu` project) provides `gpu.nvidia.com` and `mig.nvidia.com`.
+- A **ResourceClaim**, or a `ResourceClaimTemplate` that stamps one out per pod, asks for devices from a class, filtered by **CEL selectors** on device attributes, such as the GPU's `productName` in the `gpu.nvidia.com` domain.
+- The scheduler allocates matching devices and records the result in the claim. Anything referencing the same claim shares those devices.
+
+<Viz title="Device plugin count vs DRA claim" label="Compare">
+  <K8sDraCompare />
+  <Fragment slot="caption">
+    <p>Pick each requirement and compare the two panels. The device plugin is shorter for "any GPU" and has workarounds for model selection and MIG. It cannot express sharing per workload or a multi-node NVLink domain. YAML is trimmed; exact attribute names come from the driver's ResourceSlices.</p>
+  </Fragment>
+</Viz>
+
+The headline DRA feature for large inference is the **ComputeDomain** (`compute-domain.nvidia.com`). On GB200 and GB300 NVL72 systems, 72 GPUs on many separate nodes share one NVLink fabric. A ComputeDomain sets up the IMEX channels that let pods on different nodes address each other's GPU memory over NVLink, which is what wide [expert parallelism](../moe/) and multi-node [tensor parallelism](../parallelism/) need.
+
+## Multi-node replicas and gang scheduling
+
+A replica that spans nodes, for example pipeline-parallel across three 8-GPU nodes, is not three independent pods. If one rank is missing, the others wait forever. The default scheduler places pods **one at a time**, and that is how clusters deadlock:
+
+<Viz title="Partial placement vs gang admission" label="Step-through">
+  <K8sGang />
+  <Fragment slot="caption">
+    <p>Step through the default first: both groups get two of their three pods, all 32 GPUs are allocated, and nothing serves. Switch to gang admission: one group runs, the other waits without holding anything, and the spare node stays useful.</p>
+  </Fragment>
+</Viz>
+
+Three projects cover this today, and they compose:
+
+- **LeaderWorkerSet** (LWS) models one replica as a leader pod plus N workers, created, restarted and rolled out as a unit. vLLM, SGLang and llm-d multi-node examples use it.
+- **Kueue** adds quota and queueing on top of the default scheduler, admits a workload only when all its pods fit, and offers **Topology Aware Scheduling** to keep a group within a rack or block.
+- **KAI Scheduler** (open-sourced by NVIDIA from Run:ai, now a CNCF Sandbox project) is a replacement scheduler with gang scheduling, hierarchical queues, GPU-aware bin-packing and fractional GPU sharing.
+
+<Callout type="key" title="Schedule the replica, not the pod">
+For anything that spans nodes, the unit of scheduling, health, rollout and autoscaling is the **whole group**. Admit it all-or-nothing, keep it inside one fabric domain, restart it as one, and scale it in whole groups, as the [routing & autoscaling](../routing-autoscaling/) chapter does for single-node replicas.
+</Callout>
+
+<Interview>
+  <Q q="What does the GPU Operator install, and in what order?" level="core">
+    Node Feature Discovery labels GPU nodes (PCI vendor 10de). Then the driver DaemonSet loads the kernel module, the container toolkit configures containerd and writes the CDI spec, the device plugin advertises `nvidia.com/gpu`, GPU Feature Discovery adds product, memory and capability labels, the MIG manager applies MIG layouts, DCGM exporter publishes metrics, and the validator runs driver, toolkit, CUDA and plugin checks. All of it is configured by one `ClusterPolicy`.
+  </Q>
+  <Q q="Can a pod request half a GPU with nvidia.com/gpu: 0.5? What are the rules for extended resources?" level="core">
+    No. Extended resources are integers, set in limits (a request must equal the limit), never overcommitted, and all come from one node. For less than a GPU, the node has to advertise smaller devices: time-slicing or MPS replicas, MIG instances, or DRA devices. The pod then asks for 1 of those.
+  </Q>
+  <Q q="What problem does DRA solve that the device plugin does not?" level="mid">
+    The device plugin exposes a count per node, so the only way to choose hardware is with node labels, which describe the node and not the device. DRA publishes each device with attributes and capacities, lets a claim select devices with CEL, lets several containers or pods share one claim explicitly, and supports structured multi-device setups such as ComputeDomains for multi-node NVLink. It is GA as `resource.k8s.io/v1` from Kubernetes 1.34.
+  </Q>
+  <Q q="Why does a multi-node inference replica need gang scheduling?" level="mid">
+    Its pods are useless individually: tensor- or pipeline-parallel ranks block at start-up until all of them join. Pod-by-pod scheduling can place part of two groups and fill the cluster with GPUs that are allocated but idle, a deadlock. Gang admission (Kueue, KAI Scheduler) places all pods of a group or none, and topology-aware placement keeps them within one rack or NVLink domain. LWS manages the group's lifecycle as one unit.
+  </Q>
+  <Q q="A 4-GPU vLLM pod is Pending with '0/12 nodes are available: 9 Insufficient nvidia.com/gpu, 3 node(s) had untolerated taint'. The dashboard shows 20 free GPUs. What is going on and what do you do?" level="senior">
+    The three tainted nodes are probably a different pool (another team, or a reserved pool) that the pod doesn't tolerate. The other nine fail on resources: 20 free GPUs in total, but no single node has 4 free, because 1- and 2-GPU pods are spread across them. Check per-node allocatable minus allocated (`kubectl describe node`). Short term: drain or reschedule small pods to free a whole node. Long term: bin-pack GPU nodes (MostAllocated scoring on `nvidia.com/gpu`), keep separate pools for small and large replicas, and use a gang- and topology-aware scheduler for multi-GPU work. Also check that allocatable equals the physical GPU count: the device plugin removes unhealthy GPUs (for example after an Xid) from allocatable.
+  </Q>
+  <Q q="After the weekly OS patch, GPU pods on several nodes are Pending and nvidia-driver-daemonset pods are in CrashLoopBackOff. Walk through it." level="senior">
+    The nodes rebooted into a new kernel. The driver container must match the running kernel: an operator-built driver has to compile against it (and fails if headers for that kernel are not on the mirror, or the build breaks on it); a precompiled driver has no image tagged for that kernel (ImagePullBackOff). Until the driver is up, the toolkit, device plugin and validator wait, so allocatable `nvidia.com/gpu` is 0 and pods stay Pending. Read the `nvidia-driver-ctr` logs to confirm. Fix: cordon affected nodes, roll them back to the previous kernel or provide a matching driver image, then uncordon. Prevent it by pinning kernels on GPU pools, patching a canary pool first, and alerting on the driver DaemonSet's ready count.
+  </Q>
+</Interview>

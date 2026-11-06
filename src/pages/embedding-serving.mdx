@@ -1,0 +1,133 @@
+---
+layout: ../layouts/Chapter.astro
+title: Embeddings & Rerankers
+description: Embedding models and rerankers never generate a token. They run one prefill pass and return a vector or a score, which makes them compute-bound, cache-free and cheap to serve if you batch them well.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import EmbedPooling from '../components/viz/EmbedPooling.astro';
+import EmbedPadding from '../components/viz/EmbedPadding.astro';
+import EmbedRag from '../components/viz/EmbedRag.astro';
+import EmbedCost from '../components/viz/EmbedCost.astro';
+
+This chapter is about **serving** models whose output is a vector or a score: the embedding models behind semantic search and RAG, and the rerankers that clean up their results. (For the token embeddings and RoPE inside every LLM, see [Embeddings & Positions](../embeddings/).)
+
+These models are the opposite of chat from the engine's point of view:
+
+- **Prefill only.** One forward pass over the input, then done. There is no [decode](../prefill-decode/) loop, no streaming and no time-per-output-token.
+- **Nothing to keep.** The KV cache lives only for the duration of the pass. No [KV cache](../kv-cache/) is held between requests, so memory goes to batch activations instead of sequences waiting for their next token.
+- **Compute-bound.** A whole sequence is processed at once, so arithmetic intensity is high and the GPU's FLOPS, not its bandwidth, set the [roofline](../roofline/).
+- **Measured differently.** Throughput is sequences/s or tokens/s; latency is a single number per request, with no TTFT/ITL split.
+
+## Three ways to compare text
+
+| Architecture | How it scores (query, document) | Cost at query time | Used for |
+|---|---|---|---|
+| **Bi-encoder** (embedding model) | encode each text separately into one vector, compare with cosine | one pass for the query; documents embedded ahead of time | first-stage retrieval over millions of documents |
+| **Cross-encoder** (reranker) | read query and document **together**, output one relevance score | one pass **per candidate** | re-ordering the top 20–200 candidates |
+| **Late interaction** (ColBERT-style) | keep one vector **per token**; score = sum over query tokens of the best-matching document token | one query pass, cheap scoring, but far more storage | retrieval that needs finer matching than one vector |
+
+A bi-encoder must squeeze a document's meaning into one vector before it knows the question. A cross-encoder lets every query token attend to every document token, so it is much more accurate, but it cannot pre-compute anything. That is why real pipelines use both: a bi-encoder to find 100 candidates in a billion, a cross-encoder to pick the best 5.
+
+## From token vectors to one vector: pooling
+
+A transformer outputs one hidden vector per token. An embedding model reduces them to one vector with a **pooling** rule fixed at training time:
+
+- **CLS pooling**: take the first token's state. BERT-style encoders trained this way use it as a summary.
+- **Mean pooling**: average all real tokens. Common for sentence-transformer models.
+- **Last-token pooling**: take the final token's state. Used by decoder (LLM-based) embedding models, because under causal attention only the last token has seen the whole text.
+
+Then the vector is usually **L2-normalised**, so that a plain dot product equals cosine similarity.
+
+<Viz title="Pooling, padding masks and Matryoshka truncation" label="Interactive">
+  <EmbedPooling />
+  <Fragment slot="caption">
+    <p>Each column is one token's (toy, 8-dimensional) hidden state; the bar underneath is its pooling weight. Switch pooling modes and pairs. Untick <b>mask padding</b> to see mean pooling average in [PAD] states and last-token pooling pick a padding position. Try the "opposite meaning" pair: every pooling rates it highly similar. Then reduce the Matryoshka dimensions. Toy vectors, illustrative.</p>
+  </Fragment>
+</Viz>
+
+**Matryoshka** (MRL) models are trained so that the first *d* dimensions are themselves a usable embedding. You can store 256 of 1,024 dimensions and lose a little recall for 4× less memory. In vLLM the OpenAI-style `dimensions` request field selects the size, and it is rejected for models that were not trained this way.
+
+<Callout type="warn" title="Silent quality bugs">
+The wrong pooling rule, a missing padding mask, or a forgotten **query instruction or prefix** (many retrieval models expect one on queries but not on documents) all produce valid-looking vectors with worse recall. Nothing errors. Check a serving deployment against the model's reference implementation on a few known pairs before indexing anything.
+</Callout>
+
+## Batching without paying for padding
+
+An embedding server sees texts of wildly different lengths: 10-token queries, 300-token chunks, the occasional 4,000-token document. Classic encoder batching pads every sequence to the **longest in the batch**, and every padding position goes through every matmul.
+
+<Viz title="Where the encoder's work goes" label="Interactive">
+  <EmbedPadding />
+  <Fragment slot="caption">
+    <p>Thirty-two texts, three batching strategies. Naive padding commonly wastes over half the compute when one long document lands in a batch of short ones. Sorting by length fixes most of it for offline jobs. Packed (varlen) batching computes no padding at all. Lower the max sequence length to see truncation: those tokens are simply never embedded. Lengths illustrative.</p>
+  </Fragment>
+</Viz>
+
+The practical rules:
+
+- **Batch by tokens, not by count.** Engines with variable-length attention (vLLM, TEI) pack sequences up to a token budget, the same idea as [continuous batching](../batching/) with a [chunked-prefill](../chunked-prefill/)-style budget.
+- **Sort offline jobs by length.** When indexing a corpus, bucketing by length gets most of the benefit even on a padded runtime.
+- **Respect max sequence length.** Text past the model's limit (often 512 tokens for BERT-style encoders) is silently truncated. **Chunk** documents to fit; do not rely on truncation.
+- **Attention is quadratic.** For long-context embedding models, a few long documents dominate the batch's FLOPs, so cap chunk size even when the model allows 8K or more.
+
+## Serving it: engines and endpoints
+
+Two engines cover most deployments:
+
+- **vLLM** runs embedding, reranking and classification models with the **pooling runner** (`--runner pooling`, usually detected automatically). It exposes `/v1/embeddings`, `/pooling`, `/classify`, `/score` and `/rerank` (also `/v1/rerank`). This suits LLM-based embedding models and lets you reuse the same stack as your generative models.
+- **Text Embeddings Inference (TEI)** from Hugging Face is purpose-built for encoders and rerankers, with token-based dynamic batching. It serves `/embed`, `/rerank`, `/predict` and an OpenAI-compatible `/v1/embeddings`.
+
+Both are prefill-only workloads, so the [roofline](../roofline/) points to **FLOPS per dollar**, not HBM bandwidth. A 300M-parameter encoder needs only a few GB of memory, which leaves two sensible shapes. For **bulk indexing**, where you can keep any GPU saturated, cost per embedding is roughly $/hour ÷ FLOPS, and large GPUs are often cheapest. For **live query traffic**, a few hundred requests per second cannot keep an H100 busy, so you pay per hour, not per embedding. A small GPU such as an **L4** (24 GB) or **L40S** (48 GB, no NVLink), neither of which supports MIG, or a single **MIG** slice such as an H100 `1g.10gb` (see [GPU sharing](../gpu-sharing/)) is the better fit.
+
+<Viz title="Throughput, cost and storage" label="Calculator">
+  <EmbedCost />
+  <Fragment slot="caption">
+    <p>Cost per million embeddings by GPU, from a first-order FLOP model: 2 × params × tokens plus attention, at the chosen efficiency (MFU). Small encoders rarely exceed 30–40% MFU. Compare a ~335M encoder on L4 with the same model on H100, then switch to the ~8B model. These are full-load numbers; a GPU that sits half idle costs twice as much per embedding. Below, vector storage = N × dims × bytes, plus an estimated index graph. Prices and efficiencies are illustrative.</p>
+  </Fragment>
+</Viz>
+
+Storage is often the bigger bill. 100M documents × 1,024 dims × 4 bytes = **410 GB** of raw float32 vectors, before any index. Matryoshka truncation to 256 dims, int8 quantization (4×) or binary quantization (32×) bring that down to something that fits in RAM, usually with a second **re-scoring** pass over the top candidates using full-precision vectors or a reranker to recover recall.
+
+## Rerankers and the RAG latency budget
+
+At query time, a RAG request runs a chain: embed the query, search the index, rerank the top-k, then [prefill](../prefill-decode/) the LLM with the best chunks and generate. Each stage spends part of the user's [TTFT](../metrics/) budget.
+
+<Viz title="RAG time to first token, stage by stage" label="Calculator">
+  <EmbedRag />
+  <Fragment slot="caption">
+    <p>Raise top-k and watch the reranker bar grow <b>linearly</b>: a cross-encoder runs one forward pass per (query, chunk) pair. Switch to the LLM-based reranker and k = 200 can cost more than the LLM prefill. Raise the corpus to 10 billion chunks: search time barely moves, but the FP32 index no longer fits on one machine. A first-order model; illustrative.</p>
+  </Fragment>
+</Viz>
+
+What the budget shows:
+
+- **Query embedding and vector search are cheap**, a few milliseconds each. Approximate nearest-neighbour indexes grow roughly with log N in time, and linearly in memory.
+- **The reranker is the knob.** Its cost scales with k × chunk length × reranker size. Rerank 50, not 500. A good reranker also lets you send **fewer chunks** to the LLM, and LLM prefill time falls with prompt length.
+- **Index time and query time are different workloads.** Bulk indexing wants maximum throughput: huge length-sorted batches, cheap GPUs, run offline. Query-time embedding and reranking want low latency with small batches. Run them as separate deployments, or at least with separate priorities, so a re-indexing job never queues behind or in front of live queries.
+
+<Callout type="key" title="Embeddings are tied to their model">
+Vectors from different embedding models, or even different versions of the same model, live in **different spaces** and cannot be compared. Upgrading the embedding model means re-embedding the whole corpus and swapping the index atomically, with the query side switched at the same moment. Budget for it in [capacity planning](../capacity-planning/), and treat the index as sensitive data with access control (OWASP lists vector and embedding weaknesses as LLM08; see [quality & safety](../quality-safety/)).
+</Callout>
+
+<Interview>
+  <Q q="How does serving an embedding model differ from serving a chat model?" level="core">
+    It is prefill only: one forward pass per input and no decode loop. No KV cache is retained between requests, so memory goes to batch activations, and the workload is compute-bound rather than bandwidth-bound. Metrics are sequences/s or tokens/s and per-request latency, not TTFT/ITL. Batching focuses on packing variable-length inputs efficiently rather than on scheduling ongoing sequences.
+  </Q>
+  <Q q="Bi-encoder vs cross-encoder: when do you use each?" level="core">
+    A bi-encoder embeds query and documents independently, so documents can be embedded ahead of time and searched with an ANN index across millions or billions of items. A cross-encoder reads the query and a document together and outputs a relevance score: much more accurate, but it costs a forward pass per candidate and nothing can be pre-computed. Use the bi-encoder for first-stage retrieval and the cross-encoder to rerank the top tens to low hundreds.
+  </Q>
+  <Q q="What is Matryoshka representation learning and what does it buy you?" level="mid">
+    The model is trained so that every prefix of the embedding (the first 64, 128, 256 … dimensions) is itself a usable embedding. You can store truncated vectors to cut memory and search cost several-fold for a modest recall loss, and optionally re-score the top candidates with the full vector. It only works on models trained that way; truncating an ordinary embedding damages it badly.
+  </Q>
+  <Q q="Estimate the memory for 200M documents at 768 dims, and how you would reduce it." level="mid">
+    200M × 768 × 4 bytes ≈ 614 GB in float32, plus index overhead. Options: float16 (307 GB), int8 (154 GB), Matryoshka truncation to 256 dims if the model supports it (205 GB in float32, 51 GB in int8), or binary quantization (≈ 19 GB) with full-precision re-scoring of the top candidates. Product quantization in the index is another route. Measure recall@k after each step.
+  </Q>
+  <Q q="Your embedding service's GPU utilisation is high but throughput is a third of what the benchmark promised. What do you check?" level="senior">
+    Padding waste first: requests mixing short queries and long documents in padded batches can spend most of the compute on padding, so check whether the runtime packs variable-length sequences or at least buckets by length. Then sequence length: real documents may be much longer than the benchmark's, and attention grows quadratically. Then client batching: one text per HTTP request adds per-request overhead, so send lists of inputs. Finally precision (FP32 vs BF16) and whether the model runs on the GPU path at all.
+  </Q>
+  <Q q="After adding a reranker with top-k = 200, p95 RAG latency doubled. What do you do?" level="senior">
+    The reranker runs one pass per (query, chunk) pair, so its cost is linear in k and chunk length; 200 × 512 tokens through a large cross-encoder is a lot of compute per query, and it queues under load. Measure recall at smaller k: 30–50 is usually enough. Truncate chunks for reranking, use a smaller or distilled reranker, give the reranker its own GPU pool with token-based batching, and use its better precision to send fewer chunks to the LLM, which shortens prefill and pays back part of the cost.
+  </Q>
+</Interview>

@@ -1,0 +1,105 @@
+---
+/* Embedding throughput, cost and storage: model + avg tokens + GPU → sequences/s and cost per
+   million embeddings across GPUs; then vector storage = N × dims × bytes with Matryoshka
+   truncation and int8 / binary quantization. First-order FLOP model; illustrative. */
+---
+<div data-viz="embed-cost"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, group, select, slider, stats, legend, narration, hatchDefs, uniq, C, fmt } from '../../lib/viz';
+  import { GPUS } from '../../data/hardware';
+
+  const MODELS = [
+    { id: 'mini', label: '~22M small encoder (384-d)', p: 22e6, L: 6, h: 384, dims: 384, maxLen: 256 },
+    { id: 'base', label: '~110M base encoder (768-d)', p: 110e6, L: 12, h: 768, dims: 768, maxLen: 512 },
+    { id: 'large', label: '~335M large encoder (1024-d)', p: 335e6, L: 24, h: 1024, dims: 1024, maxLen: 512 },
+    { id: 'm3', label: '~570M long-context encoder (1024-d, 8K)', p: 568e6, L: 24, h: 1024, dims: 1024, maxLen: 8192 },
+    { id: 'q06', label: '~0.6B LLM-based (1024-d)', p: 0.6e9, L: 28, h: 1024, dims: 1024, maxLen: 32768 },
+    { id: 'q8', label: '~8B LLM-based (4096-d)', p: 7.6e9, L: 36, h: 4096, dims: 4096, maxLen: 32768 },
+  ];
+  // L4 is not in the shared table; added here with an illustrative price.
+  const GPU_LIST = [{ id: 'l4', name: 'L4 24GB', bf16TF: 121, pricePerHr: 0.7 }, ...GPUS.map((g) => ({ id: g.id, name: g.name, bf16TF: g.bf16TF, pricePerHr: g.pricePerHr }))];
+  const PREC = [
+    { id: 'f32', label: 'float32', bytes: 4 }, { id: 'f16', label: 'float16', bytes: 2 },
+    { id: 'i8', label: 'int8', bytes: 1 }, { id: 'bin', label: 'binary (1 bit)', bytes: 1 / 8 },
+  ];
+  const GRAPH_B = 128; // HNSW-style neighbour lists, ~M=16 × 2 × 4 B per vector (illustrative)
+
+  const W = 940, H = 268, X0 = 150, X1 = 780;
+
+  mountAll('embed-cost', (root) => {
+    let m = MODELS[2], gpuId = 'l4', tok = 256, nLog = 8, eff = 0.35, frac = 1, prec = PREC[0];
+
+    const b1 = ctrlBar(root);
+    const g1 = group(b1);
+    select(g1, 'Model', MODELS.map((x) => ({ value: x.id, label: x.label })), m.id, (v) => { m = MODELS.find((x) => x.id === v)!; render(); });
+    select(g1, 'GPU', GPU_LIST.map((g) => ({ value: g.id, label: g.name })), gpuId, (v) => { gpuId = v; render(); });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'Avg tokens / doc', min: 16, max: 2048, step: 16, value: tok, onInput: (v) => { tok = v; render(); } });
+    slider(b2, { label: 'Documents', min: 5, max: 10, step: 0.5, value: nLog, format: (v) => fmt.num(10 ** v, 0), onInput: (v) => { nLog = v; render(); } });
+    slider(b2, { label: 'Efficiency (MFU)', min: 0.1, max: 0.6, step: 0.05, value: eff, format: (v) => fmt.pct(v), onInput: (v) => { eff = v; render(); } });
+    const b3 = ctrlBar(root);
+    select(b3, 'Matryoshka dims', [{ value: '1', label: 'full' }, { value: '0.5', label: '½' }, { value: '0.25', label: '¼' }, { value: '0.125', label: '⅛' }], '1', (v) => { frac = Number(v); render(); });
+    select(b3, 'Stored as', PREC.map((p) => ({ value: p.id, label: p.label })), prec.id, (v) => { prec = PREC.find((p) => p.id === v)!; render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Cost per million embeddings by GPU, and vector storage size' });
+    const hid = uniq('ech');
+    const st = stats(root, ['Sequences / s / GPU', 'GPU-hours for corpus', 'Cost for corpus', 'Vector storage']);
+    legend(root, [['Cost per 1M embeddings', C.prefill], ['Selected GPU', C.accent], ['Vectors', C.kv], ['Index graph (est.)', C.mem]]);
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      const hatch = hatchDefs(svg, hid, C.faint);
+      const T = Math.min(tok, m.maxLen);
+      const flops = 2 * m.p * T + 4 * m.L * T * T * m.h;
+      const rows = GPU_LIST.map((g) => {
+        const sps = (eff * g.bf16TF * 1e12) / flops;
+        return { ...g, sps, per1M: (1e6 / sps / 3600) * g.pricePerHr };
+      });
+      const maxC = Math.max(...rows.map((r) => r.per1M));
+      text(svg, 6, 10, 'Cost per 1M embeddings', { class: 't-small t-bold t-dim' });
+      text(svg, W - 6, 10, 'sequences / s', { 'text-anchor': 'end', class: 't-small t-bold t-dim' });
+      rows.forEach((r, i) => {
+        const y = 22 + i * 21;
+        const sel = r.id === gpuId;
+        text(svg, 6, y + 8, r.name, { class: 't-small' + (sel ? ' t-bold' : ' t-dim') });
+        rect(svg, X0, y, X1 - X0, 16, C.surface2, { rx: 3 });
+        const w = ((X1 - X0 - 70) * r.per1M) / maxC;
+        rect(svg, X0, y, w, 16, sel ? C.accent : C.prefill, { rx: 3, opacity: sel ? 1 : 0.75 });
+        text(svg, X0 + w + 6, y + 8, `$${r.per1M < 0.1 ? r.per1M.toFixed(3) : r.per1M.toFixed(2)}`, { class: 't-small t-mono' + (sel ? ' t-bold' : '') });
+        text(svg, W - 6, y + 8, fmt.num(r.sps, r.sps < 100 || r.sps >= 1000 ? 1 : 0), { 'text-anchor': 'end', class: 't-small t-mono' + (sel ? ' t-bold' : ' t-dim') });
+      });
+
+      // storage
+      const N = 10 ** nLog;
+      const dims = Math.round(m.dims * frac);
+      const full = N * m.dims * 4;
+      const vec = N * dims * prec.bytes;
+      const graph = N * GRAPH_B;
+      const y0 = 22 + rows.length * 21 + 22;
+      text(svg, 6, y0 - 8, `Storage for ${fmt.num(N, 0)} vectors`, { class: 't-small t-bold t-dim' });
+      const sMax = Math.max(full, vec + graph);
+      const sx = (b: number) => ((X1 - X0) * b) / sMax;
+      text(svg, 6, y0 + 9, `${m.dims}-d float32`, { class: 't-small t-dim' });
+      rect(svg, X0, y0, sx(full), 18, hatch, { rx: 3, stroke: C.border });
+      text(svg, X0 + sx(full) + 6, y0 + 9, fmt.bytes(full), { class: 't-small t-mono t-dim' });
+      text(svg, 6, y0 + 37, `${dims}-d ${prec.label}`, { class: 't-small t-bold' });
+      rect(svg, X0, y0 + 28, Math.max(sx(vec), 1), 18, C.kv, { rx: 3 });
+      rect(svg, X0 + sx(vec), y0 + 28, Math.max(sx(graph), 1), 18, C.mem, { rx: 0, opacity: 0.8 });
+      text(svg, X0 + sx(vec + graph) + 6, y0 + 37, `${fmt.bytes(vec)} + ${fmt.bytes(graph)} index`, { class: 't-small t-mono t-bold' });
+
+      const sel = rows.find((r) => r.id === gpuId)!;
+      const gpuH = N / sel.sps / 3600;
+      st.set('Sequences / s / GPU', fmt.num(sel.sps, 1), `${fmt.num(sel.sps * T, 1)} tokens/s · ${T} tok each`);
+      st.set('GPU-hours for corpus', fmt.num(gpuH, 1), `${fmt.num(N, 0)} docs on ${sel.name.split(' ')[0]}`);
+      st.set('Cost for corpus', `$${fmt.num(gpuH * sel.pricePerHr, 1)}`, `at $${sel.pricePerHr}/GPU-h (illustrative)`);
+      st.set('Vector storage', fmt.bytes(vec + graph), full / vec > 1 ? `vectors ${(full / vec).toFixed(0)}× smaller than full float32` : 'full dims, float32', full / vec >= 8 ? C.good : undefined);
+
+      const truncNote = tok > m.maxLen ? ` Documents longer than ${m.maxLen} tokens are <b>truncated</b>: chunk them before embedding.` : '';
+      const attnShare = (4 * m.L * T * T * m.h) / flops;
+      say(`Each document is one prefill-only forward pass: about <b>${fmt.num(flops / 1e9, 1)} GFLOP</b> at ${T} tokens${attnShare > 0.2 ? `, ${fmt.pct(attnShare)} of it attention, which grows with length²` : ''}. Throughput is compute-bound, so at full load cost per embedding follows <b>$/hour ÷ FLOPS</b>, and big GPUs are often cheapest for bulk indexing. A small GPU or a MIG slice wins when live traffic cannot keep a big GPU busy, because then you pay per hour, not per embedding.${truncNote}${frac < 1 || prec.bytes < 4 ? ' Truncated or quantized vectors lose some recall; re-score the top candidates with full vectors or a reranker.' : ''}`);
+    }
+    render();
+  });
+</script>

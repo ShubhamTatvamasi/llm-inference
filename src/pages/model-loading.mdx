@@ -1,0 +1,156 @@
+---
+layout: ../layouts/Chapter.astro
+title: Model Weights & Loading
+description: A model is a directory of files, and getting those files from storage into HBM is often the slowest part of starting a replica. This chapter covers what is in the directory, which formats are safe and fast, where the bytes should live in a cluster, and the pod settings that make loading reliable.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import LoadTimeCalc from '../components/viz/LoadTimeCalc.astro';
+import LoadSafetensors from '../components/viz/LoadSafetensors.astro';
+import LoadStoragePicker from '../components/viz/LoadStoragePicker.astro';
+
+The [cold-start breakdown](../routing-autoscaling/) showed that a new replica spends much of its start-up time moving weights. This chapter covers that part in detail. Three questions decide how it goes:
+
+- **What exactly are you loading?** The weights alone do not make a working model. The tokenizer, chat template and generation defaults have to match them.
+- **In which format?** Some formats can be memory-mapped and sliced per GPU. Others have to be executed to be read, and some are compiled for a single GPU type.
+- **Where do the bytes come from?** A 140 GB checkpoint takes about 8 minutes to download from the internet and about 25 seconds to read from local NVMe. If twenty replicas download it at the same time, those numbers diverge further.
+
+## What is inside a model repository
+
+A Hugging Face-style model repository for Llama 3.1 70B Instruct holds about 140 GB, nearly all of it weights. The small files matter just as much:
+
+| File | What it holds | What breaks if it's wrong |
+|---|---|---|
+| `config.json` | Architecture: layers, hidden size, heads, KV heads, RoPE scaling, vocab size, `torch_dtype`, and for pre-quantized models a `quantization_config` block | The engine builds the wrong graph, or refuses to load |
+| `model-00001-of-00030.safetensors` … | The weights, **sharded** into files of a few GB each | Missing or mixed-revision shards: load errors or silent garbage |
+| `model.safetensors.index.json` | `weight_map`: tensor name → shard file, plus `total_size` | The loader cannot find tensors |
+| `tokenizer.json`, `tokenizer_config.json` | Vocabulary, merges, special tokens; usually the **chat template** too (sometimes in a separate `chat_template.jinja`) | Wrong token IDs, or [chat formatting](../tokenization/) the model was never trained on |
+| `generation_config.json` | Default sampling (temperature, top-p) and **EOS token IDs** | Generation that never stops, or different defaults than the model card |
+
+Sharding exists for practical reasons: downloads can resume and run in parallel, and no single file goes beyond filesystem or hub limits. Sharding also means a model on disk is a **set of files that must all come from the same revision**. Half-updated caches are a real failure mode.
+
+<Callout type="key" title="Pin the revision, not the name">
+`meta-llama/Llama-3.1-8B-Instruct` is a moving pointer: the repository's `main` branch can gain a fixed chat template or a new `generation_config.json` at any time. Pin a **commit hash**, for example `hf download <repo> --revision <sha> --local-dir <dir>`, or pass the engine's `--revision` flag. Then the weights, tokenizer and template you evaluated are the ones you serve. A repository name in a Deployment is the model equivalent of `image: latest`.
+</Callout>
+
+## Formats: what the bytes look like
+
+**safetensors** is now the default for serving. The format is deliberately simple. Click through the tensors of one shard below, then switch to the pickle view to compare:
+
+<Viz title="Inside a safetensors file" label="Interactive">
+  <LoadSafetensors />
+  <Fragment slot="caption">
+    <p>Click a tensor in the strip, then change the TP degree. Column-parallel tensors (<code>q_proj</code>, <code>gate_proj</code>) give each rank one contiguous byte range. Row-parallel tensors (<code>o_proj</code>, <code>down_proj</code>) give each rank a slice of every row, so its reads are strided. Then switch to the pickle view: there is no index, only a program to execute. Shapes are Llama 3.1 8B layer 0; the order of tensors within the file is illustrative.</p>
+  </Fragment>
+</Viz>
+
+The format has three parts: an **8-byte little-endian integer** giving the header length, a **JSON header** that maps each tensor name to its `dtype`, `shape` and `data_offsets`, and then the raw tensor bytes. Because the offsets are known before any data is read, a loader can **memory-map** the file and copy only the bytes it needs. With [tensor parallelism](../parallelism/), each rank reads only its slice, and the OS faults in only the pages that rank touches. Reading needs no Python object construction and runs no code.
+
+The other formats you will meet:
+
+| Format | Used by | Notes |
+|---|---|---|
+| **Pickle** (`pytorch_model.bin`, `.pt`) | Older checkpoints, training code | Loading executes an opcode stream that can import and call any function. Modern `torch.load` restricts this by default (`weights_only`), but serving stacks should simply refuse these files. |
+| **GGUF** | llama.cpp and its ecosystem | One file holding weights, tokenizer, template and metadata, with many block-[quantization](../quantization/) types. Built for CPU, laptops and edge; datacenter engines support it only partially. |
+| **ONNX** | ONNX Runtime, some embedding/[reranker](../embedding-serving/) stacks | Graph and weights together. Common for small encoders, rare for large decoder LLMs. |
+| **TensorRT-LLM engines** | TensorRT-LLM, Triton | Compiled plans tied to the **GPU architecture, TensorRT version, TP/PP layout and maximum batch/sequence shapes**. Change any of these and you rebuild. Store them as build artifacts, never as the source of truth. |
+| **Pre-quantized safetensors** | vLLM, SGLang, TensorRT-LLM | FP8, AWQ, GPTQ or compressed-tensors checkpoints. Still safetensors, with a `quantization_config` in `config.json` that tells the engine which kernels to use. Half or a quarter of the bytes to move. |
+
+<Callout type="warn" title="trust_remote_code is code execution">
+Some repositories ship Python modeling files and need `--trust-remote-code`. That flag runs those files inside your serving pod, with its service account and network access. Keep it off by default. If a model needs it, review the code at a pinned revision and mirror it, as you would any third-party dependency. See [quality & safety](../quality-safety/) for the wider supply-chain picture.
+</Callout>
+
+## Where the weights live at run time
+
+On Kubernetes, the weights have to come from somewhere at pod start. There are six common patterns:
+
+- **Hub at start-up.** The engine downloads into its cache directory on every start. This is fine for a laptop and fragile in a cluster: every pod pays the full download, egress is shared, and a hub outage or rate limit becomes your outage.
+- **ReadWriteMany PVC.** Download once into an NFS, Lustre or CephFS volume and mount it read-only in every pod. Simple to run, but every replica now reads through the same filer.
+- **Node-local NVMe cache.** A DaemonSet or pre-pull Job writes the weights to each GPU node's local disk, and pods mount them with `hostPath` or a local volume. This is the fastest option, and you have to manage cache eviction and disk space yourself.
+- **Object storage, streamed.** The weights live in S3, GCS or an S3-compatible store. vLLM's `--load-format runai_streamer` reads tensors concurrently into host buffers and copies them to the GPU while later tensors are still downloading, with no local copy.
+- **OCI artifacts.** The weights are packaged as an image layer. KServe **Modelcars** (`storageUri: oci://…`) and Kubernetes **image volumes** (beta and on by default from 1.35, GA in 1.36) mount them read-only. You get digests, signing, registry mirroring and the node's image cache for free. Every model change is a new build and push.
+- **Internal mirror.** A pull-through proxy or artifact repository in front of the hub, with an allow-list. It keeps the hub workflow while removing the dependency on the internet.
+
+Bandwidth is not the only factor. What matters is **bandwidth per replica when several replicas start together**, because scale-out events arrive in bursts:
+
+<Viz title="How long until the weights are in HBM?" label="Calculator">
+  <LoadTimeCalc />
+  <Fragment slot="caption">
+    <p>Start with Llama 3.1 70B from the hub and one replica, then drag the replica count to 20. Shared sources (hub egress, an NFS filer) slow down with every extra replica. Object stores and local disks barely change. Switch to local NVMe and the network disappears from the picture. Then pick the page cache with 1 GPU per replica: the bottleneck moves to the PCIe copy into HBM, which more GPUs per replica parallelise. Bandwidths are illustrative round numbers. Engine start-up and warm-up (covered in <a href="../routing-autoscaling/">routing & autoscaling</a>) come on top.</p>
+  </Fragment>
+</Viz>
+
+There is no single right answer. The trade-offs shift with fleet size, update frequency, model size and whether the cluster can reach the internet:
+
+<Viz title="Choosing where weights live" label="Interactive">
+  <LoadStoragePicker />
+  <Fragment slot="caption">
+    <p>Tick air-gapped and the hub disappears. Move to ~20 replicas and the shared filer loses to options that scale out. Switch to daily fine-tunes and update agility starts to count, which favours object storage over images rebuilt per model. With a 671B model, local caches win, because nobody wants 700 GB per cold start. The scores are judgement calls meant to show the trade-offs, not measurements.</p>
+  </Fragment>
+</Viz>
+
+A pattern that works at most sizes is **one immutable source of truth plus a cache near the GPU**. The source of truth is a mirror, a bucket or an OCI artifact addressed by digest or commit hash. The cache is a node-local copy that pre-pull jobs warm before the autoscaler needs it.
+
+## How tensor parallelism changes the read
+
+With TP = 4, each of four worker processes needs a quarter of every large matrix. How the loader gets there matters:
+
+- With **safetensors + mmap**, each rank maps the shard files and copies out only its slice. Column-parallel slices are contiguous. Row-parallel slices are strided, a piece of every row. Each rank moves about 1/TP of the bytes to its GPU, but the files and page cache are shared on the node. If the page cache is cold, the disk sees roughly one full read in total.
+- With **pickle**, every rank unpickles the full state dict into CPU memory and then throws away three quarters of it. Host RAM briefly needs TP × the checkpoint size.
+- **Pre-sharded checkpoints** (one file set per rank, saved after a first load) and **TensorRT-LLM engines** turn this into a plain sequential read per rank. They are tied to that exact TP layout.
+
+The host-to-GPU copy runs over **one PCIe link per GPU** (Gen5 x16, about 64 GB/s per direction peak; loaders reach a fraction of that). Adding GPUs to a replica therefore speeds up the last stage, until host memory bandwidth or the loader's CPU threads become the limit.
+
+## Pod settings that make loading reliable
+
+```yaml
+spec:
+  containers:
+    - name: vllm
+      image: vllm/vllm-openai:<pinned-version>
+      args: ["/models/llama-3.1-70b-instruct",          # local path, not a hub name
+             "--tensor-parallel-size", "4",
+             "--load-format", "safetensors"]
+      env:
+        - { name: HF_HUB_OFFLINE, value: "1" }            # never reach for the internet at start
+        - { name: HF_HOME, value: /cache/hf }              # tokenizer/config cache on a volume
+      resources:
+        limits: { nvidia.com/gpu: 4, memory: 200Gi }        # host RAM: see below
+        requests: { memory: 200Gi }
+      volumeMounts:
+        - { name: weights, mountPath: /models, readOnly: true }
+        - { name: shm, mountPath: /dev/shm }
+        - { name: hf-cache, mountPath: /cache/hf }
+  volumes:
+    - name: shm
+      emptyDir: { medium: Memory, sizeLimit: 16Gi }        # NCCL / multiprocess workers
+```
+
+- **`/dev/shm`.** Containers get 64 MiB by default. TP workers and NCCL use shared memory for inter-process communication, and too little shows up as hangs or bus errors at start-up. An `emptyDir` with `medium: Memory` fixes it. Its contents are tmpfs pages and **count against the container's memory limit**.
+- **Host memory during load.** GPU memory is not the only thing that runs out. Loaders hold CPU copies of tensors, pinned staging buffers and, with pickle, full state dicts per rank. If the memory limit is sized for steady state, the pod is **OOMKilled** halfway through loading, which looks like a crash loop with no Python traceback. Measure the peak RSS during a load and set the limit above it.
+- **Offline mode.** `HF_HUB_OFFLINE=1` makes any accidental hub access fail fast instead of hanging on a firewall. It catches a hub name left in the args, or a tokenizer fetched separately from the weights.
+- **Cache directories on volumes.** Point `HF_HOME` (or the engine's download directory) at a volume, never the container's writable layer. Otherwise each restart downloads again, and the node's ephemeral storage fills up until the kubelet evicts pods.
+- **Probes.** Size the startup probe for the slowest realistic load, including the 20-replica case from the calculator above. The [cold-start chapter](../routing-autoscaling/) covers the probe design.
+
+<Interview>
+  <Q q="What files besides the weights does an LLM need to serve correctly, and what happens if they don't match?" level="core">
+    `config.json` (architecture and quantization config), the tokenizer files, the chat template (in `tokenizer_config.json` or `chat_template.jinja`) and `generation_config.json` (EOS IDs, default sampling). A mismatched tokenizer gives wrong token IDs. A wrong template gives prompts in a format the model was never trained on. A missing generation config can leave out the real EOS token, so output never stops. Pin all of them to the same commit as the weights.
+  </Q>
+  <Q q="Why is safetensors preferred over pickle checkpoints for serving?" level="core">
+    Safety and speed. A pickle is an opcode stream that can import and call arbitrary functions, so loading an untrusted file is code execution. Safetensors is an 8-byte length, a JSON header of names, dtypes, shapes and offsets, then raw bytes. Nothing executes. The offsets let loaders memory-map the file and read only each TP rank's slice, without materialising the whole state dict in CPU memory.
+  </Q>
+  <Q q="Compare a RWX PVC, node-local NVMe and OCI-packaged weights for a 70B model." level="mid">
+    A RWX PVC is the simplest: download once and mount everywhere. Every replica reads through the same filer, so scale-out events saturate it, and the volume is mutable. Node-local NVMe gives the fastest starts with no network, but you have to build pre-pull, eviction and warm-node scheduling. OCI artifacts (Modelcars, image volumes) are immutable, digest-pinned, signable and mirror like any image, and the node image cache makes them local after the first pull. The cost is a build per model version and slow pulls for very large models. A common answer combines them: an immutable source of truth plus a node-local cache.
+  </Q>
+  <Q q="How does tensor parallelism change what each process reads at load time?" level="mid">
+    Each rank needs only its slice of each sharded matrix. Column-parallel weights split along the output dimension, which is contiguous in a row-major file. Row-parallel weights split along the input dimension, so each rank reads a strided piece of every row. With mmap'd safetensors, each rank copies roughly 1/TP of the bytes to its GPU, and the page cache is shared on the node. With pickle, every rank deserialises everything. Pre-sharded checkpoints make each rank's read sequential, but only for that TP size.
+  </Q>
+  <Q q="During a traffic spike the autoscaler adds 20 replicas, and they take 25 minutes to become ready instead of the usual 4. Nothing changed in the deployment. Why, and what do you change?" level="senior">
+    The usual 4 minutes was measured one replica at a time. Twenty replicas pulling from a **shared** source (hub egress, a NAT gateway or an NFS filer) split its bandwidth twenty ways, so each one is roughly 20× slower to download. Startup probes may also have killed and restarted some pods, which made it worse. Fixes: serve from something that scales out (object storage with concurrent streaming, or a registry with node caches), pre-stage weights on GPU nodes before peaks, keep warm capacity for predictable ramps, and size startup probes for the worst case.
+  </Q>
+  <Q q="A TP=8 pod for a 405B model is OOMKilled during start-up even though the GPUs have plenty of memory. What's going on?" level="senior">
+    The kill comes from the **host** memory cgroup, not from the GPU. During load, the eight worker processes hold CPU-side tensors and pinned staging buffers. If the checkpoint is a pickle, or the loader materialises full shards, peak RSS can reach several times the per-rank share. A `/dev/shm` emptyDir in memory also counts against the limit. Check `lastState.terminated.reason: OOMKilled`, measure peak RSS during a load, raise the memory limit and request (or use a node-sized pod), switch to mmap'd safetensors, and keep `/dev/shm` sized but bounded.
+  </Q>
+</Interview>

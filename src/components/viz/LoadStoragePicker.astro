@@ -1,0 +1,109 @@
+---
+/* Where should the weights live? A scored matrix of six storage approaches against six criteria.
+   Toggles (air-gapped, replicas starting together, update frequency, model size) change the
+   weight of each criterion and rule options in or out; the best-scoring row is recommended.
+   Scores are judgement calls on a 0–3 scale, meant to show the trade-offs, not to be a benchmark. */
+---
+<div data-viz="load-storage"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, segmented, checkbox, narration, C } from '../../lib/viz';
+
+  const CRIT = [
+    { id: 'speed', name: 'Cold-start speed' },
+    { id: 'fan', name: 'Many replicas at once' },
+    { id: 'air', name: 'Works air-gapped' },
+    { id: 'agile', name: 'Quick model updates' },
+    { id: 'simple', name: 'Simple to run' },
+    { id: 'pin', name: 'Immutable, pinned' },
+  ] as const;
+  type CId = typeof CRIT[number]['id'];
+  interface Opt { id: string; name: string; sub: string; sc: Record<CId, number>; why: string; }
+  const OPTS: Opt[] = [
+    { id: 'hub', name: 'Hub at start-up', sub: 'each pod downloads', sc: { speed: 0, fan: 0, air: 0, agile: 3, simple: 3, pin: 1 }, why: 'Zero setup, but every pod pays the full download, egress is shared, and a hub outage or rate limit becomes your outage.' },
+    { id: 'mirror', name: 'Internal mirror', sub: 'pull-through proxy / registry', sc: { speed: 1, fan: 1, air: 3, agile: 2, simple: 2, pin: 3 }, why: 'Same workflow as the hub, but the bytes come from inside your network, with a reviewed allow-list of repos and revisions.' },
+    { id: 'pvc', name: 'RWX PVC', sub: 'NFS, Lustre, CephFS…', sc: { speed: 1, fan: 1, air: 3, agile: 3, simple: 2, pin: 1 }, why: 'Download once, mount everywhere. Simple until a scale-out event sends 20 replicas through the same filer heads; and anyone with write access can change a live model.' },
+    { id: 'nvme', name: 'Node-local NVMe cache', sub: 'DaemonSet pre-pull / hostPath', sc: { speed: 3, fan: 3, air: 3, agile: 1, simple: 1, pin: 2 }, why: 'Fastest possible start because nothing crosses the network. You own the cache: pre-pull jobs, eviction, disk-full alerts, and making sure the scheduler prefers warm nodes.' },
+    { id: 'stream', name: 'Object storage, streamed', sub: 'S3/GCS + runai_streamer', sc: { speed: 2, fan: 3, air: 2, agile: 3, simple: 1, pin: 2 }, why: 'Object stores scale horizontally, and streaming overlaps the network read with the GPU copy. Air-gapped sites need an S3-compatible store inside the boundary.' },
+    { id: 'oci', name: 'OCI artifact', sub: 'Modelcar / image volume', sc: { speed: 2, fan: 2, air: 3, agile: 1, simple: 2, pin: 3 }, why: 'Weights become an immutable, digest-addressed, signable artifact that rides your existing registry, mirroring and node image cache. Every model change is a new build and push.' },
+  ];
+
+  const W = 920, H = 330;
+
+  mountAll('load-storage', (root) => {
+    let air = false, reps = 'few', upd = 'monthly', size = 'mid';
+    const b1 = ctrlBar(root);
+    checkbox(b1, 'Air-gapped cluster', air, (v) => { air = v; render(); });
+    segmented(b1, [{ value: 'few', label: '1–2 replicas' }, { value: 'many', label: '~20 at once' }, { value: 'huge', label: '100+ nodes' }], reps, (v) => { reps = v; render(); });
+    const b2 = ctrlBar(root);
+    segmented(b2, [{ value: 'monthly', label: 'Model changes monthly' }, { value: 'daily', label: 'daily (fine-tunes)' }], upd, (v) => { upd = v; render(); });
+    segmented(b2, [{ value: 'small', label: '8B (16 GB)' }, { value: 'mid', label: '70B (140 GB)' }, { value: 'big', label: '671B (~700 GB)' }], size, (v) => { size = v; render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Matrix scoring model storage options against operational criteria' });
+    const say = narration(root);
+
+    function weights(): Record<CId, number> {
+      return {
+        speed: size === 'big' ? 3 : size === 'mid' ? 2 : 1,
+        fan: reps === 'few' ? 0.5 : reps === 'many' ? 2.5 : 3.5,
+        air: 0, // handled as a hard constraint below
+        agile: upd === 'daily' ? 2.5 : 0.8,
+        simple: reps === 'few' ? 2.5 : 1,
+        pin: 1.2,
+      };
+    }
+    function adjusted(o: Opt): Record<CId, number> {
+      const sc = { ...o.sc };
+      if (size === 'big') { if (o.id === 'oci') { sc.speed = 1; sc.simple = 1; } if (o.id === 'pvc') sc.fan = 0; if (o.id === 'mirror') sc.speed = 0; }
+      if (size === 'small') { if (o.id === 'hub') sc.speed = 1; if (o.id === 'pvc') sc.speed = 2; }
+      return sc;
+    }
+
+    function render() {
+      clear(svg);
+      const wt = weights();
+      const rows = OPTS.map((o) => {
+        const sc = adjusted(o);
+        const out = air && sc.air === 0;
+        const score = (Object.keys(wt) as CId[]).reduce((a, k) => a + wt[k] * sc[k], 0);
+        return { o, sc, out, score };
+      });
+      const max = Math.max(...rows.filter((r) => !r.out).map((r) => r.score));
+      const best = rows.find((r) => !r.out && r.score === max)!;
+
+      const NX = 20, CX0 = 250, CWd = 84, SX = CX0 + CRIT.length * CWd + 10, Y0 = 52, RH = 42;
+      CRIT.forEach((c, j) => {
+        const x = CX0 + j * CWd + CWd / 2;
+        const words = c.name.split(' ');
+        const mid = Math.ceil(words.length / 2);
+        text(svg, x, 14, words.slice(0, mid).join(' '), { 'text-anchor': 'middle', class: 't-small t-bold' });
+        text(svg, x, 28, words.slice(mid).join(' '), { 'text-anchor': 'middle', class: 't-small t-bold' });
+        const w = c.id === 'air' ? (air ? 'must' : '—') : `×${wt[c.id].toFixed(1)}`;
+        text(svg, x, 42, w, { 'text-anchor': 'middle', class: 't-small t-mono', fill: c.id === 'air' && air ? C.waste : wt[c.id] >= 2 ? C.accent : C.faint });
+      });
+      text(svg, SX, 28, 'Weighted score', { class: 't-small t-bold' });
+
+      rows.forEach((r, i) => {
+        const y = Y0 + i * RH;
+        const isBest = r === best;
+        rect(svg, NX - 6, y, W - NX - 8, RH - 6, isBest ? C.accentSoft : i % 2 ? 'transparent' : C.surface2, { rx: 8, stroke: isBest ? C.accent : 'none', opacity: r.out ? 0.5 : 1 });
+        text(svg, NX + 4, y + 13, r.o.name, { class: 't-bold t-small' + (r.out ? ' t-faint' : '') });
+        text(svg, NX + 4, y + 28, r.out ? 'ruled out: needs the internet' : r.o.sub, { class: 't-small', fill: r.out ? C.waste : C.dim });
+        CRIT.forEach((c, j) => {
+          const v = r.sc[c.id];
+          const cx = CX0 + j * CWd + CWd / 2 - 21;
+          for (let k = 0; k < 3; k++) {
+            s('circle', { cx: cx + k * 14 + 7, cy: y + RH / 2 - 3, r: 5, fill: k < v ? (v === 3 ? C.good : v === 2 ? C.kv : C.prefill) : 'transparent', stroke: k < v ? 'none' : C.borderStrong, 'stroke-width': 1, opacity: r.out ? 0.4 : 1 }, svg);
+          }
+        });
+        const bw = r.out ? 0 : (r.score / max) * (W - SX - 60);
+        rect(svg, SX, y + 8, Math.max(bw, 2), RH - 22, isBest ? C.accent : C.borderStrong, { rx: 4 });
+        text(svg, SX + Math.max(bw, 2) + 6, y + RH / 2 - 3, r.out ? '—' : r.score.toFixed(1), { class: 't-small t-mono t-bold', fill: isBest ? C.accent : C.dim });
+      });
+      text(svg, NX, H - 10, 'Dots: 0–3, judgement-based. Toggles change the weight of each column; air-gapped is a hard constraint.', { class: 't-small t-faint' });
+
+      const runner = rows.filter((r) => !r.out && r !== best).sort((a, b) => b.score - a.score)[0];
+      say(`<b>Recommended: ${best.o.name}.</b> ${best.o.why} <span style="color:var(--text-dim)">Runner-up: ${runner.o.name}. In practice teams combine two: a pinned, immutable source of truth (mirror, object store or OCI artifact) feeding a fast local cache on each node.</span>`);
+    }
+    render();
+  });
+</script>

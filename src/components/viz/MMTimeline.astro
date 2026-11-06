@@ -1,0 +1,127 @@
+---
+/* Where the time to first token goes for an image request: upload or fetch → CPU decode/resize →
+   vision encoder → LLM prefill. Toggles for client-side downscaling, URL vs base64, a cache hit on a
+   repeated image, and a CPU-contended API server. Animated like the cold-start bar.
+   Illustrative constants: JPEG ≈ 0.3 B/pixel, 50 Mbit/s client uplink, decode+resize ≈ 12 ms/MP per image
+   on one core, 7B VLM on an H100 at ~30–35% of BF16 peak, max_pixels = 1280 tokens (28 px per token). */
+---
+<div data-viz="mm-timeline"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, group, select, slider, checkbox, player, stats, narration, C, fmt } from '../../lib/viz';
+
+  const PRESETS = [
+    { id: 'phone', label: 'Phone photo 12 MP', w: 4032, h: 3024 },
+    { id: 'shot', label: 'Screenshot 1080p', w: 1920, h: 1080 },
+    { id: 'doc', label: 'A4 scan 300 dpi', w: 2480, h: 3508 },
+  ];
+  const TEXT_TOK = 400, MAX_TOK = 1280;
+  const W = 940, H = 250, X0 = 20, X1 = 920;
+
+  function nativeTokens(w: number, h: number) {
+    const F = 28, maxPx = MAX_TOK * 784;
+    let hb = Math.round(h / F) * F, wb = Math.round(w / F) * F;
+    if (hb * wb > maxPx) { const b = Math.sqrt((h * w) / maxPx); hb = Math.floor(h / b / F) * F; wb = Math.floor(w / b / F) * F; }
+    return (hb / F) * (wb / F);
+  }
+
+  mountAll('mm-timeline', (root) => {
+    let preset = PRESETS[0], n = 2;
+    const on = { down: false, url: false, hit: false, busy: false };
+    let t = 0;
+
+    const bar = ctrlBar(root);
+    const b1 = ctrlBar(root);
+    const g = group(b1);
+    select(g, 'Image', PRESETS.map((p) => ({ value: p.id, label: p.label })), preset.id, (v) => { preset = PRESETS.find((p) => p.id === v)!; t = 0; render(); });
+    slider(b1, { label: 'Images per request', min: 1, max: 8, value: n, onInput: (v) => { n = v; t = 0; render(); } });
+    const b2 = ctrlBar(root);
+    checkbox(b2, 'Client downscales to 1280 px', false, (v) => { on.down = v; t = 0; render(); });
+    checkbox(b2, 'Send URL, not base64', false, (v) => { on.url = v; t = 0; render(); });
+    checkbox(b2, 'Same images seen before (cache hit)', false, (v) => { on.hit = v; t = 0; render(); });
+    checkbox(b2, 'Busy API server CPU', false, (v) => { on.busy = v; t = 0; render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Time to first token for an image request, split into upload, preprocessing, encoder and prefill' });
+    const say = narration(root);
+    const st = stats(root, ['TTFT (this config)', 'Image tokens', 'Request body', 'Spent off the GPU']);
+
+    function phases(opt: typeof on) {
+      let w = preset.w, h = preset.h;
+      if (opt.down) { const k = Math.min(1, 1280 / Math.max(w, h)); w = Math.round(w * k); h = Math.round(h * k); }
+      const mp = (w * h) / 1e6;
+      const bytes = mp * 1e6 * 0.3; // JPEG-ish
+      const tokPer = nativeTokens(w, h);
+      const tok = tokPer * n;
+      const body = opt.url ? 600 + n * 120 : n * bytes * (4 / 3) + 2000;
+      const upload = opt.url ? 0.03 + (n * bytes) / 200e6 : body / 6.25e6; // URL: server fetches from a nearby bucket at ~200 MB/s
+      const cpuMul = opt.busy ? 4 : 1;
+      const hash = (n * bytes) / 1.5e9;
+      const pre = opt.hit ? hash : (n * mp * 0.012 + 0.004 * n) * cpuMul + hash;
+      const patches = tok * 4;
+      const enc = opt.hit ? 0 : (2 * 0.67e9 * patches) / (989e12 * 0.3) + 0.004 * n;
+      const preTok = opt.hit ? TEXT_TOK : TEXT_TOK + tok;
+      const prefill = (2 * 7.6e9 * preTok) / (989e12 * 0.35) + 0.01;
+      return {
+        tok, body,
+        list: [
+          { key: 'up', name: opt.url ? 'Server fetches URL' : 'Upload (base64)', d: upload, color: C.comm, what: opt.url ? 'The client sends a short URL; the server fetches the image from a nearby bucket. Fast here, but now the server depends on that bucket and must guard against fetching arbitrary URLs.' : 'The image travels inside the JSON body as base64, which is 4/3 the size of the file. On a mobile or office uplink this alone can dominate.' },
+          { key: 'cpu', name: opt.hit ? 'Hash (cache hit)' : 'CPU decode + resize', d: pre, color: C.mem, what: opt.hit ? 'The image bytes are hashed; the hash matches an earlier request, so decoding, resizing and the encoder are skipped.' : `JPEG decode and resize of ${(mp).toFixed(1)} MP per image on the API server's CPU${opt.busy ? ', competing with tokenization and other requests' : ''}. The GPU sits idle for this request meanwhile.` },
+          { key: 'enc', name: 'Vision encoder', d: enc, color: C.compute, what: 'The ViT runs over every 14 px patch, then the merger turns each 2×2 group into one LLM token embedding.' },
+          { key: 'pf', name: 'LLM prefill', d: prefill, color: C.prefill, what: opt.hit ? 'With the image tokens already in the prefix cache, only the text after them is prefilled.' : `Prefill over ${fmt.int(preTok)} tokens, ${fmt.int(tok)} of them image tokens. They write KV exactly like text.` },
+        ],
+      };
+    }
+
+    const SLOW = () => phases({ down: false, url: false, hit: false, busy: false });
+    const total = () => phases(on).list.reduce((a, p) => a + p.d, 0);
+    function reset() { t = 0; }
+    function step() { const T = total(); t = Math.min(T, t + T / 60); return t < T; }
+
+    function render() {
+      clear(svg);
+      const P = phases(on), base = SLOW();
+      const T = P.list.reduce((a, p) => a + p.d, 0), TB = base.list.reduce((a, p) => a + p.d, 0);
+      const scale = (X1 - X0) / Math.max(T, TB);
+      text(svg, X0, 14, 'No optimisations', { class: 't-small t-faint' });
+      let x = X0;
+      base.list.forEach((p) => { rect(svg, x, 24, p.d * scale, 8, p.color, { rx: 0, opacity: 0.35 }); x += p.d * scale; });
+      text(svg, X1, 14, fmt.ms(TB * 1000), { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+
+      text(svg, X0, 54, 'This configuration', { class: 't-small t-bold' });
+      x = X0; let acc = 0, cur = 0;
+      P.list.forEach((p, i) => {
+        const w = p.d * scale;
+        rect(svg, x, 64, w, 40, C.surface2, { rx: 0, stroke: C.border });
+        const filled = Math.max(0, Math.min(p.d, t - acc));
+        if (filled > 0) rect(svg, x, 64, filled * scale, 40, p.color, { rx: 0, opacity: 0.9 });
+        if (t >= acc && t < acc + p.d) cur = i;
+        if (w > 92) text(svg, x + 6, 84, p.name, { class: 't-small t-bold', fill: filled > p.d * 0.5 ? 'var(--bg)' : C.text });
+        if (w > 40) text(svg, x + 6, 116, fmt.ms(p.d * 1000), { class: 't-small t-mono t-faint' });
+        acc += p.d; x += w;
+      });
+      line(svg, X0 + t * scale, 58, X0 + t * scale, 110, C.accent);
+      if (t >= T) text(svg, Math.max(X0 + T * scale, 330), 54, `first token at ${fmt.ms(T * 1000)} ▾`, { class: 't-small t-bold', fill: C.good, 'text-anchor': 'end' });
+
+      // breakdown list
+      P.list.forEach((p, i) => {
+        const cx = X0 + i * 228, cy = 150;
+        rect(svg, cx, cy, 218, 62, C.surface2, { rx: 8, stroke: i === cur && t > 0 && t < T ? C.accent : C.border });
+        rect(svg, cx, cy, 5, 62, p.color, { rx: 2 });
+        text(svg, cx + 14, cy + 16, p.name, { class: 't-small t-bold' });
+        text(svg, cx + 14, cy + 36, fmt.ms(p.d * 1000), { class: 't-mono t-bold' });
+        text(svg, cx + 206, cy + 36, fmt.pct(p.d / T), { 'text-anchor': 'end', class: 't-small t-mono t-dim' });
+        text(svg, cx + 14, cy + 52, i < 2 ? 'CPU / network' : 'GPU', { class: 't-small t-faint' });
+      });
+      const off = (P.list[0].d + P.list[1].d) / T;
+      text(svg, X0, H - 12, `${n} × ${preset.label}${on.down ? ' (downscaled)' : ''} + ${TEXT_TOK} text tokens · max_pixels = ${MAX_TOK} tokens per image`, { class: 't-small t-dim' });
+
+      st.set('TTFT (this config)', fmt.ms(T * 1000), `vs ${fmt.ms(TB * 1000)} unoptimised`, T < TB * 0.5 ? C.good : undefined);
+      st.set('Image tokens', fmt.int(P.tok), `${fmt.int(P.tok / n)} per image`);
+      st.set('Request body', fmt.bytes(P.body), P.body > 1024 * 1024 ? 'over nginx\'s 1 MB default body limit' : 'fits common proxy limits', P.body > 1024 * 1024 ? C.waste : undefined);
+      st.set('Spent off the GPU', fmt.pct(off), 'upload + preprocessing', off > 0.5 ? C.waste : undefined);
+      say(t >= T ? `<b>First token at ${fmt.ms(T * 1000)}.</b> ${fmt.pct(off)} of it was spent before the GPU saw the request. Now tick the options and press Play again.` : t === 0 ? 'Press <b>Play</b>, then tick the options one at a time. Notice how little of the default TTFT is GPU work: the image is large on the wire and on the CPU long before it becomes ~1,280 tokens.' : `<b>${P.list[cur].name}.</b> ${P.list[cur].what}`);
+    }
+
+    player(bar, root, { step, reset, render, interval: 60, autoplay: false });
+  });
+</script>

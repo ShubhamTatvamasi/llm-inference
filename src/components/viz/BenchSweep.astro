@@ -1,0 +1,144 @@
+---
+/* Concurrency sweep vs request-rate sweep on the same simulated replica.
+   One continuous-batching engine (64 slots, 512-token chunked-prefill budget). A closed-loop
+   client keeps N requests in flight; an open-loop client fires Poisson arrivals at rate λ.
+   Both sweeps are plotted as latency–throughput curves (p99 TTFT, ITL) with SLO lines and the
+   goodput-optimal sweep point marked. Illustrative step-time model, not a specific GPU. */
+---
+<div data-viz="bench-sweep"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, group, slider, segmented, stats, legend, narration, C, rng } from '../../lib/viz';
+
+  type Mode = 'closed' | 'open';
+  interface Point { level: number; rps: number; tps: number; ttft50: number; ttft99: number; itl50: number; itl99: number; maxQ: number; }
+
+  const CLOSED = [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 80, 96, 128];
+  const OPEN = [1, 2, 3, 4, 5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 10, 12];
+  const N = 800, WARM = 80, MAXSEQ = 64, BUDGET = 512;
+
+  function sim(mode: Mode, level: number): Point {
+    const r = rng(11);
+    const g = () => { let u = 0; while (u === 0) u = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * r()); };
+    const spec = Array.from({ length: N }, () => ({
+      P: Math.round(Math.min(4000, Math.max(64, 800 * Math.exp(0.6 * g())))),
+      O: Math.round(Math.min(800, Math.max(16, 200 * Math.exp(0.5 * g())))),
+    }));
+    interface R { arr: number; O: number; pre: number; out: number; first: number; last: number; }
+    let now = 0, issued = 0, done = 0, nextArr = 0, maxQ = 0;
+    const waiting: R[] = []; let running: R[] = []; const fin: R[] = []; const gaps: number[] = [];
+    const make = (t: number): R => { const x = spec[issued++]; return { arr: t, O: x.O, pre: x.P, out: 0, first: -1, last: 0 }; };
+    if (mode === 'closed') for (let i = 0; i < level; i++) waiting.push(make(0));
+    else nextArr = -Math.log(1 - r()) / level;
+    let guard = 0;
+    while (done < N && guard++ < 400000) {
+      if (mode === 'open') while (issued < N && nextArr <= now) { waiting.push(make(nextArr)); nextArr += -Math.log(1 - r()) / level; }
+      if (!waiting.length && !running.length) { if (mode === 'open' && issued < N) { now = nextArr; continue; } break; }
+      while (waiting.length && running.length < MAXSEQ) running.push(waiting.shift()!);
+      maxQ = Math.max(maxQ, waiting.length);
+      const decodes = running.filter((x) => x.pre === 0);
+      let budget = BUDGET - decodes.length, pref = 0; const firsts: R[] = [];
+      for (const x of running) if (x.pre > 0 && budget > 0) { const c = Math.min(x.pre, budget); x.pre -= c; budget -= c; pref += c; if (x.pre === 0) firsts.push(x); }
+      // step time (ms): launch/fixed overhead + per-sequence weight/KV cost + prefill compute
+      now += (6 + 0.3 * running.length + 0.028 * pref) / 1000;
+      for (const x of firsts) { x.first = now; x.out = 1; x.last = now; }
+      for (const x of decodes) { gaps.push(now - x.last); x.last = now; x.out++; }
+      running = running.filter((x) => {
+        if (x.first >= 0 && x.out >= x.O) { done++; fin.push(x); (x as R & { end: number }).end = now; if (mode === 'closed' && issued < N) waiting.push(make(now)); return false; }
+        return true;
+      });
+    }
+    const keep = fin.slice(WARM) as (R & { end: number })[];
+    const span = keep[keep.length - 1].end - keep[0].end;
+    const pct = (a: number[], p: number) => { const so = [...a].sort((x, y) => x - y); return so[Math.min(so.length - 1, Math.floor(p * so.length))]; };
+    const ttft = keep.map((x) => x.first - x.arr);
+    const tok = keep.reduce((a, x) => a + x.O, 0);
+    return { level, rps: (keep.length - 1) / span, tps: tok / span, ttft50: pct(ttft, 0.5), ttft99: pct(ttft, 0.99), itl50: pct(gaps, 0.5) * 1000, itl99: pct(gaps, 0.99) * 1000, maxQ };
+  }
+
+  const W = 940, H = 320;
+
+  mountAll('bench-sweep', (root) => {
+    const data: Record<Mode, Point[]> = { closed: CLOSED.map((c) => sim('closed', c)), open: OPEN.map((l) => sim('open', l)) };
+    let mode: Mode = 'closed', idx = 9, sloTTFT = 0.5, sloITL = 35;
+
+    const bar = ctrlBar(root);
+    const g1 = group(bar);
+    segmented(g1, [{ value: 'closed', label: 'Closed loop: --max-concurrency' }, { value: 'open', label: 'Open loop: --request-rate' }], mode, (v) => {
+      mode = v as Mode; const n = data[mode].length; lev.input.max = String(n - 1); lev.set(Math.min(idx, n - 1));
+    });
+    const lev = slider(bar, { label: 'Sweep point', min: 0, max: CLOSED.length - 1, value: idx, format: (i) => mode === 'closed' ? `${CLOSED[i]} in flight` : `${OPEN[i]} req/s`, onInput: (v) => { idx = v; render(); } });
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'SLO: p99 TTFT ≤', min: 0.2, max: 3, step: 0.1, value: sloTTFT, format: (v) => `${v.toFixed(1)} s`, onInput: (v) => { sloTTFT = v; render(); } });
+    slider(bar2, { label: 'SLO: p99 ITL ≤', min: 15, max: 45, value: sloITL, format: (v) => `${v} ms`, onInput: (v) => { sloITL = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Latency versus throughput for a closed-loop concurrency sweep and an open-loop request-rate sweep' });
+    const st = stats(root, ['Throughput', 'TTFT p50 / p99', 'ITL p50 / p99', 'Goodput-optimal point']);
+    legend(root, [['Closed loop (concurrency sweep)', C.decode], ['Open loop (Poisson rate sweep)', C.prefill], ['Selected point', C.accent], ['Best point within both SLOs', C.good]]);
+    const say = narration(root);
+
+    const TMAX = 2200;
+    const ok = (p: Point) => p.ttft99 <= sloTTFT && p.itl99 <= sloITL;
+    const best = (m: Mode) => { let b = -1; data[m].forEach((p, i) => { if (ok(p) && (b < 0 || p.tps > data[m][b].tps)) b = i; }); return b; };
+
+    function panel(x0: number, x1: number, title: string, yOf: (p: Point) => number, ymap: (v: number) => number, ticks: [number, string][], slo: number, sloLabel: string) {
+      const Y0 = 34, Y1 = 262;
+      const px = (v: number) => x0 + (Math.min(v, TMAX) / TMAX) * (x1 - x0);
+      const py = (v: number) => Y1 - ymap(v) * (Y1 - Y0);
+      text(svg, x0, 14, title, { class: 't-bold' });
+      for (const [v, lab] of ticks) {
+        line(svg, x0, py(v), x1, py(v), C.border, { 'stroke-width': 1 });
+        text(svg, x0 - 6, py(v), lab, { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      }
+      line(svg, x0, Y1, x1, Y1, C.borderStrong, { 'stroke-width': 1 });
+      for (let v = 0; v <= TMAX; v += 500) text(svg, px(v), Y1 + 14, String(v), { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      text(svg, (x0 + x1) / 2, Y1 + 32, 'output tokens/s (throughput)', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      // SLO band
+      const sy = py(slo);
+      rect(svg, x0, Y0, x1 - x0, Math.max(0, sy - Y0), C.wasteSoft, { rx: 0, opacity: 0.6 });
+      line(svg, x0, sy, x1, sy, C.waste, { 'stroke-dasharray': '5 3', 'stroke-width': 1.3 });
+      text(svg, x0 + 4, sy - 8, sloLabel, { class: 't-small t-bold', fill: C.waste });
+      for (const m of ['closed', 'open'] as Mode[]) {
+        const pts = data[m]; const col = m === 'closed' ? C.decode : C.prefill; const act = m === mode;
+        s('path', { d: pts.map((p, i) => `${i ? 'L' : 'M'}${px(p.tps)},${py(yOf(p))}`).join(' '), fill: 'none', stroke: col, 'stroke-width': act ? 2.4 : 1.4, opacity: act ? 1 : 0.4 }, svg);
+        pts.forEach((p) => s('circle', { cx: px(p.tps), cy: py(yOf(p)), r: act ? 3.2 : 2.2, fill: col, opacity: act ? 1 : 0.4 }, svg));
+      }
+      const b = best(mode);
+      if (b >= 0) { const p = data[mode][b]; s('circle', { cx: px(p.tps), cy: py(yOf(p)), r: 8, fill: 'none', stroke: C.good, 'stroke-width': 2.2 }, svg); }
+      const p = data[mode][idx];
+      s('circle', { cx: px(p.tps), cy: py(yOf(p)), r: 5.5, fill: C.accent, stroke: C.surface, 'stroke-width': 1.5 }, svg);
+    }
+
+    function render() {
+      clear(svg);
+      const lmin = Math.log10(0.02), lmax = Math.log10(30);
+      panel(70, 450, 'p99 TTFT vs throughput', (p) => p.ttft99, (v) => (Math.log10(Math.max(0.02, Math.min(30, v))) - lmin) / (lmax - lmin),
+        [[0.05, '50ms'], [0.2, '200ms'], [1, '1s'], [5, '5s'], [20, '20s']], sloTTFT, `TTFT SLO ${sloTTFT.toFixed(1)} s`);
+      panel(540, 920, 'p99 ITL vs throughput', (p) => p.itl99, (v) => Math.min(v, 45) / 45,
+        [[0, '0'], [10, '10ms'], [20, '20ms'], [30, '30ms'], [40, '40ms']], sloITL, `ITL SLO ${sloITL} ms`);
+
+      const p = data[mode][idx];
+      const f = (x: number) => (x < 1 ? `${Math.round(x * 1000)} ms` : `${x.toFixed(1)} s`);
+      st.set('Throughput', `${Math.round(p.tps)} tok/s`, `${p.rps.toFixed(1)} req/s completed`, C.decode);
+      st.set('TTFT p50 / p99', `${f(p.ttft50)} / ${f(p.ttft99)}`, p.ttft99 <= sloTTFT ? 'p99 within SLO' : 'p99 breaks SLO', p.ttft99 <= sloTTFT ? C.good : C.waste);
+      st.set('ITL p50 / p99', `${p.itl50.toFixed(0)} / ${p.itl99.toFixed(0)} ms`, p.itl99 <= sloITL ? 'p99 within SLO' : 'p99 breaks SLO', p.itl99 <= sloITL ? C.good : C.waste);
+      const b = best(mode);
+      st.set('Goodput-optimal point', b < 0 ? 'none' : mode === 'closed' ? `${CLOSED[b]} in flight` : `${OPEN[b]} req/s`, b < 0 ? 'no sweep point meets both SLOs' : `${Math.round(data[mode][b].tps)} tok/s within SLO`, b < 0 ? C.waste : C.good);
+
+      // compare the two loops at matched throughput
+      const other = mode === 'closed' ? data.open : data.closed;
+      let near = other[0]; for (const q of other) if (Math.abs(q.tps - p.tps) < Math.abs(near.tps - p.tps)) near = q;
+      const sat = mode === 'closed' ? CLOSED[idx] >= MAXSEQ : p.rps < OPEN[idx] * 0.95;
+      if (mode === 'closed') {
+        say(sat
+          ? `<b>${CLOSED[idx]} clients, all slots full.</b> Extra clients just wait in the engine queue, so TTFT grows linearly with concurrency but stays <i>bounded</i>: a closed-loop client never sends more than it gets back. Throughput is flat at ~${Math.round(p.tps)} tok/s.`
+          : `<b>${CLOSED[idx]} requests in flight.</b> A new request is sent only when one finishes, so the client slows down when the server does. At this throughput an open-loop client sees p99 TTFT ≈ <b>${f(near.ttft99)}</b> vs <b>${f(p.ttft99)}</b> here: closed loops hide queueing.`);
+      } else {
+        say(sat
+          ? `<b>${OPEN[idx]} req/s offered, ~${p.rps.toFixed(1)} served.</b> Arrivals do not wait for responses, so past capacity the queue grows without limit (peak ${p.maxQ} waiting) and p99 TTFT depends on how long you run the test. This is the <b>open-loop cliff</b>.`
+          : `<b>${OPEN[idx]} req/s, Poisson arrivals.</b> Random bursts briefly exceed the batch, so the tail rises well before saturation. Near the knee, the same throughput costs a much worse p99 TTFT than the closed-loop sweep suggests (closed: ${f(near.ttft99)}).`);
+      }
+    }
+    render();
+  });
+</script>

@@ -1,0 +1,117 @@
+---
+/* RAG latency budget: embed query → vector search → rerank top-k → LLM prefill → first token,
+   as a stacked bar, plus reranker cost vs k (linear). First-order FLOP/bandwidth model; illustrative. */
+---
+<div data-viz="embed-rag"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, group, select, slider, stats, legend, narration, C, fmt } from '../../lib/viz';
+  import { GPUS, getGPU } from '../../data/hardware';
+
+  const RERANKERS = [
+    { id: 'small', label: 'Small cross-encoder (~0.1B)', p: 0.1e9 },
+    { id: 'large', label: 'Large cross-encoder (~0.6B)', p: 0.56e9 },
+    { id: 'llm', label: 'LLM-based reranker (~4B)', p: 4e9 },
+  ];
+  const LLMS = [
+    { id: '8b', label: '8B dense, 1 GPU', p: 8e9, gpus: 1 },
+    { id: '70b', label: '70B dense, TP = 4', p: 70e9, gpus: 4 },
+  ];
+  const QTOK = 30, SYS = 300, EMB_P = 0.3e9, DIMS = 1024;
+  const W = 940, H = 280, X0 = 120, X1 = 920;
+
+  mountAll('embed-rag', (root) => {
+    let gpu = getGPU('h100');
+    let corpusLog = 7, k = 30, rr = RERANKERS[1], chunk = 512, nCtx = 5, llm = LLMS[0];
+
+    const b1 = ctrlBar(root);
+    const g1 = group(b1);
+    select(g1, 'GPU', GPUS.map((g) => ({ value: g.id, label: g.name })), gpu.id, (v) => { gpu = getGPU(v); render(); });
+    select(g1, 'Reranker', RERANKERS.map((r) => ({ value: r.id, label: r.label })), rr.id, (v) => { rr = RERANKERS.find((r) => r.id === v)!; render(); });
+    select(g1, 'LLM', LLMS.map((m) => ({ value: m.id, label: m.label })), llm.id, (v) => { llm = LLMS.find((m) => m.id === v)!; render(); });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'Corpus (chunks)', min: 4, max: 10, step: 0.5, value: corpusLog, format: (v) => fmt.num(10 ** v, 0), onInput: (v) => { corpusLog = v; render(); } });
+    slider(b2, { label: 'Rerank top-k', min: 0, max: 200, step: 10, value: k, format: (v) => (v === 0 ? 'off' : String(v)), onInput: (v) => { k = v; render(); } });
+    const b3 = ctrlBar(root);
+    slider(b3, { label: 'Chunk tokens', min: 128, max: 1024, step: 128, value: chunk, onInput: (v) => { chunk = v; render(); } });
+    slider(b3, { label: 'Chunks in LLM prompt', min: 1, max: 20, value: nCtx, onInput: (v) => { nCtx = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Stacked latency budget of a RAG request and reranker cost against top-k' });
+    const st = stats(root, ['Time to first token', 'Reranker share', 'Reranker GPU time / query', 'Index memory (FP32)']);
+    legend(root, [['Network + gateway', C.mem], ['Embed query', C.token], ['Vector search', C.kv], ['Rerank top-k', C.weight], ['LLM prefill', C.prefill], ['First decode step', C.decode]]);
+    const say = narration(root);
+
+    const F = () => gpu.bf16TF * 1e12;
+    const rerankMs = (kk: number) => (kk === 0 ? 0 : (2 * rr.p * kk * (chunk + QTOK)) / (0.35 * F()) * 1e3 + 3);
+
+    function render() {
+      clear(svg);
+      const N = 10 ** corpusLog;
+      const indexBytes = N * DIMS * 4;
+      const sharded = indexBytes > 512e9;
+      const parts = [
+        { name: 'network', ms: 5, color: C.mem },
+        { name: 'embed', ms: (2 * EMB_P * QTOK) / (0.2 * F()) * 1e3 + 3, color: C.token },
+        { name: 'search', ms: 0.4 + 0.6 * Math.log2(N / 1e4 + 1) + (sharded ? 3 : 0), color: C.kv },
+        { name: 'rerank', ms: rerankMs(k), color: C.weight },
+        { name: 'prefill', ms: (2 * llm.p * (nCtx * chunk + SYS + QTOK)) / (0.5 * F() * llm.gpus * (llm.gpus > 1 ? 0.85 : 1)) * 1e3, color: C.prefill },
+        { name: 'first token', ms: ((llm.p * 2) / (gpu.bwTBs * 1e12 * llm.gpus)) * 1e3 * 1.15 + (llm.gpus > 1 ? 1 : 0), color: C.decode },
+      ];
+      const total = parts.reduce((a, p) => a + p.ms, 0);
+      const scaleMax = Math.max(400, Math.ceil(total / 200) * 200);
+      const sx = (ms: number) => ((X1 - X0) * ms) / scaleMax;
+
+      text(svg, 6, 34, 'One request', { class: 't-small t-bold' });
+      text(svg, 6, 48, 'TTFT budget', { class: 't-small t-faint' });
+      let x = X0;
+      for (const p of parts) {
+        const w = sx(p.ms);
+        rect(svg, x, 22, Math.max(w, 0.5), 38, p.color, { rx: 0 });
+        if (w > 58) text(svg, x + 5, 35, p.name, { class: 't-small t-bold', fill: 'var(--bg)' });
+        if (w > 58) text(svg, x + 5, 50, fmt.ms(p.ms), { class: 't-small t-mono', fill: 'var(--bg)' });
+        x += w;
+      }
+      text(svg, Math.min(x + 6, X1 - 70), 72, `= ${fmt.ms(total)}`, { class: 't-bold t-mono' });
+      for (let t = 0; t <= scaleMax; t += scaleMax / 4) {
+        line(svg, X0 + sx(t), 64, X0 + sx(t), 68, C.borderStrong);
+        text(svg, X0 + sx(t), 82, fmt.ms(t), { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      }
+
+      // rerank time vs k
+      const PY0 = 120, PY1 = 250, PX0 = X0, PX1 = X1;
+      const kMax = 200;
+      const yMax = Math.max(50, rerankMs(kMax) * 1.1);
+      const px = (kk: number) => PX0 + ((PX1 - PX0) * kk) / kMax;
+      const py = (ms: number) => PY1 - ((PY1 - PY0) * ms) / yMax;
+      text(svg, 6, PY0 + 6, 'Rerank time', { class: 't-small t-bold' });
+      text(svg, 6, PY0 + 20, 'vs top-k', { class: 't-small t-faint' });
+      line(svg, PX0, PY1, PX1, PY1, C.borderStrong, { 'stroke-width': 1 });
+      line(svg, PX0, PY0, PX0, PY1, C.borderStrong, { 'stroke-width': 1 });
+      for (let kk = 0; kk <= kMax; kk += 50) text(svg, px(kk), PY1 + 13, `k=${kk}`, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      text(svg, PX0 - 6, PY0, fmt.ms(yMax), { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      // other stages' total as reference band
+      const others = total - parts[3].ms;
+      if (others < yMax) {
+        line(svg, PX0, py(others), PX1, py(others), C.prefill, { 'stroke-dasharray': '5 4', 'stroke-width': 1.2 });
+        text(svg, PX1, py(others) - 8, `everything else: ${fmt.ms(others)}`, { 'text-anchor': 'end', class: 't-small', fill: C.prefill });
+      }
+      let d = '';
+      for (let kk = 0; kk <= kMax; kk += 5) d += (d ? 'L' : 'M') + px(kk).toFixed(1) + ',' + py(rerankMs(kk)).toFixed(1);
+      s('path', { d, fill: 'none', stroke: C.weight, 'stroke-width': 2.2 }, svg);
+      s('circle', { cx: px(k), cy: py(rerankMs(k)), r: 5, fill: C.weight, stroke: 'var(--bg)', 'stroke-width': 1.5 }, svg);
+      text(svg, px(k) + 8, py(rerankMs(k)) - 10, k ? `${k} pairs × ${chunk + QTOK} tokens` : 'no reranker', { class: 't-small t-bold' });
+
+      const rshare = parts[3].ms / total;
+      const gpuMs = parts[3].ms - (k ? 3 : 0);
+      st.set('Time to first token', fmt.ms(total), `${llm.label} on ${gpu.name.split(' ')[0]}`);
+      st.set('Reranker share', fmt.pct(rshare), k ? `${k} query–chunk pairs` : 'reranker off', rshare > 0.5 ? C.waste : undefined);
+      st.set('Reranker GPU time / query', k ? fmt.ms(gpuMs) : '–', k ? `≈ ${fmt.num(1000 / Math.max(gpuMs, 0.01), 0)} queries/s per GPU, max` : '');
+      st.set('Index memory (FP32)', fmt.bytes(indexBytes), `${fmt.num(N, 0)} × ${DIMS} dims × 4 B${sharded ? ' · sharded' : ''}`, sharded ? C.prefill : undefined);
+
+      if (k === 0) say('Without a reranker the LLM sees the raw vector-search top results. Fast, but bi-encoder similarity misses nuance (negation, exact constraints), so you usually feed the LLM <b>more</b> chunks to compensate, which makes prefill longer.');
+      else if (rshare > 0.5) say(`The reranker now costs <b>${fmt.pct(rshare)}</b> of TTFT. A cross-encoder runs one full forward pass per (query, chunk) pair, so its cost is <b>linear in k</b> and in chunk length. Cut k, use a smaller reranker, or truncate chunks for reranking.`);
+      else say(`Vector search is cheap even at ${fmt.num(N, 0)} chunks: approximate indexes grow roughly with log N. The GPU-heavy stages are the reranker (${k} × ${chunk + QTOK} tokens) and the LLM prefill (${fmt.int(nCtx * chunk + SYS + QTOK)} tokens). Reranking well lets you send <b>fewer, better</b> chunks to the LLM, which shortens prefill.`);
+    }
+    render();
+  });
+</script>

@@ -1,0 +1,133 @@
+---
+layout: ../layouts/Chapter.astro
+title: Multimodal Serving
+description: A vision-language model turns every image into hundreds or thousands of tokens before the first word is generated. Where those tokens come from, what they cost, and how engines avoid paying for them twice.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import MMImageTokens from '../components/viz/MMImageTokens.astro';
+import MMTimeline from '../components/viz/MMTimeline.astro';
+import MMVideoBudget from '../components/viz/MMVideoBudget.astro';
+
+A **vision-language model** (VLM) is a normal LLM with two extra parts in front of it: a **vision encoder** that reads pixels, and a small **projector** that maps the encoder's outputs into the LLM's embedding space. After that, the LLM cannot tell an image from text. Image positions are just more tokens in the prompt.
+
+That one fact explains most of multimodal serving:
+
+- **Images are prompt tokens.** A single photo can be 256 to over 16,000 tokens depending on the model and its resolution settings. They go through [prefill](../prefill-decode/), take [KV cache](../kv-cache/) and count against the context like any text.
+- **There is extra work before prefill.** The image has to be uploaded, decoded and resized on the CPU, then run through the encoder on the GPU. All of it lands in TTFT.
+- **Requests get lumpy.** One request with eight scanned pages is a very long prompt, with all the [interference](../chunked-prefill/) a long prompt brings.
+
+## How an image becomes tokens
+
+The standard recipe, used with variations by Qwen-VL, LLaVA, InternVL and most open VLMs:
+
+1. **Resize** the image to a size the encoder accepts.
+2. **Cut it into patches**, usually 14×14 or 16×16 pixels. Each patch is one input position for a **ViT** (vision transformer), which runs full transformer layers over the patch sequence.
+3. **Merge and project.** Neighbouring patch outputs are usually merged (2×2 → 1 is common) and an MLP projects them to the LLM's hidden size. Each merged vector becomes **one LLM token**.
+4. **Splice** the image tokens into the text sequence where the image placeholder sits in the [chat template](../tokenization/).
+
+So the token count depends on the **resolution after resizing**, and each model family chooses a different scheme for that resize:
+
+<Viz title="From pixels to LLM tokens" label="Calculator">
+  <MMImageTokens />
+  <Fragment slot="caption">
+    <p>The grid shows one cell per LLM token. <b>Native resolution</b> follows Qwen2.5-VL: 14 px patches merged 2×2, so one token per 28×28 pixels, with the image scaled down until it fits under <code>max_pixels</code>. <b>Fixed 336 px</b> follows LLaVA-1.5: always 576 tokens. <b>Tiles of 448 px</b> follows the InternVL style: up to 12 tiles plus a thumbnail, 256 tokens each. Try the A4 scan in each mode, then add images. Cost estimates are for a 7B model and illustrative.</p>
+  </Fragment>
+</Viz>
+
+| Scheme | Tokens per image | Strength | Serving cost |
+|---|---|---|---|
+| **Fixed resolution** | Constant (e.g. 576) | Predictable | Cheap, but small text and fine detail are lost |
+| **Dynamic tiling** | 256 × tiles (+ thumbnail) | Detail on large images | Jumps in steps; a document page can be 2–3k tokens |
+| **Native / dynamic resolution** | ∝ pixels, between min and max | Detail where it exists | Unbounded unless you cap pixels |
+
+<Callout type="key" title="Resolution caps are a serving knob">
+For native-resolution models, the processor's pixel limits (for Qwen2.5-VL, `min_pixels` and `max_pixels`, settable on the server through `--mm-processor-kwargs`) directly set the worst-case tokens per image. The model card's own example range of 256–1,280 tokens per image is far below what a 12 MP photo would produce uncapped. Choose the cap from an accuracy test on your images: OCR-heavy documents need more pixels than photos.
+</Callout>
+
+## The cost lands in TTFT
+
+Before the first output token, an image request does four things the text path does not, and two of them do not happen on the GPU:
+
+<Viz title="Where the time to first token goes" label="Live">
+  <MMTimeline />
+  <Fragment slot="caption">
+    <p>Press Play, then tick the options one by one. With full-size phone photos sent as base64, upload and CPU preprocessing dwarf the GPU work. Downscaling on the client barely changes the token count (the server would have resized anyway) but cuts bytes and decode time. A cache hit skips preprocessing, the encoder and the image's prefill. Illustrative numbers: 50 Mbit/s client uplink, 7B VLM on one H100.</p>
+  </Fragment>
+</Viz>
+
+What each stage teaches:
+
+- **Upload.** Base64 inflates the bytes by 4/3, and a 12 MP JPEG is several megabytes. Gateways and proxies have body-size limits (nginx's default is 1 MB), and API servers buffer whole requests. Resize on the client to roughly what the model will use, or pass a URL the server can fetch. URL fetching then needs an allow-list (vLLM has `--allowed-media-domains`), or it becomes a server-side request forgery path.
+- **CPU preprocessing.** Decoding and resizing run on the API server's CPU. Under load, they compete with tokenization and detokenization, and the GPU waits. Scale out API server processes, give the pod enough cores, and watch CPU time per request as well as GPU metrics.
+- **Encoder.** The ViT is small next to the LLM but runs over every patch (4× the LLM tokens with a 2×2 merge). With [tensor parallelism](../parallelism/), splitting a small encoder across GPUs is often wasteful; vLLM's `--mm-encoder-tp-mode data` runs it data-parallel instead, for supported models.
+- **Prefill.** Image tokens prefill like text. A request with 8 images can be a 10,000-token prompt, so [chunked prefill](../chunked-prefill/) matters as much as for long documents, and an image-heavy request can stall everyone else's decode without it.
+
+## Caching images
+
+Users send the same images again: the same document asked about five times, a screenshot re-sent with every turn of a chat, a product photo shared by many requests. Engines avoid repeating the work at several levels:
+
+| Cache | Key | Skips | In vLLM |
+|---|---|---|---|
+| **Processor cache** | Hash of the media content (or a client-supplied UUID) | Decode, resize, patching on the CPU | `--mm-processor-cache-gb` (default 4 GiB; 0 disables) |
+| **Encoder cache** | Same media hash | Re-running the vision encoder while the request's prefill chunks are still being scheduled | Internal, sized by the scheduler's encoder budget |
+| **[Prefix cache](../prefix-caching/)** | Block hashes that include the media hash as an extra key | Encoder **and** prefill for every block up to the first difference | Automatic prefix caching |
+
+The prefix cache is the big win, and it follows the usual rule: matching is **positional**. An image after the same system prompt in the same position hits; the same image after a different preamble misses at the first differing block, so put shared images and documents **before** the per-request text.
+
+<Callout type="tip" title="Hash once, at the edge">
+Hashing large images is not free. vLLM accepts `multi_modal_uuids` so a client that already has a stable id for an image (a content hash or a database key) can skip rehashing. The same id can drive cache-aware routing, so repeated images land on the replica that already holds their KV.
+</Callout>
+
+## Limits and admission
+
+Multimodal requests have more ways to be huge, so engines add guard rails:
+
+- **Items per prompt.** `--limit-mm-per-prompt` caps how many images, videos or audio clips a prompt may contain, per modality (for example `--limit-mm-per-prompt.image 4`, or a JSON map). Set a modality to 0 to disable it. The engine plans its startup memory profiling around the worst case these limits allow, so overly generous limits waste KV memory on a case that never arrives.
+- **Pixels per item.** Processor arguments such as `max_pixels` bound tokens per image; frame counts and frame sizes bound video.
+- **Context.** All of it must fit in `max_model_len` together with the text and the output.
+- **Payload.** Gateway body limits, request timeouts and per-tenant rate limits should count image bytes and image tokens, not just requests.
+
+## Video and audio: the budget explodes
+
+Video is a stack of images. A model samples frames at some rate, encodes each one (often merging pairs of consecutive frames, as Qwen2.5-VL does), and every frame costs tokens. Audio encoders produce a steady stream of tokens per second of sound. The multiplication gets out of hand quickly:
+
+<Viz title="Video token budget" label="Calculator">
+  <MMVideoBudget />
+  <Fragment slot="caption">
+    <p>Tokens = frames × tokens per frame (halved if pairs of frames are merged), plus audio if included. Ten minutes at 1 fps with 360p frames is already about 90k tokens. A frame cap keeps requests bounded but lowers the effective sampling rate, so short events fall between frames. Audio at ~25 tokens/s is an illustrative rate. Prefill estimate is the linear part only.</p>
+  </Fragment>
+</Viz>
+
+For long media, the practical patterns are the same as for long documents: sample less, shrink frames, cut into segments and process them separately (in parallel, on several replicas), and summarise into text that later turns can reuse cheaply.
+
+## Splitting the encoder off
+
+Because the encoder is a separate model with a different compute profile, it can run on separate workers, the same idea as [prefill/decode disaggregation](../disaggregation/) applied one stage earlier. vLLM's **disaggregated encoder** mode runs encoder instances that produce image embeddings and ship them to prefill/decode instances through an **encoder-cache connector** (`--ec-transfer-config`, with producer and consumer roles). Text-only requests skip the encoder pool entirely. It is newer and less mature than P/D disaggregation, but it addresses the same problem: a burst of image-heavy requests should not slow everyone's decode.
+
+<Callout type="warn" title="Image requests and text requests are different workloads">
+On a shared pool, a few requests with many large images can dominate prefill time and KV memory. If your traffic mixes them, track image tokens per request as a first-class metric, cap pixels and items, and consider routing heavy multimodal traffic to its own pool.
+</Callout>
+
+<Interview>
+  <Q q="How does an image become tokens in a typical VLM?" level="core">
+    The image is resized, cut into fixed-size patches (e.g. 14×14 px), and run through a ViT encoder. Neighbouring patch embeddings are merged (often 2×2) and projected by an MLP into the LLM's embedding space. Each resulting vector is one token, spliced into the text sequence at the image placeholder. For Qwen2.5-VL that works out to one token per 28×28 pixels.
+  </Q>
+  <Q q="Do image tokens use the KV cache differently from text tokens?" level="core">
+    No. Once projected, they are ordinary positions in the sequence. Every image token writes K and V in every layer and is read by every later decode step, so a 1,280-token image costs the same KV as 1,280 tokens of text. The difference is the extra encoder and preprocessing work before prefill.
+  </Q>
+  <Q q="What controls how many tokens an image costs, and how would you choose it?" level="mid">
+    The model's resize scheme plus the processor's pixel limits: fixed-resolution models are constant, tiling models step up with tile count, native-resolution models scale with pixels up to <code>max_pixels</code>. Pick the cap with an accuracy sweep on your own images (documents and small text need more pixels than photos), then enforce it on the server and resize on the client to match.
+  </Q>
+  <Q q="Users uploading phone photos see TTFT of 3 s, but GPU metrics show low utilisation. What's going on?" level="senior">
+    Most of the time is probably off the GPU: multi-megabyte base64 bodies over the client's uplink, and JPEG decode plus resize on a busy API server CPU. Confirm with per-stage timings or CPU profiles. Fixes: resize on the client to the model's working resolution, send URLs from a nearby bucket (with a domain allow-list), add API server processes and CPU, and use the processor and prefix caches for repeated images.
+  </Q>
+  <Q q="The same document image is asked about many times, but prefix-cache hit rate stays low. Why?" level="mid">
+    Matching is positional. If per-request text (a timestamp, the user's question, a different system prompt) comes before the image, the first block differs and nothing after it, including the image's blocks, can match. Put shared images and documents right after the stable system prompt and the question after them, and route repeat requests to the replica that holds them.
+  </Q>
+  <Q q="After enabling video input, decode latency for all users spikes periodically. Explain and fix." level="senior">
+    A few video requests are turning into prompts of tens of thousands of tokens, plus encoder work, and their prefill is stalling the shared decode batch. Cap frames, frame size and items per prompt (<code>--limit-mm-per-prompt</code>, processor kwargs), make sure chunked prefill bounds the per-step token budget, and consider a separate pool or a disaggregated encoder for heavy multimodal traffic so text users keep steady inter-token latency.
+  </Q>
+</Interview>

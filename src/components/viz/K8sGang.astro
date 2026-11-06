@@ -1,0 +1,118 @@
+---
+/* Gang scheduling for multi-node inference. Two LeaderWorkerSet groups (A and B), each needing
+   3 pods × 8 GPUs, arrive together on a 4-node × 8-GPU cluster. Pod-by-pod scheduling places half
+   of each and deadlocks; gang admission (Kueue / KAI Scheduler style) places one whole group and
+   queues the other without holding GPUs. Step-through. */
+---
+<div data-viz="k8s-gang"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, player, segmented, stats, narration, C } from '../../lib/viz';
+
+  type Mode = 'pod' | 'gang';
+  interface Pod { job: 'A' | 'B' | 'S'; rank: number; gpus: number; }
+  interface Snap { nodes: Pod[][]; jobs: Record<string, string>; say: string; }
+
+  const JOBCOL: Record<string, string> = { A: C.decode, B: C.prefill, S: C.token };
+  const NN = 4;
+
+  function script(mode: Mode): Snap[] {
+    const out: Snap[] = [];
+    const nodes: Pod[][] = Array.from({ length: NN }, () => []);
+    const jobs: Record<string, string> = { A: 'Pending 0/3', B: 'Pending 0/3', S: 'not submitted' };
+    const snap = (say: string) => out.push({ nodes: nodes.map((n) => [...n]), jobs: { ...jobs }, say });
+    snap('Two 70B-class replicas arrive at once. Each is a <b>LeaderWorkerSet</b> group of 3 pods × 8 GPUs (pipeline-parallel across nodes), so each needs 24 of the cluster\'s 32 GPUs. Only one can run.');
+    if (mode === 'pod') {
+      const order: [Pod['job'], number, number][] = [['A', 0, 0], ['B', 0, 1], ['A', 1, 2], ['B', 1, 3]];
+      for (const [j, r, n] of order) {
+        nodes[n].push({ job: j, rank: r, gpus: 8 });
+        const placed = nodes.flat().filter((p) => p.job === j).length;
+        jobs[j] = `Partial ${placed}/3`;
+        snap(`The default scheduler looks at <b>one pod at a time</b>. ${j}-${r} fits on node ${n + 1}, so it binds. It has no idea the pod is useless without its siblings.`);
+      }
+      jobs.A = 'Stuck 2/3'; jobs.B = 'Stuck 2/3';
+      snap('A-2 and B-2 find no free node. Both groups hold 16 GPUs each, and the engines wait at start-up for a rank that will never arrive. <b>32 GPUs allocated, 0 serving.</b> Neither group releases anything, so this lasts until a timeout or a human intervenes.');
+      jobs.S = 'Pending';
+      snap('A small 1-GPU embedding job now arrives. It cannot run either: every GPU is held by a half-placed group. This is the classic <b>partial-placement deadlock</b>.');
+    } else {
+      [0, 1, 2].forEach((r) => nodes[r].push({ job: 'A', rank: r, gpus: 8 }));
+      jobs.A = 'Running 3/3';
+      snap('A gang-aware admission layer (Kueue, or the KAI Scheduler) treats the group as one unit. A needs 24 GPUs and 24 are free on three nodes, so <b>all three pods bind together</b>.');
+      jobs.B = 'Queued (gang)';
+      snap('B also needs 24 GPUs, but only 8 are free. Instead of binding B-0 and B-1 and waiting, B stays <b>queued as a whole</b> and holds nothing.');
+      nodes[3].push({ job: 'S', rank: 0, gpus: 1 });
+      jobs.S = 'Running';
+      snap('The free node stays usable: the 1-GPU embedding job lands on it immediately.');
+      for (let r = 0; r < 3; r++) nodes[r] = [];
+      jobs.A = 'Completed';
+      snap('Later, replica A is scaled down (or finishes) and releases 24 GPUs.');
+      [0, 1, 2].forEach((r) => nodes[r].push({ job: 'B', rank: r, gpus: 8 }));
+      jobs.B = 'Running 3/3';
+      snap('Now B fits as a whole and is admitted in one step. At no point were GPUs held by a group that could not run. Topology-aware variants also keep a group within one rack or NVLink domain.');
+    }
+    return out;
+  }
+
+  const W = 940, H = 300;
+
+  mountAll('k8s-gang', (root) => {
+    let mode: Mode = 'pod';
+    let seq = script(mode), i = 0;
+    const bar = ctrlBar(root);
+    segmented(bar, [{ value: 'pod', label: 'Default: pod by pod' }, { value: 'gang', label: 'Gang admission' }], mode, (v) => { mode = v as Mode; seq = script(mode); p.reset(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Four 8-GPU nodes and two multi-node inference groups being scheduled' });
+    const say = narration(root);
+    const st = stats(root, ['GPUs allocated', 'GPUs serving', 'Groups running']);
+
+    function reset() { i = 0; }
+    function step() { i = Math.min(seq.length - 1, i + 1); return i < seq.length - 1; }
+
+    function render() {
+      clear(svg);
+      const sn = seq[i];
+      const NW = 214;
+      sn.nodes.forEach((pods, n) => {
+        const x = 12 + n * (NW + 16), y = 10;
+        rect(svg, x, y, NW, 150, C.surface2, { rx: 10, stroke: C.border });
+        text(svg, x + 12, y + 16, `node ${n + 1}`, { class: 't-small t-bold' });
+        text(svg, x + NW - 12, y + 16, '8 × H100', { 'text-anchor': 'end', class: 't-small t-faint' });
+        let g = 0;
+        const cells: (Pod | null)[] = Array(8).fill(null);
+        pods.forEach((pd) => { for (let k = 0; k < pd.gpus; k++) cells[g++] = pd; });
+        cells.forEach((pd, k) => {
+          const cx = x + 12 + (k % 4) * 48, cy = y + 30 + Math.floor(k / 4) * 40;
+          const stuck = pd && /^(Stuck|Partial)/.test(sn.jobs[pd.job]);
+          rect(svg, cx, cy, 42, 34, pd ? JOBCOL[pd.job] : 'transparent', { rx: 5, opacity: pd ? (stuck ? 0.35 : 0.9) : 1, stroke: pd ? 'none' : C.border, 'stroke-dasharray': pd ? null : '3 3' });
+          if (pd) text(svg, cx + 21, cy + 17, stuck ? 'idle' : 'busy', { 'text-anchor': 'middle', class: 't-small t-bold', fill: stuck ? C.text : 'var(--bg)' });
+        });
+        const pod = pods[0];
+        text(svg, x + 12, y + 134, pod ? `${pod.job === 'S' ? 'embed-0' : `${pod.job}-${pod.rank}`}${pod.job !== 'S' ? (pod.rank === 0 ? ' (leader)' : ' (worker)') : ''}` : 'free', { class: 't-small t-mono', fill: pod ? JOBCOL[pod.job] : C.faint });
+      });
+
+      // job status cards
+      const JY = 180;
+      (['A', 'B', 'S'] as const).forEach((j, k) => {
+        const x = 12 + k * 308;
+        const s = sn.jobs[j];
+        const bad = /^(Stuck|Partial)/.test(s) || (j === 'S' && s === 'Pending');
+        const good = s.startsWith('Running') || s === 'Completed';
+        rect(svg, x, JY, 296, 64, 'transparent', { rx: 10, stroke: bad ? C.waste : good ? C.good : C.border });
+        rect(svg, x, JY, 6, 64, JOBCOL[j], { rx: 3 });
+        text(svg, x + 18, JY + 18, j === 'S' ? 'embed job · 1 pod × 1 GPU' : `replica ${j} · LWS group · 3 pods × 8 GPUs`, { class: 't-small t-bold' });
+        text(svg, x + 18, JY + 42, s, { class: 't-bold', fill: bad ? C.waste : good ? C.good : C.dim });
+      });
+      text(svg, 12, H - 14, `step ${i + 1} / ${seq.length}`, { class: 't-small t-mono t-faint' });
+
+      const all = sn.nodes.flat();
+      const alloc = all.reduce((a, p) => a + p.gpus, 0);
+      const serving = all.filter((p) => !/^(Stuck|Partial)/.test(sn.jobs[p.job])).reduce((a, p) => a + p.gpus, 0);
+      const running = (['A', 'B'] as const).filter((j) => sn.jobs[j].startsWith('Running')).length;
+      st.set('GPUs allocated', `${alloc} / 32`);
+      st.set('GPUs serving', `${serving}`, alloc && !serving ? 'allocated but idle' : 'doing useful work', alloc > 0 && serving === 0 ? C.waste : serving ? C.good : C.text);
+      st.set('Groups running', String(running), 'of 2 multi-node replicas');
+      say(sn.say);
+    }
+
+    const p = player(bar, root, { step, reset, render, interval: 1600, autoplay: false });
+  });
+</script>

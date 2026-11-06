@@ -1,0 +1,186 @@
+---
+/* MIG packer: pick a GPU, click profiles to add instances, click an instance to remove it.
+   A small solver re-packs the whole set using approximate placement rules (memory-slice start
+   positions per profile, compute-slice budget), so the reader sees which combinations are possible,
+   what is stranded, and what the device plugin advertises under the single vs mixed strategy. */
+---
+<div data-viz="mig-packer"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, group, button, select, segmented, stats, narration, C, SERIES, hatchDefs, uniq } from '../../lib/viz';
+
+  interface Prof { name: string; size: number; c: number; starts: number[]; }
+  interface Gpu { id: string; name: string; product: string; memGB: number; mslices: number; cslices: number; profs: Prof[]; presets: Record<string, string[]>; }
+
+  const big = (n: string[]): Prof[] => [
+    { name: n[0], size: 1, c: 1, starts: [0, 1, 2, 3, 4, 5, 6] },
+    { name: n[1], size: 2, c: 1, starts: [0, 2, 4, 6] },
+    { name: n[2], size: 2, c: 2, starts: [0, 2, 4] },
+    { name: n[3], size: 4, c: 3, starts: [0, 4] },
+    { name: n[4], size: 4, c: 4, starts: [0] },
+    { name: n[5], size: 8, c: 7, starts: [0] },
+  ];
+  const presetsBig = (n: string[]) => ({
+    [`all-${n[0]}`]: Array(7).fill(n[0]),
+    [`all-${n[2]}`]: Array(3).fill(n[2]),
+    [`all-${n[3]}`]: Array(2).fill(n[3]),
+    'all-balanced': [n[0], n[0], n[2], n[3]],
+    [`all-${n[5]}`]: [n[5]],
+  });
+  const H100N = ['1g.10gb', '1g.20gb', '2g.20gb', '3g.40gb', '4g.40gb', '7g.80gb'];
+  const H200N = ['1g.18gb', '1g.35gb', '2g.35gb', '3g.71gb', '4g.71gb', '7g.141gb'];
+  const B200N = ['1g.23gb', '1g.45gb', '2g.45gb', '3g.90gb', '4g.90gb', '7g.180gb'];
+  const GPUS: Gpu[] = [
+    { id: 'h100', name: 'H100 80GB', product: 'NVIDIA-H100-80GB-HBM3', memGB: 80, mslices: 8, cslices: 7, profs: big(H100N), presets: presetsBig(H100N) },
+    { id: 'h200', name: 'H200 141GB', product: 'NVIDIA-H200', memGB: 141, mslices: 8, cslices: 7, profs: big(H200N), presets: presetsBig(H200N) },
+    { id: 'b200', name: 'B200 180GB', product: 'NVIDIA-B200', memGB: 180, mslices: 8, cslices: 7, profs: big(B200N), presets: presetsBig(B200N) },
+    { id: 'rtx', name: 'RTX PRO 6000 96GB', product: 'NVIDIA-RTX-PRO-6000', memGB: 96, mslices: 4, cslices: 4,
+      profs: [{ name: '1g.24gb', size: 1, c: 1, starts: [0, 1, 2, 3] }, { name: '2g.48gb', size: 2, c: 2, starts: [0, 2] }, { name: '4g.96gb', size: 4, c: 4, starts: [0] }],
+      presets: { 'all-1g.24gb': Array(4).fill('1g.24gb'), 'all-2g.48gb': ['2g.48gb', '2g.48gb'], 'all-4g.96gb': ['4g.96gb'] } },
+  ];
+
+  interface Placed { p: Prof; start: number; }
+  /** Try to place every profile; larger first, backtracking over allowed start positions. */
+  function solve(g: Gpu, names: string[]): Placed[] | null {
+    const ps = names.map((n) => g.profs.find((x) => x.name === n)!).sort((a, b) => b.size - a.size || b.c - a.c);
+    if (ps.reduce((a, p) => a + p.c, 0) > g.cslices) return null;
+    const used = Array(g.mslices).fill(false);
+    const out: Placed[] = [];
+    const rec = (i: number): boolean => {
+      if (i === ps.length) return true;
+      for (const s of ps[i].starts) {
+        if (s + ps[i].size > g.mslices) continue;
+        let ok = true; for (let k = s; k < s + ps[i].size; k++) if (used[k]) ok = false;
+        if (!ok) continue;
+        for (let k = s; k < s + ps[i].size; k++) used[k] = true;
+        out.push({ p: ps[i], start: s });
+        if (rec(i + 1)) return true;
+        out.pop(); for (let k = s; k < s + ps[i].size; k++) used[k] = false;
+      }
+      return false;
+    };
+    return rec(0) ? out.sort((a, b) => a.start - b.start) : null;
+  }
+
+  const W = 940, H = 236, X0 = 120, GW = 800;
+
+  mountAll('mig-packer', (root) => {
+    let g = GPUS[0];
+    let names: string[] = [...g.presets['all-balanced']];
+    let strategy: 'single' | 'mixed' = 'mixed';
+    let msg = '';
+
+    const b1 = ctrlBar(root);
+    select(b1, 'GPU', GPUS.map((x) => ({ value: x.id, label: x.name })), g.id, (v) => { g = GPUS.find((x) => x.id === v)!; names = [...Object.values(g.presets)[0]]; msg = ''; buildButtons(); render(); });
+    let presetSel: HTMLSelectElement;
+    const presetWrap = group(b1);
+    segmented(b1, [{ value: 'single', label: 'Strategy: single' }, { value: 'mixed', label: 'Strategy: mixed' }], strategy, (v) => { strategy = v as 'single' | 'mixed'; render(); });
+    const b2 = ctrlBar(root);
+    const pg = group(b2);
+    const svg = svgRoot(root, W, H, { 'aria-label': 'MIG memory and compute slices with placed GPU instances' });
+    const hid = uniq('migh');
+    const say = narration(root);
+    const st = stats(root, ['Instances', 'Compute slices used', 'Memory used', 'Stranded']);
+    const res = document.createElement('pre'); res.className = 'mig-res'; root.appendChild(res);
+
+    function buildButtons() {
+      pg.innerHTML = ''; presetWrap.innerHTML = '';
+      g.profs.forEach((p) => button(pg, `+ ${p.name}`, () => {
+        const next = [...names, p.name];
+        if (solve(g, next)) { names = next; msg = ''; }
+        else {
+          const cUsed = names.reduce((a, n) => a + g.profs.find((x) => x.name === n)!.c, 0);
+          msg = cUsed + p.c > g.cslices ? (cUsed >= g.cslices ? `No room for <b>${p.name}</b>: all ${g.cslices} compute slices are already assigned.` : `No room for <b>${p.name}</b>: it needs ${p.c} compute slices and only ${g.cslices - cUsed} ${g.cslices - cUsed === 1 ? 'is' : 'are'} left.`) : `No room for <b>${p.name}</b>: compute is left, but no free run of ${p.size} memory slice${p.size > 1 ? 's' : ''} starts at an allowed position (${p.starts.join(', ')}).`;
+        }
+        render();
+      }));
+      button(pg, 'Clear', () => { names = []; msg = ''; render(); });
+      presetSel = select(presetWrap, 'mig.config', [{ value: '', label: '(custom)' }, ...Object.keys(g.presets).map((k) => ({ value: k, label: k }))], '', (v) => { if (v) { names = [...g.presets[v]]; msg = ''; render(); } });
+    }
+
+    function render() {
+      clear(svg);
+      const hp = hatchDefs(svg, hid, C.waste);
+      const placed = solve(g, names) ?? [];
+      const sw = GW / g.mslices;
+      const MY = 40, MH = 70, CY = 150, CH = 30;
+      text(svg, 12, 18, `${g.name}`, { class: 't-bold' });
+      text(svg, X0 + GW, 18, `${g.mslices} memory slices × ${Math.round(g.memGB / g.mslices * 10) / 10} GB · ${g.cslices} compute slices`, { 'text-anchor': 'end', class: 't-small t-faint' });
+      text(svg, 12, MY + MH / 2 - 7, 'memory', { class: 't-small t-bold' });
+      text(svg, 12, MY + MH / 2 + 9, 'slices', { class: 't-small t-faint' });
+      text(svg, 12, CY + CH / 2 - 7, 'compute', { class: 't-small t-bold' });
+      text(svg, 12, CY + CH / 2 + 9, 'slices (SMs)', { class: 't-small t-faint' });
+      const memUsed = Array(g.mslices).fill(false);
+      placed.forEach((pl) => { for (let k = pl.start; k < pl.start + pl.p.size; k++) memUsed[k] = true; });
+      const cUsed = placed.reduce((a, pl) => a + pl.p.c, 0);
+      const usable = Array(g.mslices).fill(false);
+      g.profs.forEach((p) => {
+        if (p.c > g.cslices - cUsed) return;
+        p.starts.forEach((s0) => {
+          if (s0 + p.size > g.mslices) return;
+          let ok = true; for (let k = s0; k < s0 + p.size; k++) if (memUsed[k]) ok = false;
+          if (ok) for (let k = s0; k < s0 + p.size; k++) usable[k] = true;
+        });
+      });
+      for (let k = 0; k < g.mslices; k++) {
+        rect(svg, X0 + k * sw + 2, MY, sw - 4, MH, memUsed[k] ? 'transparent' : usable[k] ? C.surface2 : hp, { rx: 6, stroke: C.border, 'stroke-dasharray': '3 3' });
+        text(svg, X0 + k * sw + sw / 2, MY + MH + 12, String(k), { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+      }
+      const cw = GW / g.cslices;
+      for (let k = 0; k < g.cslices; k++) rect(svg, X0 + k * cw + 2, CY, cw - 4, CH, k < cUsed ? 'transparent' : C.surface2, { rx: 5, stroke: C.border, 'stroke-dasharray': '3 3' });
+      let cx = 0;
+      placed.forEach((pl, i) => {
+        const col = SERIES[i % SERIES.length];
+        const x = X0 + pl.start * sw + 2, w = pl.p.size * sw - 4;
+        const r = rect(svg, x, MY, w, MH, col, { rx: 6, opacity: 0.88, style: 'cursor:pointer' });
+        const label = text(svg, x + w / 2, MY + MH / 2 - 6, pl.p.name, { 'text-anchor': 'middle', class: 't-small t-bold t-mono', fill: 'var(--bg)', style: 'cursor:pointer' });
+        const lab2 = text(svg, x + w / 2, MY + MH / 2 + 10, w > 70 ? 'click to remove' : '×', { 'text-anchor': 'middle', class: 't-small', fill: 'var(--bg)', style: 'cursor:pointer' });
+        const rm = () => { const j = names.indexOf(pl.p.name); if (j >= 0) names.splice(j, 1); msg = ''; render(); };
+        [r, label, lab2].forEach((el) => el.addEventListener('click', rm));
+        rect(svg, X0 + cx * cw + 2, CY, pl.p.c * cw - 4, CH, col, { rx: 5, opacity: 0.88 });
+        if (pl.p.c * cw > 40) text(svg, X0 + cx * cw + pl.p.c * cw / 2, CY + CH / 2, `${pl.p.c}g`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+        cx += pl.p.c;
+      });
+      text(svg, X0, H - 12, 'Hatched = free but unusable: no profile can start there with the compute slices that are left.', { class: 't-small t-faint' });
+
+      const memGB = placed.reduce((a, pl) => a + pl.p.size, 0) * g.memGB / g.mslices;
+      const freeM = memUsed.filter((x) => !x).length;
+      st.set('Instances', String(placed.length), `on one ${g.name}`);
+      st.set('Compute slices used', `${cUsed} / ${g.cslices}`, cUsed < g.cslices ? `${g.cslices - cUsed} idle` : 'all assigned', cUsed === g.cslices ? C.good : C.text);
+      st.set('Memory used', `${Math.round(memGB)} GB`, `${g.mslices - freeM} of ${g.mslices} memory slices`);
+      const strandC = freeM === 0 ? g.cslices - cUsed : 0;
+      const strandM = memUsed.filter((x, k) => !x && !usable[k]).length;
+      st.set('Stranded', strandC ? `${strandC} compute` : strandM ? `${strandM} mem slice${strandM > 1 ? 's' : ''}` : '0', strandC ? 'memory is full; these SMs can never be used' : strandM ? 'no profile can use this memory any more' : 'nothing wasted', strandC || strandM ? C.waste : C.good);
+
+      const key = [...names].sort().join(',');
+      const match = Object.entries(g.presets).find(([, v]) => [...v].sort().join(',') === key);
+      if (presetSel) presetSel.value = match ? match[0] : '';
+      // device plugin view
+      const counts = new Map<string, number>();
+      placed.forEach((pl) => counts.set(pl.p.name, (counts.get(pl.p.name) ?? 0) + 1));
+      const homo = counts.size === 1;
+      let out = `# node with 8 × ${g.name}, label nvidia.com/mig.config=${presetSel?.value || '<custom>'}\n`;
+      if (!placed.length) out += 'MIG enabled, no instances: nothing to advertise (nvidia.com/gpu: 0)';
+      else if (strategy === 'single') {
+        out += homo
+          ? `allocatable:\n  nvidia.com/gpu: ${8 * placed.length}\nlabels:\n  nvidia.com/gpu.product: ${g.product}-MIG-${[...counts.keys()][0]}`
+          : `single strategy expects one profile per node. This layout mixes ${[...counts.keys()].join(', ')}:\nthe plugin cannot present them all as interchangeable nvidia.com/gpu. Use mixed.`;
+      } else {
+        out += 'allocatable:\n' + [...counts.entries()].map(([n, c]) => `  nvidia.com/mig-${n}: ${c * 8}`).join('\n');
+      }
+      res.textContent = out;
+      res.classList.toggle('bad', strategy === 'single' && placed.length > 0 && !homo);
+
+      say(msg || (strategy === 'single'
+        ? 'With the <b>single</b> strategy every MIG device on the node looks like an ordinary <code>nvidia.com/gpu</code>, so existing pod specs work unchanged. That only makes sense when every instance is the same size.'
+        : 'With the <b>mixed</b> strategy each profile becomes its own resource, such as <code>nvidia.com/mig-1g.10gb</code>, and pods ask for the exact profile. Click profiles to add instances; the layout re-packs automatically.'));
+    }
+    buildButtons();
+    render();
+  });
+</script>
+
+<style is:global>
+  .mig-res { margin: 12px 0 0; padding: 10px 13px; font-family: var(--font-mono); font-size: 0.78rem; line-height: 1.55; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; white-space: pre-wrap; color: var(--text); }
+  .mig-res.bad { border-color: var(--c-waste); color: var(--c-waste); }
+</style>

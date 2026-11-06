@@ -1,0 +1,178 @@
+---
+/* Step-through of one tool-calling round trip on an OpenAI-compatible server:
+   request with tools → chat template → raw tokens (Hermes/Qwen-style <tool_call> tags, optional <think>)
+   → reasoning parser + tool-call parser → `tool_calls` in the response → client runs tools
+   (parallel or one at a time) → results appended as role "tool" → next call reuses the cached prefix. */
+---
+<div data-viz="tool-call-steps"></div>
+
+<script>
+  import { mountAll, svgRoot, s as el, rect, text, line, clear, ctrlBar, checkbox, stats, narration, player, C, arrowDefs, uniq } from '../../lib/viz';
+
+  const W = 940, H = 398;
+  const COLS = [
+    { x: 10, w: 300, title: 'Model output (raw tokens)' },
+    { x: 322, w: 270, title: 'Server: parsers' },
+    { x: 604, w: 326, title: 'API response / client' },
+  ];
+  const TOOL_T = [0.8, 1.3]; // Paris, Tokyo tool latencies (s)
+  const TTFT = 0.25, DEC = 0.6; // per model call, illustrative
+
+  interface Step { col: number; title: string; say: string; }
+
+  mountAll('tool-call-steps', (root) => {
+    let reasoning = true, parallel = true, k = 0;
+    const bar = ctrlBar(root);
+    const opts = ctrlBar(root);
+    checkbox(opts, 'Reasoning model (<think> block)', reasoning, (v) => { reasoning = v; render(); });
+    checkbox(opts, 'Parallel tool calls', parallel, (v) => { parallel = v; render(); });
+    const rootSvg = svgRoot(root, W, H, { 'aria-label': 'Tool call round trip from raw tokens through parsers to tool execution' });
+    const arrowId = uniq('tc-arr');
+    const say = narration(root);
+    const st = stats(root, ['Model calls for this task', 'Tool time', 'Task latency (illustrative)']);
+
+    const steps = (): Step[] => [
+      { col: 2, title: '1 · Request', say: 'The client sends <code>messages</code> plus a <code>tools</code> array of JSON schemas. Nothing special happens on the wire: tools are just more input.' },
+      { col: 1, title: '2 · Chat template', say: 'The server renders the tool schemas into the prompt with the model\'s <b>chat template</b>, usually right after the system prompt. That block is identical on every call, so it is a perfect <b>prefix-cache</b> candidate, as long as the tool list is not reordered.' },
+      { col: 0, title: '3 · Decode', say: reasoning ? 'The model decodes ordinary tokens. First a hidden reasoning block, then one <code>&lt;tool_call&gt;</code> block per call, each a JSON object with a name and arguments. To the engine these are just tokens.' : 'The model decodes ordinary tokens: one <code>&lt;tool_call&gt;</code> block per call, each a JSON object with a name and arguments. To the engine these are just tokens.' },
+      { col: 1, title: '4 · Parse', say: `${reasoning ? 'The <b>reasoning parser</b> moves the think block into a separate <code>reasoning</code> field. ' : ''}The <b>tool-call parser</b> (picked with <code>--tool-call-parser</code>) finds the tag blocks, parses the JSON, assigns ids and turns them into <code>tool_calls</code>. If the JSON is malformed, the call is lost: use <code>tool_choice: "required"</code> or a named tool to make the engine constrain the arguments with structured output.` },
+      { col: 2, title: '5 · Execute', say: parallel ? 'The response ends with <code>finish_reason: "tool_calls"</code>. The client runs both calls <b>concurrently</b>, so tool time is the slowest call, not the sum.' : 'With parallel calls off, the model asks for one tool per turn. The client runs Paris, sends the result back, waits for a <b>second model call</b>, then runs Tokyo: two TTFTs and the sum of tool times.' },
+      { col: 2, title: '6 · Append & call again', say: 'Results go back as <code>role: "tool"</code> messages tied by <code>tool_call_id</code>. The next request re-sends everything; with prefix caching only the new tail is prefilled, then the model writes the final answer with <code>finish_reason: "stop"</code>.' },
+    ];
+
+    function mono(x: number, y: number, str: string, fill: string = C.text, extra: Record<string, string | number> = {}) {
+      return text(svg, x, y, str, { class: 't-small t-mono', fill, ...extra });
+    }
+
+    let svg: SVGGElement;
+    function render() {
+      clear(rootSvg);
+      const arrow = arrowDefs(rootSvg, arrowId, C.accent);
+      svg = el('g', { transform: 'translate(0, 20)' }, rootSvg);
+      const S = steps();
+      const cur = S[Math.min(k, S.length - 1)];
+      COLS.forEach((c, i) => {
+        const active = i === cur.col;
+        rect(svg, c.x, 8, c.w, 296, active ? C.accentSoft : C.surface2, { rx: 10, stroke: active ? C.accent : C.border });
+        text(svg, c.x + 12, 26, c.title, { class: 't-small t-bold', fill: active ? C.accent : C.dim });
+      });
+      // flow arrows between columns
+      if (k >= 1) s_arrow(COLS[2].x - 2, 60, COLS[1].x + COLS[1].w + 2, 60, arrow);
+      if (k >= 2) s_arrow(COLS[1].x - 2, 60, COLS[0].x + COLS[0].w + 2, 60, arrow);
+      if (k >= 3) s_arrow(COLS[0].x + COLS[0].w + 2, 150, COLS[1].x - 2, 150, arrow);
+      if (k >= 3) s_arrow(COLS[1].x + COLS[1].w + 2, 150, COLS[2].x - 2, 150, arrow);
+
+      // --- column C: request
+      const cx = COLS[2].x + 12;
+      if (k >= 0) {
+        mono(cx, 48, 'POST /v1/chat/completions', C.dim);
+        mono(cx, 64, 'messages: [system, user:', C.text);
+        mono(cx, 78, '  "Weather in Paris and Tokyo?"]', C.text);
+        mono(cx, 92, 'tools: [{type:"function",', C.text);
+        mono(cx, 106, '  function:{name:"get_weather",', C.text);
+        mono(cx, 120, '  parameters:{city:string}}}]', C.text);
+      }
+      // --- column B: template
+      const bx = COLS[1].x + 12;
+      if (k >= 1) {
+        const segs: [string, number, string][] = [['system + tool schemas', 150, C.kv], ['user', 50, C.prefill], ['asst', 40, C.token]];
+        let x = bx;
+        segs.forEach(([lab, w, col]) => { rect(svg, x, 42, w, 22, col, { rx: 3, opacity: 0.85 }); text(svg, x + 5, 53, lab, { class: 't-small t-bold', fill: 'var(--bg)' }); x += w + 2; });
+        mono(bx, 78, 'stable block → cache hit next call', C.kv);
+        mono(bx, 94, 'assistant header = "your turn"', C.dim);
+      }
+      // --- column A: raw tokens
+      const ax = COLS[0].x + 12;
+      let ay = 48;
+      if (k >= 2) {
+        if (reasoning) {
+          mono(ax, ay, '<think>', C.token); ay += 14;
+          mono(ax, ay, ' Two cities, independent lookups.', C.token); ay += 14;
+          mono(ax, ay, ' Call the tool for each.', C.token); ay += 14;
+          mono(ax, ay, '</think>', C.token); ay += 18;
+        }
+        mono(ax, ay, '<tool_call>', C.decode); ay += 14;
+        mono(ax, ay, '{"name": "get_weather",', C.text); ay += 14;
+        mono(ax, ay, ' "arguments": {"city": "Paris"}}', C.text); ay += 14;
+        mono(ax, ay, '</tool_call>', C.decode); ay += 18;
+        if (parallel) {
+          mono(ax, ay, '<tool_call>', C.decode); ay += 14;
+          mono(ax, ay, '{"name": "get_weather",', C.text); ay += 14;
+          mono(ax, ay, ' "arguments": {"city": "Tokyo"}}', C.text); ay += 14;
+          mono(ax, ay, '</tool_call>', C.decode); ay += 14;
+        }
+        mono(ax, ay + 4, '<eos>', C.faint);
+      }
+      // --- column B: parsers
+      if (k >= 3) {
+        let by = 126;
+        if (reasoning) {
+          rect(svg, bx - 4, by - 10, COLS[1].w - 16, 40, C.tokenSoft, { rx: 6 });
+          mono(bx, by, '--reasoning-parser', C.token); by += 14;
+          mono(bx, by, '<think>…</think> → "reasoning"', C.text); by += 26;
+        }
+        rect(svg, bx - 4, by - 10, COLS[1].w - 16, 54, C.decodeSoft, { rx: 6 });
+        mono(bx, by, '--enable-auto-tool-choice', C.decode); by += 14;
+        mono(bx, by, '--tool-call-parser hermes', C.decode); by += 14;
+        mono(bx, by, `<tool_call> × ${parallel ? 2 : 1} → JSON → tool_calls`, C.text); by += 26;
+        mono(bx, by, 'remaining text → "content"', C.dim);
+      }
+      // --- column C: response + execution
+      if (k >= 3) {
+        let ry = 144;
+        mono(cx, ry, 'finish_reason: "tool_calls"', C.decode); ry += 14;
+        if (reasoning) { mono(cx, ry, 'reasoning: "Two cities, …"', C.token); ry += 14; }
+        mono(cx, ry, 'tool_calls: [', C.text); ry += 14;
+        mono(cx, ry, ' {id:"call_1", function:{name:', C.text); ry += 14;
+        mono(cx, ry, '  "get_weather", arguments:', C.text); ry += 14;
+        mono(cx, ry, '  "{\\"city\\":\\"Paris\\"}"}}' + (parallel ? ',' : ']'), C.text); ry += 14;
+        if (parallel) { mono(cx, ry, ' {id:"call_2", … "Tokyo" …}]', C.text); ry += 14; }
+      }
+      if (k >= 4) {
+        // execution timeline
+        const tx = cx, tw = COLS[2].w - 24, ty = 252;
+        const total = parallel ? Math.max(...TOOL_T) : TOOL_T[0] + TTFT + DEC + TOOL_T[1];
+        const sc = tw / 4.2;
+        mono(tx, ty - 12, parallel ? 'tools run concurrently' : 'one call per turn', C.dim);
+        rect(svg, tx, ty, TOOL_T[0] * sc, 12, C.comm, { rx: 2 });
+        text(svg, tx + TOOL_T[0] * sc + 4, ty + 6, 'Paris 0.8 s', { class: 't-small' });
+        const t2 = parallel ? 0 : TOOL_T[0] + TTFT + DEC;
+        if (!parallel) { rect(svg, tx + TOOL_T[0] * sc, ty + 16, (TTFT + DEC) * sc, 12, C.decode, { rx: 2, opacity: 0.7 }); }
+        rect(svg, tx + t2 * sc, ty + 32, TOOL_T[1] * sc, 12, C.comm, { rx: 2 });
+        text(svg, tx + (t2 + TOOL_T[1]) * sc + 4, ty + 38, 'Tokyo 1.3 s', { class: 't-small' });
+        mono(tx + tw, ty - 12, `${total.toFixed(2)} s`, C.text, { 'text-anchor': 'end' });
+      }
+
+      // --- bottom strip: next request's prompt
+      const yb = 318;
+      text(svg, 10, yb, k >= 5 ? 'Next request (same session): what the engine prefills' : 'Next request: (after step 6)', { class: 't-small t-bold', fill: k >= 5 ? C.text : C.faint });
+      if (k >= 5) {
+        const parts: [string, number, string][] = [
+          ['system + tools', 260, C.kv], ['user', 70, C.kv], [reasoning ? 'asst: tool_calls (+ think?*)' : 'asst: tool_calls', 230, C.kv],
+          ['tool results', 150, C.prefill], ['asst header', 70, C.prefill],
+        ];
+        let x = 10;
+        parts.forEach(([lab, w, col]) => { rect(svg, x, yb + 12, w, 24, col, { rx: 3, opacity: col === C.kv ? 0.75 : 0.95 }); text(svg, x + 6, yb + 24, lab, { class: 't-small t-bold', fill: 'var(--bg)' }); x += w + 2; });
+        text(svg, x + 6, yb + 24, '← only the tail is new', { class: 't-small', fill: C.prefill });
+      }
+      text(rootSvg, 10, 10, `Step ${cur.title}`, { class: 't-small t-bold', fill: C.accent });
+
+      const calls = parallel ? 2 : 3;
+      const toolTime = parallel ? Math.max(...TOOL_T) : TOOL_T[0] + TOOL_T[1];
+      st.set('Model calls for this task', String(calls), parallel ? 'tool calls + final answer' : 'one per tool + final answer');
+      st.set('Tool time', `${toolTime.toFixed(1)} s`, parallel ? 'max of the two' : 'sum of the two');
+      st.set('Task latency (illustrative)', `${(calls * (TTFT + DEC) + toolTime).toFixed(2)} s`, `${calls} × (${TTFT} s TTFT + ${DEC} s decode) + tools`);
+      say(cur.say + (k >= 5 && reasoning ? ' <i>*Chat templates differ on whether earlier reasoning blocks stay in the history. Dropping them saves tokens, but if the template drops them only on some calls the prefix changes and the cache misses. Check yours.</i>' : ''));
+    }
+
+    function s_arrow(x1: number, y1: number, x2: number, y2: number, marker: string) {
+      line(svg, x1, y1, x2, y2, C.accent, { 'marker-end': marker, 'stroke-width': 1.4 });
+    }
+
+    player(bar, root, {
+      step: () => { k = Math.min(5, k + 1); return k < 5; },
+      reset: () => { k = 0; },
+      render, interval: 2200, autoplay: false,
+    });
+  });
+</script>

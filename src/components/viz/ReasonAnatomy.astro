@@ -1,0 +1,179 @@
+---
+/* Anatomy of a reasoning request: prompt prefill → long hidden "thinking" decode → visible answer.
+   Shared time axis: the top shows one request's phases and what the user sees; the bottom shows KV-cache
+   demand when N such requests start together, against the KV pool left on the GPU after FP8 weights.
+   Roofline-style model: decode step = (weight bytes + KV bytes read) / (bandwidth × 0.75). Illustrative. */
+---
+<div data-viz="reason-anatomy"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, group, select, slider, stats, legend, narration, player, C, fmt, hatchDefs, uniq } from '../../lib/viz';
+  import { getModel, getGPU, kvBytesPerToken } from '../../data/hardware';
+
+  const PROMPTS = [500, 1000, 2000, 4000, 8000, 16000, 32000];
+  const THINK = [0, 500, 1000, 2000, 4000, 8000, 16000, 32000];
+  const ANSWER = [100, 200, 400, 800, 1500, 3000];
+  const MODEL_IDS = ['qwen3-8b', 'qwen3-32b', 'llama3-70b'];
+  const GPU_IDS = ['h100', 'h200', 'b200'];
+  const W = 940, H = 340, X0 = 132, X1 = 920;
+
+  mountAll('reason-anatomy', (root) => {
+    let model = getModel('qwen3-32b');
+    let gpu = getGPU('h100');
+    let pI = 2, tI = 4, aI = 2, conc = 16;
+    let t = 0; // cursor, seconds
+
+    const bar1 = ctrlBar(root);
+    const g1 = group(bar1);
+    select(g1, 'Model (FP8 weights)', MODEL_IDS.map((id) => ({ value: id, label: getModel(id).name })), model.id, (v) => { model = getModel(v); t = 0; render(); });
+    select(g1, 'GPU', GPU_IDS.map((id) => ({ value: id, label: getGPU(id).name })), gpu.id, (v) => { gpu = getGPU(v); t = 0; render(); });
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'Prompt', min: 0, max: PROMPTS.length - 1, value: pI, format: (i) => fmt.num(PROMPTS[i], 0), onInput: (i) => { pI = i; t = 0; render(); } });
+    slider(bar2, { label: 'Thinking tokens', min: 0, max: THINK.length - 1, value: tI, format: (i) => fmt.num(THINK[i], 0), onInput: (i) => { tI = i; t = 0; render(); } });
+    slider(bar2, { label: 'Answer tokens', min: 0, max: ANSWER.length - 1, value: aI, format: (i) => fmt.num(ANSWER[i], 0), onInput: (i) => { aI = i; t = 0; render(); } });
+    slider(bar2, { label: 'Concurrent requests', min: 1, max: 256, value: conc, onInput: (v) => { conc = v; t = 0; render(); } });
+    const bar3 = ctrlBar(root);
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Timeline of a reasoning request and the KV-cache demand of many such requests' });
+    const hatchId = uniq('ra-h');
+    const say = narration(root);
+    const st = stats(root, ['First token (hidden)', 'First answer token', 'End-to-end', 'Fit in KV at full length', 'GPU cost / 1k answers']);
+    legend(root, [['Prefill', C.prefill], ['Thinking (hidden) decode', C.token], ['Answer decode', C.decode], ['KV demand', C.kv], ['Over capacity → preemption', C.waste]]);
+
+    function calc() {
+      const prompt = PROMPTS[pI], think = THINK[tI], ans = ANSWER[aI];
+      const out = think + ans;
+      const wB = model.params * 1; // FP8 weights
+      const kvTok = kvBytesPerToken(model, 2);
+      const usable = gpu.memGB * 1e9 * 0.92;
+      const pool = usable - wB - 4e9;
+      const fits = pool > 0;
+      const prefillS = (2 * model.params * prompt) / ((gpu.fp8TF ?? gpu.bf16TF) * 1e12 * 0.4) + 0.02;
+      const avgCtx = prompt + out / 2; // steady-state: neighbours are halfway through on average
+      const stepS = (wB + conc * avgCtx * kvTok) / (gpu.bwTBs * 1e12 * 0.75) + 0.003;
+      const thinkEnd = prefillS + think * stepS;
+      const e2e = thinkEnd + ans * stepS;
+      const perReq = (prompt + out) * kvTok;
+      const maxFull = fits ? Math.floor(pool / perReq) : 0;
+      const burstPeak = conc * perReq;
+      // time when the burst's demand crosses the pool
+      let cross = -1;
+      if (fits && burstPeak > pool) {
+        const need = pool / (conc * kvTok) - prompt; // generated tokens when crossing
+        cross = need <= 0 ? prefillS : prefillS + need * stepS;
+      }
+      const costPerK = (gpu.pricePerHr / 3600) * e2e / conc * 1000;
+      return { prompt, think, ans, out, kvTok, pool, fits, prefillS, stepS, thinkEnd, e2e, perReq, maxFull, burstPeak, cross, costPerK };
+    }
+
+    function reset() { t = 0; }
+    function step() { const m = calc(); t = Math.min(m.e2e, t + m.e2e / 80); return t < m.e2e; }
+
+    function render() {
+      clear(svg);
+      const hatch = hatchDefs(svg, hatchId, C.waste);
+      const m = calc();
+      if (!m.fits) {
+        text(svg, W / 2, H / 2, `${model.name} in FP8 does not fit on one ${gpu.name}. Pick a bigger GPU or a smaller model.`, { 'text-anchor': 'middle', class: 't-bold', fill: C.waste });
+        ['First token (hidden)', 'First answer token', 'End-to-end', 'Fit in KV at full length', 'GPU cost / 1k answers'].forEach((k) => st.set(k, '–', ''));
+        say('The weights alone exceed the memory budget, so there is no KV pool at all.');
+        return;
+      }
+      const sx = (sec: number) => X0 + (sec / m.e2e) * (X1 - X0);
+
+      // ---- row 1: one request
+      text(svg, 10, 34, 'One request', { class: 't-small t-bold' });
+      const y1 = 22, hh = 26;
+      rect(svg, X0, y1, X1 - X0, hh, C.surface2, { rx: 4, stroke: C.border });
+      const segs: [number, number, string, string][] = [
+        [0, m.prefillS, C.prefill, `prefill ${fmt.num(m.prompt, 0)}`],
+        [m.prefillS, m.thinkEnd, C.token, `thinking ${fmt.num(m.think, 0)} tokens`],
+        [m.thinkEnd, m.e2e, C.decode, `answer ${fmt.num(m.ans, 0)}`],
+      ];
+      for (const [a, b, col, lab] of segs) {
+        const w = sx(b) - sx(a);
+        if (w <= 0) continue;
+        rect(svg, sx(a), y1, w, hh, col, { rx: 0, opacity: t >= b ? 0.95 : 0.3 });
+        if (t > a && t < b) rect(svg, sx(a), y1, sx(t) - sx(a), hh, col, { rx: 0, opacity: 0.95 });
+        if (w > 90) text(svg, sx(a) + 6, y1 + hh / 2, lab, { class: 't-small t-bold', fill: t > a + (b - a) * 0.3 ? 'var(--bg)' : C.text });
+      }
+      // row 2: what the user sees
+      text(svg, 10, 74, 'User sees', { class: 't-small t-bold' });
+      const y2 = 64;
+      rect(svg, X0, y2, sx(m.thinkEnd) - X0, 18, C.surface3, { rx: 3 });
+      if (sx(m.thinkEnd) - X0 > 120) text(svg, X0 + 6, y2 + 9, m.think > 0 ? 'spinner / "thinking…" (or a reasoning summary)' : 'waiting for prefill', { class: 't-small t-dim' });
+      rect(svg, sx(m.thinkEnd), y2, X1 - sx(m.thinkEnd), 18, C.decodeSoft, { rx: 3, stroke: C.decode });
+      if (X1 - sx(m.thinkEnd) > 90) text(svg, sx(m.thinkEnd) + 6, y2 + 9, 'answer streams', { class: 't-small', fill: C.decode });
+      // markers
+      const mark = (sec: number, lab: string, anchor: string, col: string) => {
+        line(svg, sx(sec), y1 - 6, sx(sec), y2 + 24, col, { 'stroke-dasharray': '3 3' });
+        text(svg, sx(sec) + (anchor === 'end' ? -4 : 4), y2 + 32, lab, { class: 't-small t-mono', 'text-anchor': anchor, fill: col });
+      };
+      mark(m.prefillS, `first token ${fmt.ms(m.prefillS * 1000)}`, sx(m.prefillS) > X1 - 220 ? 'end' : 'start', C.prefill);
+      if (m.think > 0) mark(m.thinkEnd, `first answer token ${fmt.ms(m.thinkEnd * 1000)}`, sx(m.thinkEnd) > X1 - 260 ? 'end' : 'start', C.decode);
+
+      // ---- KV chart
+      const cy0 = 128, cy1 = 300; // top/bottom of plot
+      const yMax = Math.max(m.pool * 1.25, m.burstPeak * 1.08);
+      const sy = (b: number) => cy1 - (b / yMax) * (cy1 - cy0);
+      text(svg, 10, cy0 + 4, `KV demand,`, { class: 't-small t-bold' });
+      text(svg, 10, cy0 + 18, `${conc} requests`, { class: 't-small t-bold' });
+      text(svg, 10, cy0 + 32, 'arriving together', { class: 't-small t-dim' });
+      line(svg, X0, cy1, X1, cy1, C.borderStrong, { 'stroke-width': 1 });
+      line(svg, X0, cy0 - 4, X0, cy1, C.borderStrong, { 'stroke-width': 1 });
+      for (const f of [0.5, 1]) {
+        const v = yMax * f;
+        text(svg, X0 - 6, sy(v), `${fmt.num(v / 1e9, 0)} GB`, { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+      }
+      // demand polyline: prompt KV after prefill, grows linearly with generated tokens
+      const demand = (sec: number) => {
+        if (sec < m.prefillS) return conc * m.prompt * m.kvTok * (sec / m.prefillS);
+        const gen = Math.min(m.out, (sec - m.prefillS) / m.stepS);
+        return conc * (m.prompt + gen) * m.kvTok;
+      };
+      const pts: string[] = [];
+      const N = 120;
+      for (let i = 0; i <= N; i++) { const sec = (i / N) * m.e2e; pts.push(`${sx(sec)},${sy(demand(sec))}`); }
+      // over-capacity area
+      if (m.cross >= 0) {
+        const over: string[] = [`${sx(m.cross)},${sy(m.pool)}`];
+        for (let i = 0; i <= N; i++) { const sec = (i / N) * m.e2e; if (sec >= m.cross) over.push(`${sx(sec)},${sy(demand(sec))}`); }
+        over.push(`${X1},${sy(m.pool)}`);
+        s('polygon', { points: over.join(' '), fill: hatch, stroke: 'none' }, svg);
+      }
+      s('polygon', { points: `${X0},${cy1} ${pts.join(' ')} ${X1},${cy1}`, fill: C.kvSoft, stroke: 'none' }, svg);
+      s('polyline', { points: pts.join(' '), fill: 'none', stroke: C.kv, 'stroke-width': 2 }, svg);
+      // capacity
+      line(svg, X0, sy(m.pool), X1, sy(m.pool), C.text, { 'stroke-dasharray': '5 4', 'stroke-width': 1.2 });
+      text(svg, X1 - 4, sy(m.pool) - 9, `KV pool ${fmt.num(m.pool / 1e9, 1)} GB = ${fmt.num(m.pool / m.kvTok, 0)} tokens`, { 'text-anchor': 'end', class: 't-small t-bold' });
+      if (m.cross >= 0) {
+        line(svg, sx(m.cross), cy0 - 4, sx(m.cross), cy1, C.waste, { 'stroke-width': 1.5 });
+        const right = sx(m.cross) < X1 - 260;
+        text(svg, sx(m.cross) + (right ? 6 : -6), cy1 - 12, `full at ${fmt.ms(m.cross * 1000)}: preemption starts`, { class: 't-small t-bold', fill: C.waste, 'text-anchor': right ? 'start' : 'end' });
+      }
+      // cursor
+      if (t > 0) {
+        line(svg, sx(t), y1 - 6, sx(t), cy1, C.accent, { 'stroke-width': 1.5 });
+        s('circle', { cx: sx(t), cy: sy(demand(t)), r: 4, fill: C.accent }, svg);
+      }
+      text(svg, X0, cy1 + 16, '0 s', { class: 't-small t-mono t-faint' });
+      text(svg, X1, cy1 + 16, `${m.e2e.toFixed(1)} s`, { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+      text(svg, (X0 + X1) / 2, cy1 + 16, `decode step ${fmt.ms(m.stepS * 1000)} at batch ${conc} → ${Math.round(1 / m.stepS)} tok/s per request`, { 'text-anchor': 'middle', class: 't-small t-dim' });
+
+      st.set('First token (hidden)', fmt.ms(m.prefillS * 1000), 'what TTFT metrics measure');
+      st.set('First answer token', fmt.ms(m.thinkEnd * 1000), m.think ? `${fmt.num(m.think, 0)} thinking tokens first` : 'no thinking', m.thinkEnd > 10 ? C.waste : undefined);
+      st.set('End-to-end', `${m.e2e.toFixed(1)} s`, `${fmt.pct(m.think / m.out)} of output is hidden`);
+      st.set('Fit in KV at full length', fmt.int(m.maxFull), `${fmt.num(m.perReq / 1e9, 2)} GB each`, m.maxFull >= conc ? C.good : C.waste);
+      st.set('GPU cost / 1k answers', `$${m.costPerK.toFixed(2)}`, `at ~$${gpu.pricePerHr}/GPU-h, batch ${conc}`);
+
+      let msg: string;
+      if (t === 0) msg = 'Press <b>Play</b> to follow one request. Then drag <b>Thinking tokens</b> from 0 to 16k and watch the answer move to the right while the KV curve climbs.';
+      else if (t < m.prefillS) msg = '<b>Prefill.</b> The prompt is processed in one compute-bound pass. Standard TTFT ends here, but for a reasoning model the first token is hidden.';
+      else if (t < m.thinkEnd) msg = `<b>Thinking.</b> Every hidden token is an ordinary decode step: same cost, same KV growth. ${fmt.int(Math.min(m.think, (t - m.prefillS) / m.stepS))} of ${fmt.int(m.think)} so far; the user still sees nothing.`;
+      else msg = `<b>Answer.</b> The visible part finally streams. ${m.cross >= 0 ? 'A burst this size outgrew the KV pool partway through, so the scheduler had to preempt some of these requests and redo their work later.' : 'The whole burst stayed inside the KV pool.'}`;
+      say(msg);
+    }
+
+    player(bar3, root, { step, reset, render, interval: 60, autoplay: false });
+  });
+</script>

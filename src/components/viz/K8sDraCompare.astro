@@ -1,0 +1,101 @@
+---
+/* Device plugin (count of nvidia.com/gpu) vs DRA (ResourceClaim with device class + CEL selectors).
+   The reader picks a requirement; both panels show how (or whether) it can be expressed, and a
+   capability matrix summarises all requirements. YAML is trimmed to the relevant fields. */
+---
+<div data-viz="k8s-dra-compare"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, segmented, narration, C } from '../../lib/viz';
+
+  type Verdict = 'yes' | 'partial' | 'no';
+  interface Side { v: Verdict; tag: string; yaml: string[]; note: string; }
+  interface Req { id: string; label: string; dp: Side; dra: Side; story: string; }
+
+  const REQS: Req[] = [
+    {
+      id: 'any', label: 'Any one GPU',
+      dp: { v: 'yes', tag: 'Count', yaml: ['containers:', '- name: vllm', '  resources:', '    limits:', '      nvidia.com/gpu: 1'], note: 'Simple and universal. The scheduler only counts.' },
+      dra: { v: 'yes', tag: 'Claim', yaml: ['kind: ResourceClaimTemplate', 'spec:', '  spec:', '    devices:', '      requests:', '      - name: gpu', '        exactly:', '          deviceClassName: gpu.nvidia.com', '---  # in the Pod', 'resourceClaims: [{ name: gpu,', '  resourceClaimTemplateName: one-gpu }]', 'containers: [{ resources: { claims: [{ name: gpu }] } }]'], note: 'More YAML for the same result.' },
+      story: 'For "give me one GPU" the device plugin is shorter and works everywhere. DRA pays off only when the request needs to say <i>which</i> device, or how devices relate.',
+    },
+    {
+      id: 'model', label: 'H100 or H200, ≥ 80 GiB',
+      dp: { v: 'partial', tag: 'Node labels', yaml: ['affinity:', '  nodeAffinity:', '    requiredDuringScheduling…:', '      nodeSelectorTerms:', '      - matchExpressions:', '        - key: nvidia.com/gpu.product', '          operator: In', '          values: [NVIDIA-H100-80GB-HBM3, NVIDIA-H200]', 'resources: { limits: { nvidia.com/gpu: 1 } }'], note: 'Selects a node, not a device: assumes every GPU in it is identical.' },
+      dra: { v: 'yes', tag: 'CEL on the device', yaml: ['exactly:', '  deviceClassName: gpu.nvidia.com', '  selectors:', '  - cel:', '      expression: |', "        device.attributes['gpu.nvidia.com']", "          .productName.matches('H100|H200') &&", "        device.capacity['gpu.nvidia.com']", "          .memory.compareTo(quantity('80Gi')) >= 0"], note: 'Evaluated per device against what the driver published.' },
+      story: 'GFD labels describe the <b>node</b>, so with the device plugin you filter nodes and hope the GPUs inside match. DRA drivers publish each device with typed attributes and capacities in a <code>ResourceSlice</code>, and the CEL selector is checked against each one.',
+    },
+    {
+      id: 'shared', label: 'Two containers, one GPU',
+      dp: { v: 'no', tag: 'Not per request', yaml: ['containers:', '- name: engine', '  resources: { limits: { nvidia.com/gpu: 1 } }', '- name: sidecar', '  resources: { limits: { nvidia.com/gpu: 1 } }', '# → two different GPUs', '# sharing needs a node-wide time-slicing', '# or MPS config by the cluster admin'], note: 'Each request gets its own device. Sharing is a node setting.' },
+      dra: { v: 'yes', tag: 'Shared claim', yaml: ['kind: ResourceClaim        # not a template', 'metadata: { name: shared-gpu }', 'spec: { devices: { requests: [{ name: g,', '  exactly: { deviceClassName: gpu.nvidia.com } }] } }', '---  # in the Pod', 'resourceClaims: [{ name: g,', '  resourceClaimName: shared-gpu }]', 'containers:', '- name: engine   resources: { claims: [{ name: g }] }', '- name: sidecar  resources: { claims: [{ name: g }] }'], note: 'Both containers (or several pods) reference one claim.' },
+      story: 'A <code>ResourceClaim</code> is an object with its own lifecycle. Anything that references the same claim gets the <b>same</b> device, so sharing is an explicit, per-workload decision instead of a node-wide replica count.',
+    },
+    {
+      id: 'mig', label: 'One 1g MIG slice',
+      dp: { v: 'partial', tag: 'Pre-partitioned', yaml: ['# admin: label node nvidia.com/mig.config=all-1g.10gb', '#        MIG strategy: mixed', 'resources:', '  limits:', '    nvidia.com/mig-1g.10gb: 1'], note: 'Works, but the layout is fixed per node by an admin.' },
+      dra: { v: 'yes', tag: 'Device class', yaml: ['exactly:', '  deviceClassName: mig.nvidia.com', '  selectors:', '  - cel:', '      expression: |', "        device.attributes['gpu.nvidia.com']", "          .profile == '1g.10gb'   # illustrative"], note: 'MIG devices are first-class; on-demand carving is newer.' },
+      story: 'With the device plugin, each MIG profile becomes its own resource name and the node layout is chosen ahead of time. With DRA, MIG devices are published under their own <code>DeviceClass</code> and selected by attributes like any other device.',
+    },
+    {
+      id: 'nvl', label: 'Multi-node NVLink domain',
+      dp: { v: 'no', tag: 'No concept', yaml: ['# 4 pods × 4 GPUs, one per GB200 node', 'resources: { limits: { nvidia.com/gpu: 4 } }', '# nothing says "same NVL72 rack",', '# nothing sets up IMEX channels between', '# the pods: hand-built node labels + scripts'], note: 'Counts cannot describe a fabric spanning nodes.' },
+      dra: { v: 'yes', tag: 'ComputeDomain', yaml: ['apiVersion: resource.nvidia.com/v1beta1', 'kind: ComputeDomain', 'metadata: { name: llm-cd }', 'spec:', '  numNodes: 4', '  channel:', '    resourceClaimTemplate: { name: llm-cd-ch }', '---  # each worker pod', 'resourceClaims: [{ name: ch,', '  resourceClaimTemplateName: llm-cd-ch }]'], note: 'The driver joins pods into one multi-node NVLink (IMEX) domain.' },
+      story: 'On GB200/GB300 NVL72, 72 GPUs across many trays share one NVLink domain. A <b>ComputeDomain</b> asks the NVIDIA DRA driver to set up IMEX channels so pods on different nodes can address each other\'s GPU memory over NVLink. A device count has no way to say this.',
+    },
+  ];
+
+  const W = 940, H = 392, PW = 452, PY = 8, PH = 262;
+
+  mountAll('k8s-dra-compare', (root) => {
+    let cur = REQS[1];
+    const bar = ctrlBar(root);
+    segmented(bar, REQS.map((r) => ({ value: r.id, label: r.label })), cur.id, (v) => { cur = REQS.find((r) => r.id === v)!; render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'The same GPU requirement written for the device plugin and for DRA' });
+    const say = narration(root);
+
+    const col = (v: Verdict) => (v === 'yes' ? C.good : v === 'partial' ? C.prefill : C.waste);
+    const word = (v: Verdict) => (v === 'yes' ? 'Expressible' : v === 'partial' ? 'Workaround' : 'Not expressible');
+
+    function panel(x: number, title: string, sub: string, sd: Side) {
+      rect(svg, x, PY, PW, PH, C.surface2, { rx: 10, stroke: C.border });
+      text(svg, x + 14, PY + 18, title, { class: 't-bold' });
+      text(svg, x + 14, PY + 34, sub, { class: 't-small t-faint' });
+      const c = col(sd.v);
+      rect(svg, x + PW - 134, PY + 10, 122, 22, 'transparent', { rx: 11, stroke: c });
+      text(svg, x + PW - 73, PY + 21, word(sd.v), { 'text-anchor': 'middle', class: 't-small t-bold', fill: c });
+      text(svg, x + PW - 73, PY + 42, sd.tag, { 'text-anchor': 'middle', class: 't-small t-dim' });
+      sd.yaml.forEach((l, i) => text(svg, x + 14, PY + 62 + i * 15, l, { style: 'white-space:pre', class: 't-small t-mono', fill: l.trim().startsWith('#') ? C.faint : C.text }));
+      text(svg, x + 14, PY + PH - 14, sd.note, { class: 't-small t-bold', fill: c });
+    }
+
+    function render() {
+      clear(svg);
+      panel(10, 'Device plugin', 'extended resource: an integer count', cur.dp);
+      panel(W - PW - 10, 'Dynamic Resource Allocation', 'resource.k8s.io/v1 · ResourceClaim', cur.dra);
+
+      // matrix
+      const MY = PY + PH + 14;
+      text(svg, 14, MY + 10, 'Requirement', { class: 't-small t-faint t-bold' });
+      REQS.forEach((r, i) => {
+        const x = 160 + i * 154;
+        const on = r.id === cur.id;
+        rect(svg, x, MY, 148, 104, on ? C.accentSoft : 'transparent', { rx: 8, stroke: on ? C.accent : C.border });
+        text(svg, x + 74, MY + 16, r.label, { 'text-anchor': 'middle', class: 't-small t-bold', fill: on ? C.accent : C.text });
+        [['plugin', r.dp.v], ['DRA', r.dra.v]].forEach(([k, v], j) => {
+          const yy = MY + 44 + j * 30;
+          text(svg, x + 12, yy, k, { class: 't-small t-dim' });
+          text(svg, x + 136, yy, word(v as Verdict), { 'text-anchor': 'end', class: 't-small t-bold', fill: col(v as Verdict) });
+        });
+      });
+      text(svg, 14, MY + 44, 'Device plugin', { class: 't-small t-faint' });
+      text(svg, 14, MY + 74, 'DRA', { class: 't-small t-faint' });
+      say(cur.story);
+    }
+    render();
+  });
+</script>
+
+<style is:global>
+  [data-viz='k8s-dra-compare'] .seg { flex-wrap: wrap; }
+</style>

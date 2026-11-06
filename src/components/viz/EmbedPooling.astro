@@ -1,0 +1,145 @@
+---
+/* Pooling explainer: per-token hidden states → one sentence vector via CLS, mean or
+   last-token pooling, with padding masks, Matryoshka truncation and cosine similarity
+   between two sentences. Toy 8-dimensional vectors; illustrative. */
+---
+<div data-viz="embed-pooling"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, group, segmented, select, checkbox, slider, stats, narration, rng, C } from '../../lib/viz';
+
+  type Pool = 'cls' | 'mean' | 'last';
+  const D = 8, LEN = 12;
+  const LEX: Record<string, number[]> = {
+    how: [0, 0, 0, 0, 0, 0.8, 0, 0], do: [0, 0.1, 0, 0, 0, 0.5, 0, 0], i: [0.1, 0, 0, 0, 0, 0.3, 0, 0],
+    reset: [0.3, 0.9, 0, 0, 0, 0.2, 0.1, 0], my: [0.3, 0, 0, 0, 0, 0.1, 0, 0], password: [1, 0.2, 0, 0, 0, 0, 0, 0],
+    steps: [0, 0.4, 0, 0, 0, 0.6, 0, 0], to: [0, 0.1, 0, 0, 0, 0.1, 0, 0], change: [0.2, 0.9, 0, 0, 0, 0.1, 0, 0],
+    a: [0, 0, 0, 0, 0, 0, 0, 0], forgotten: [0.5, 0.3, 0, 0, 0.2, 0, 0.3, 0],
+    best: [0, 0, 0.4, 0, 0, 0.3, -0.2, 0.2], pizza: [0, 0, 1, 0, 0, 0, 0, 0.1], in: [0, 0, 0, 0, 0, 0, 0, 0.4],
+    naples: [0, 0, 0.6, 0, 0, 0, 0, 0.9], tonight: [0, 0, 0.2, 0, 0, 0, 0, 0.8],
+    the: [0, 0, 0, 0, 0, 0, 0, 0], gpu: [0, 0, 0, 1, 0.3, 0, 0, 0], ran: [0, 0.3, 0, 0.1, 0.2, 0, 0.5, 0],
+    out: [0, 0, 0, 0, 0.3, 0, 0.7, 0], of: [0, 0, 0, 0, 0, 0, 0, 0], memory: [0, 0, 0, 0.4, 1, 0, 0, 0],
+    has: [0, 0, 0, 0, 0.1, 0, 0, 0], plenty: [0, 0, 0, 0, 0.4, 0, -0.6, 0],
+  };
+  const PAIRS = {
+    para: { label: 'Paraphrase', a: 'how do i reset my password', b: 'steps to change a forgotten password' },
+    unrel: { label: 'Unrelated', a: 'how do i reset my password', b: 'best pizza in naples tonight' },
+    neg: { label: 'Opposite meaning, same words', a: 'the gpu ran out of memory', b: 'the gpu has plenty of memory' },
+  };
+  type PairId = keyof typeof PAIRS;
+  // LEX dims: auth, action, food, gpu, memory, question, polarity, place/time
+  const ORDER = [0, 2, 3, 4, 1, 5, 6, 7];
+  const OFFSET = 0.12; // shared direction most real embedding spaces have (anisotropy)
+  const PAD = [0.5, -0.3, 0.4, 0.2, -0.4, 0.1, 0.3, -0.2];
+
+  function hash(s: string) { let h = 2166136261; for (const ch of s) h = Math.imul(h ^ ch.charCodeAt(0), 16777619); return h >>> 0; }
+  function wordVec(w: string) {
+    const r = rng(hash(w));
+    const raw = LEX[w] ?? Array(D).fill(0);
+    // Matryoshka-style ordering: the most discriminative topic dimensions come first
+    const base = ORDER.map((j) => raw[j]);
+    return base.map((v) => v + OFFSET + (r() - 0.5) * 0.16);
+  }
+
+  interface Tok { label: string; v: number[]; kind: 'cls' | 'word' | 'eos' | 'pad' }
+  function encode(sentence: string): Tok[] {
+    const words = sentence.split(' ');
+    const wv = words.map(wordVec);
+    const mean = Array.from({ length: D }, (_, d) => wv.reduce((a, v) => a + v[d], 0) / wv.length);
+    // CLS (bidirectional summary) and EOS (causal, recency-weighted summary) final states
+    const cls = mean.map((m, d) => 0.75 * m + (d === 5 ? 0.25 : 0.05));
+    const ws = wv.map((_, i) => Math.pow(1.7, i));
+    const wsum = ws.reduce((a, b) => a + b, 0);
+    const eos = Array.from({ length: D }, (_, d) => wv.reduce((a, v, i) => a + (ws[i] / wsum) * v[d], 0));
+    const toks: Tok[] = [{ label: '[CLS]', v: cls, kind: 'cls' }, ...words.map((w, i) => ({ label: w, v: wv[i], kind: 'word' as const })), { label: '[EOS]', v: eos, kind: 'eos' }];
+    while (toks.length < LEN) toks.push({ label: '[PAD]', v: PAD.slice(), kind: 'pad' });
+    return toks;
+  }
+
+  function pool(toks: Tok[], mode: Pool, mask: boolean): { vec: number[]; w: number[] } {
+    const w = toks.map(() => 0);
+    if (mode === 'cls') w[0] = 1;
+    else if (mode === 'last') { const idx = mask ? toks.findIndex((t) => t.kind === 'pad') - 1 : toks.length - 1; w[idx < 0 ? toks.length - 1 : idx] = 1; }
+    else { const use = toks.map((t) => (!mask || t.kind !== 'pad' ? 1 : 0)); const n = use.reduce((a: number, b) => a + b, 0); use.forEach((u, i) => (w[i] = u / n)); }
+    const vec = Array.from({ length: D }, (_, d) => toks.reduce((a, t, i) => a + w[i] * t.v[d], 0));
+    return { vec, w };
+  }
+  const dot = (a: number[], b: number[], k: number) => a.slice(0, k).reduce((s, x, i) => s + x * b[i], 0);
+  const norm = (a: number[], k: number) => Math.sqrt(dot(a, a, k));
+  const cos = (a: number[], b: number[], k: number) => dot(a, b, k) / (norm(a, k) * norm(b, k));
+
+  const W = 940, H = 300, TX = 70, CW = 48, SQ = 10;
+
+  mountAll('embed-pooling', (root) => {
+    let pair: PairId = 'para', mode: Pool = 'mean', mask = true, dims = 8;
+    const bar = ctrlBar(root);
+    segmented(bar, [{ value: 'cls', label: 'CLS' }, { value: 'mean', label: 'Mean' }, { value: 'last', label: 'Last token' }], mode, (v) => { mode = v; render(); });
+    select(bar, 'Pair', (Object.keys(PAIRS) as PairId[]).map((k) => ({ value: k, label: PAIRS[k].label })), pair, (v) => { pair = v; render(); });
+    const bar2 = ctrlBar(root);
+    const g = group(bar2);
+    checkbox(g, 'Mask padding', mask, (v) => { mask = v; render(); });
+    slider(g, { label: 'Matryoshka dims kept', min: 2, max: 8, step: 2, value: dims, format: (v) => `${v} / 8`, onInput: (v) => { dims = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Token hidden states pooled into sentence vectors and compared by cosine similarity' });
+    const st = stats(root, ['Cosine (this pooling)', 'CLS', 'Mean', 'Last token']);
+    const say = narration(root);
+
+    function cell(x: number, y: number, v: number, faded = false) {
+      const a = Math.min(1, Math.abs(v));
+      rect(svg, x, y, SQ, SQ, C.surface3, { rx: 2 });
+      rect(svg, x, y, SQ, SQ, v >= 0 ? C.decode : C.prefill, { rx: 2, opacity: (faded ? 0.25 : 1) * (0.1 + 0.9 * a) });
+    }
+
+    function drawSeq(y0: number, name: string, toks: Tok[], w: number[], vec: number[]) {
+      text(svg, 6, y0 + 8, name, { class: 't-bold' });
+      toks.forEach((t, i) => {
+        const x = TX + i * CW;
+        const isPad = t.kind === 'pad';
+        text(svg, x + CW / 2, y0 + 8, t.label.length > 8 ? t.label.slice(0, 7) + '…' : t.label, { 'text-anchor': 'middle', class: 't-small' + (t.kind === 'word' ? '' : ' t-mono') + (isPad ? ' t-faint' : t.kind !== 'word' ? ' t-dim' : '') });
+        for (let d = 0; d < D; d++) cell(x + (CW - SQ) / 2, y0 + 18 + d * (SQ + 1), t.v[d], d >= dims);
+        const wh = Math.min(14, w[i] * 14 * (mode === 'mean' ? 4 : 1));
+        rect(svg, x + 6, y0 + 18 + D * (SQ + 1) + 4, CW - 12, 3, C.surface3, { rx: 1 });
+        if (w[i] > 0) rect(svg, x + 6, y0 + 18 + D * (SQ + 1) + 4, (CW - 12) * Math.min(1, wh / 14), 3, isPad ? C.waste : C.kv, { rx: 1 });
+      });
+      const px = TX + LEN * CW + 20;
+      text(svg, px - 10, y0 + 18 + (D * (SQ + 1)) / 2, '→', { 'text-anchor': 'middle', class: 't-bold t-dim' });
+      text(svg, px + 8, y0 + 8, 'pooled', { 'text-anchor': 'middle', class: 't-small t-bold' });
+      for (let d = 0; d < D; d++) cell(px + 3, y0 + 18 + d * (SQ + 1), vec[d] / Math.max(norm(vec, D), 1e-9) * 2, d >= dims);
+    }
+
+    function render() {
+      clear(svg);
+      const P = PAIRS[pair];
+      const A = encode(P.a), B = encode(P.b);
+      const pa = pool(A, mode, mask), pb = pool(B, mode, mask);
+      drawSeq(10, 'A', A, pa.w, pa.vec);
+      drawSeq(150, 'B', B, pb.w, pb.vec);
+      line(svg, TX, 140, TX + LEN * CW, 140, C.border, { 'stroke-dasharray': '3 4', 'stroke-width': 1 });
+      text(svg, TX, H - 6, 'pooling weight per token ▬', { class: 't-small t-faint' });
+
+      const c = cos(pa.vec, pb.vec, dims);
+      const RX = TX + LEN * CW + 60;
+      text(svg, RX, 40, 'cosine(A, B)', { class: 't-small t-dim' });
+      text(svg, RX, 66, c.toFixed(3), { class: 't-big t-mono', fill: c > 0.85 ? C.good : c < 0.6 ? C.prefill : C.text });
+      const barW = W - RX - 10;
+      rect(svg, RX, 84, barW, 8, C.surface3, { rx: 4 });
+      rect(svg, RX, 84, barW * Math.max(0, c), 8, C.kv, { rx: 4 });
+      text(svg, RX, 118, `|A| = ${norm(pa.vec, dims).toFixed(2)}`, { class: 't-small t-mono t-dim' });
+      text(svg, RX, 134, `|B| = ${norm(pb.vec, dims).toFixed(2)}`, { class: 't-small t-mono t-dim' });
+      text(svg, RX, 150, `A·B = ${dot(pa.vec, pb.vec, dims).toFixed(2)}`, { class: 't-small t-mono t-dim' });
+      text(svg, RX, 176, 'normalise → A·B = cos', { class: 't-small t-faint' });
+
+      const all = (m: Pool) => cos(pool(A, m, mask).vec, pool(B, m, mask).vec, dims);
+      st.set('Cosine (this pooling)', c.toFixed(3), `${dims} of 8 dims`);
+      st.set('CLS', all('cls').toFixed(3), 'BERT-style encoders');
+      st.set('Mean', all('mean').toFixed(3), mask ? 'over real tokens' : 'padding included!', mask ? undefined : C.waste);
+      st.set('Last token', all('last').toFixed(3), mask ? 'last real token' : 'position 12 = [PAD]!', mask ? undefined : C.waste);
+
+      if (!mask && mode !== 'cls') say(mode === 'mean' ? 'Without the attention mask, <b>[PAD]</b> states are averaged in. Both sentences share the same padding vector, so their similarity drifts towards the padding instead of the meaning, and the result depends on how long the other texts in the batch were.' : 'Last-token pooling on a right-padded batch picks the final <b>position</b>, which is a [PAD]. Engines must index the last <i>real</i> token of each sequence (or pad on the left).');
+      else if (pair === 'neg') say('The two sentences say opposite things but share most of their words, so a bi-encoder scores them as very similar under every pooling. A <b>cross-encoder reranker</b>, which reads both texts together, is much better at catching this.');
+      else if (dims < 8) say(`Keeping only the first <b>${dims}</b> dimensions (Matryoshka truncation) still separates related from unrelated pairs, because a Matryoshka-trained model packs the most important information into the leading dimensions. Storage shrinks by ${8 / dims}×.`);
+      else say(`<b>${mode === 'cls' ? 'CLS pooling' : mode === 'mean' ? 'Mean pooling' : 'Last-token pooling'}</b>: ${mode === 'cls' ? 'take the hidden state of the first token, which a bidirectional encoder trained this way uses as its summary.' : mode === 'mean' ? 'average the hidden states of all real tokens. Common for sentence-transformer models.' : 'take the hidden state of the final token. Used by decoder-based (LLM-derived) embedding models, where only the last token has seen the whole text.'} The pooling must match how the model was trained.`);
+    }
+    render();
+  });
+</script>

@@ -1,0 +1,135 @@
+---
+/* "GPU utilisation lies": a kernel timeline across SM groups for one decode step of an 8B model
+   on an H100-class GPU. Batch size, kernel grid coverage and CUDA graphs on/off drive what each
+   metric reports: GPU_UTIL (any kernel running), SM_ACTIVE, SM_OCCUPANCY, PIPE_TENSOR_ACTIVE,
+   DRAM_ACTIVE, and the tokens/s actually delivered. Illustrative model, not a profiler trace. */
+---
+<div data-viz="obs-util"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, slider, checkbox, stats, legend, narration, C } from '../../lib/viz';
+
+  // one decode step = these kernels per layer (relative weight bytes moved, uses tensor cores?)
+  const KERNELS = [
+    { name: 'norm', w: 0.02, tensor: false },
+    { name: 'qkv', w: 0.18, tensor: true },
+    { name: 'attn', w: 0.10, tensor: false, kv: true },
+    { name: 'o', w: 0.12, tensor: true },
+    { name: 'norm', w: 0.02, tensor: false },
+    { name: 'gate+up', w: 0.38, tensor: true },
+    { name: 'act', w: 0.02, tensor: false },
+    { name: 'down', w: 0.19, tensor: true },
+  ];
+  const RIDGE = 295;        // H100 BF16 FLOP/byte ridge (989 TFLOPS / 3.35 TB/s)
+  const STEP_MS_B1 = 5.2;   // ~16 GB of weights / ~3.1 TB/s achieved
+  const LANES = 12;
+  const W = 920, H = 285;
+
+  mountAll('obs-util', (root) => {
+    let batch = 8, cover = 1.0, graphs = true;
+    const bar = ctrlBar(root);
+    slider(bar, { label: 'Batch size', min: 1, max: 256, value: batch, onInput: (v) => { batch = v; render(); } });
+    slider(bar, { label: 'Kernel grid covers', min: 0.1, max: 1, step: 0.05, value: cover, format: (v) => `${Math.round(v * 100)}% of SMs`, onInput: (v) => { cover = v; render(); } });
+    checkbox(bar, 'CUDA graphs (no launch gaps)', graphs, (v) => { graphs = v; render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Kernel timeline across SMs with the DCGM metrics it produces' });
+    const st = stats(root, ['GPU_UTIL', 'Tokens / s', 'Step time', 'Regime']);
+    legend(root, [['Kernel resident (SM busy)', C.mem], ['Tensor pipe active', C.compute], ['Launch gap (CPU)', C.wasteSoft]]);
+    const say = narration(root);
+
+    function model() {
+      const cf = Math.min(1, batch / RIDGE);               // fraction of a GEMM's time the tensor pipe would be busy at full width
+      const memScale = Math.max(1, batch / RIDGE);          // compute-bound steps stretch
+      const kvScale = 1 + batch / 64;                       // attention reads more KV with more sequences
+      // narrow grids cannot pull full bandwidth: kernels take longer
+      const slow = 1 / Math.min(1, 0.25 + cover * 0.9);
+      const ks = KERNELS.map((k) => ({ ...k, t: k.w * (k.kv ? kvScale : memScale) * slow }));
+      const busy = ks.reduce((a, k) => a + k.t, 0);
+      const gapEach = graphs ? 0.004 : 0.03;                 // ~5 µs launch overhead per kernel, relative to the step
+      const gaps = gapEach * ks.length;
+      const total = busy + gaps;
+      const stepMs = STEP_MS_B1 * total / 1.0;
+      const busyFrac = busy / total;
+      const tensorTime = ks.filter((k) => k.tensor).reduce((a, k) => a + k.t, 0);
+      const tensorActive = busyFrac * cover * (tensorTime / busy) * Math.min(1, cf / Math.min(1, memScale) * (1 / slow)) ;
+      const dramDuring = Math.min(0.92, 0.92 / slow) / memScale;
+      const dram = busyFrac * dramDuring;
+      const smActive = busyFrac * cover;
+      const occ = smActive * 0.28;
+      return { ks, gapEach, total, stepMs, busyFrac, tensor: tensorActive, dram, smActive, occ, cf };
+    }
+
+    function render() {
+      clear(svg);
+      const m = model();
+      const X0 = 96, X1 = 560, Y0 = 40, LH = 14;
+      const sx = (t: number) => X0 + (t / m.total) * (X1 - X0);
+      text(svg, 20, 14, 'One transformer layer of a decode step, across SM groups (time →)', { class: 't-small t-bold' });
+
+      // sampler row
+      text(svg, 20, Y0 - 8 + 2, 'any kernel?', { class: 't-small t-faint' });
+      let t = 0;
+      m.ks.forEach((k) => {
+        rect(svg, sx(t), Y0 - 14, sx(t + k.t) - sx(t), 10, C.decode, { rx: 1 });
+        t += k.t + m.gapEach;
+      });
+      // lanes
+      for (let l = 0; l < LANES; l++) {
+        const y = Y0 + 4 + l * LH;
+        rect(svg, X0, y, X1 - X0, LH - 2, C.surface2, { rx: 1 });
+        if (l % 3 === 0) text(svg, X0 - 8, y + 6, `SM ${Math.round((l / LANES) * 132)}`, { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      }
+      const nl = Math.max(1, Math.round(cover * LANES));
+      t = 0;
+      m.ks.forEach((k) => {
+        const x = sx(t), w = Math.max(1, sx(t + k.t) - sx(t));
+        for (let l = 0; l < nl; l++) {
+          const y = Y0 + 4 + l * LH;
+          rect(svg, x, y, w - 0.6, LH - 2, C.mem, { rx: 1, opacity: 0.45 });
+          if (k.tensor) {
+            const frac = Math.min(1, m.cf);
+            rect(svg, x, y + (LH - 2) * (1 - frac), w - 0.6, Math.max(0.8, (LH - 2) * frac), C.compute, { rx: 0 });
+          }
+        }
+        if (w > 34) text(svg, x + w / 2, Y0 + 4 + LANES * LH + 10, k.name, { 'text-anchor': 'middle', class: 't-small t-faint' });
+        if (m.gapEach > 0.01) rect(svg, sx(t + k.t), Y0 + 4, sx(t + k.t + m.gapEach) - sx(t + k.t), LANES * LH - 2, C.wasteSoft, { rx: 0 });
+        t += k.t + m.gapEach;
+      });
+      text(svg, X1, Y0 + 4 + LANES * LH + 26, `${(m.stepMs / 32).toFixed(2)} ms per layer × 32 layers`, { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+
+      // metric bars
+      const MX = 600, MW = 300;
+      text(svg, MX, 14, 'What DCGM reports for this pattern', { class: 't-small t-bold' });
+      const rows: [string, number, string, string][] = [
+        ['DCGM_FI_DEV_GPU_UTIL', m.busyFrac, C.decode, 'was any kernel running?'],
+        ['DCGM_FI_PROF_SM_ACTIVE', m.smActive, C.mem, 'SMs with ≥1 warp'],
+        ['DCGM_FI_PROF_SM_OCCUPANCY', m.occ, C.mem, 'warps resident / max'],
+        ['DCGM_FI_PROF_PIPE_TENSOR_ACTIVE', m.tensor, C.compute, 'tensor cores busy'],
+        ['DCGM_FI_PROF_DRAM_ACTIVE', m.dram, C.weight, 'HBM interface busy'],
+      ];
+      rows.forEach(([name, v, col, hint], i) => {
+        const y = 32 + i * 50;
+        text(svg, MX, y + 4, name, { class: 't-small t-mono t-bold' });
+        rect(svg, MX, y + 12, MW, 14, C.surface2, { rx: 4, stroke: C.border });
+        rect(svg, MX, y + 12, MW * Math.max(0, Math.min(1, v)), 14, col, { rx: 4 });
+        text(svg, MX + MW, y + 4, `${Math.round(v * 100)}%`, { 'text-anchor': 'end', class: 't-small t-mono t-bold' });
+        text(svg, MX, y + 36, hint, { class: 't-small t-faint' });
+      });
+      line(svg, 580, 20, 580, H - 20, C.border, { 'stroke-width': 1 });
+
+      const tps = batch / (m.stepMs / 1000);
+      st.set('GPU_UTIL', `${Math.round(m.busyFrac * 100)}%`, 'the number on most dashboards');
+      st.set('Tokens / s', tps >= 1000 ? `${(tps / 1000).toFixed(1)}k` : tps.toFixed(0), `batch ${batch}`, C.good);
+      st.set('Step time', `${m.stepMs.toFixed(1)} ms`, 'one decode step (ITL)');
+      st.set('Regime', batch < RIDGE ? 'memory-bound' : 'compute-bound', `ridge ≈ ${RIDGE} tokens/step`);
+      const pct = (x: number) => Math.round(x * 100);
+      say(cover < 0.5
+        ? `<b>Narrow kernels</b> occupy only ${pct(cover)}% of the SMs. GPU_UTIL still counts the whole GPU as busy (${pct(m.busyFrac)}%), but SM_ACTIVE shows most SMs idle, and the kernels cannot pull full memory bandwidth. Typical for small models, tiny batches or unfused elementwise kernels.`
+        : !graphs
+          ? `<b>Launch gaps</b>: without CUDA graphs the CPU launches every kernel and the GPU idles in between. GPU_UTIL drops to ${pct(m.busyFrac)}%, but the real cost is a longer step, so higher ITL. See <a href="../kernels/">kernels & CUDA graphs</a>.`
+          : batch < 32
+            ? `<b>GPU_UTIL says ${pct(m.busyFrac)}%</b>, yet the tensor pipe is busy only ${Math.max(0, m.tensor * 100).toFixed(1)}% of cycles. A decode step streams every weight from HBM for just ${batch} token${batch > 1 ? 's' : ''}, so the tensor cores mostly wait on memory. Raise the batch: GPU_UTIL barely moves, but tokens/s climbs almost linearly.`
+            : `At batch ${batch} the GEMMs move toward the <a href="../roofline/">ridge point</a>: tensor activity rises because each weight byte is reused across more tokens, and attention reads more KV. GPU_UTIL stayed near 100% throughout. It never told you any of this.`);
+    }
+    render();
+  });
+</script>

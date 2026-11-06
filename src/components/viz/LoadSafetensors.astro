@@ -1,0 +1,183 @@
+---
+/* Inside a safetensors file: 8-byte header length, JSON header, raw tensor bytes.
+   Click a tensor to see its header entry and absolute byte range, then pick a TP degree to see
+   which bytes each rank reads through mmap (contiguous for column-parallel, strided for row-parallel).
+   A second mode shows the pickle opcode stream of a legacy .bin checkpoint for contrast.
+   Shapes are Llama 3.1 8B layer 0 (BF16); offsets are computed, layout order is illustrative. */
+---
+<div data-viz="load-safetensors"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, segmented, stats, narration, C, SERIES, SERIES_SOFT, fmt } from '../../lib/viz';
+
+  type Split = 'col' | 'row' | 'vocab' | 'rep';
+  interface T { name: string; short: string; shape: [number, number] | [number]; split: Split; }
+  const TENSORS: T[] = [
+    { name: 'model.embed_tokens.weight', short: 'embed_tokens', shape: [128256, 4096], split: 'vocab' },
+    { name: 'model.layers.0.input_layernorm.weight', short: 'input_layernorm', shape: [4096], split: 'rep' },
+    { name: 'model.layers.0.self_attn.q_proj.weight', short: 'q_proj', shape: [4096, 4096], split: 'col' },
+    { name: 'model.layers.0.self_attn.k_proj.weight', short: 'k_proj', shape: [1024, 4096], split: 'col' },
+    { name: 'model.layers.0.self_attn.v_proj.weight', short: 'v_proj', shape: [1024, 4096], split: 'col' },
+    { name: 'model.layers.0.self_attn.o_proj.weight', short: 'o_proj', shape: [4096, 4096], split: 'row' },
+    { name: 'model.layers.0.post_attention_layernorm.weight', short: 'post_attn_norm', shape: [4096], split: 'rep' },
+    { name: 'model.layers.0.mlp.gate_proj.weight', short: 'gate_proj', shape: [14336, 4096], split: 'col' },
+    { name: 'model.layers.0.mlp.up_proj.weight', short: 'up_proj', shape: [14336, 4096], split: 'col' },
+    { name: 'model.layers.0.mlp.down_proj.weight', short: 'down_proj', shape: [4096, 14336], split: 'row' },
+  ];
+  const BYTES = 2;
+  const nbytes = (t: T) => t.shape.reduce((a, b) => a * b, 1) * BYTES;
+  // offsets relative to the start of the data section, as stored in the header
+  let acc = 0;
+  const OFFS = TENSORS.map((t) => { const b = acc; acc += nbytes(t); return [b, acc] as [number, number]; });
+  const DATA = acc;
+  const entry = (t: T, i: number) => `"${t.name}":{"dtype":"BF16","shape":[${t.shape.join(',')}],"data_offsets":[${OFFS[i][0]},${OFFS[i][1]}]}`;
+  const HEADER_LEN = (() => { let n = 2; TENSORS.forEach((t, i) => (n += entry(t, i).length + 1)); n += '"__metadata__":{"format":"pt"}'.length; return Math.ceil(n / 8) * 8; })();
+  const DATA0 = 8 + HEADER_LEN;
+
+  const PICKLE: [string, string, boolean][] = [
+    ['PROTO 2', 'pickle protocol version', false],
+    ['GLOBAL \'collections OrderedDict\'', 'import a callable by name', true],
+    ['EMPTY_TUPLE · REDUCE', 'call it: OrderedDict()', true],
+    ['BINUNICODE \'model.layers.0.self_attn.q_proj.weight\'', 'push a key', false],
+    ['GLOBAL \'torch._utils _rebuild_tensor_v2\'', 'import another callable', true],
+    ['BINPERSID (\'storage\', BFloat16Storage, \'12\', …)', 'reference raw bytes stored in data/12', false],
+    ['… shape, stride tuples · REDUCE', 'call _rebuild_tensor_v2(...) to build the tensor', true],
+    ['SETITEM', 'state_dict[key] = tensor', false],
+    ['…', 'repeat for every tensor', false],
+    ['GLOBAL \'os system\'  ·  BINUNICODE \'curl … | sh\'  ·  REDUCE', 'a malicious file can call anything importable', true],
+  ];
+
+  const W = 920, H = 360;
+
+  mountAll('load-safetensors', (root) => {
+    let mode: 'st' | 'pk' = 'st';
+    let sel = 2, tp = 2;
+    const bar = ctrlBar(root);
+    segmented(bar, [{ value: 'st', label: 'model.safetensors' }, { value: 'pk', label: 'pytorch_model.bin (pickle)' }], mode, (v) => { mode = v as 'st' | 'pk'; render(); });
+    segmented(bar, [1, 2, 4, 8].map((n) => ({ value: String(n), label: `TP ${n}` })), String(tp), (v) => { tp = Number(v); render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Byte layout of a safetensors file and the slices each tensor-parallel rank reads' });
+    const st = stats(root, ['Selected tensor', 'Absolute byte range', 'Each rank reads', 'Header']);
+    const say = narration(root);
+
+    function strip(y: number) {
+      // file strip: header parts get a fixed visual width, tensors are sqrt-scaled with a minimum
+      const X0 = 20, X1 = W - 20;
+      const lenW = 34, hdrW = 96;
+      rect(svg, X0, y, lenW, 34, C.accentSoft, { rx: 4, stroke: C.accent });
+      text(svg, X0 + lenW / 2, y + 17, 'u64', { 'text-anchor': 'middle', class: 't-small t-mono t-bold', fill: C.accent });
+      rect(svg, X0 + lenW + 2, y, hdrW, 34, C.tokenSoft, { rx: 4, stroke: C.token });
+      text(svg, X0 + lenW + 2 + hdrW / 2, y + 17, 'JSON header', { 'text-anchor': 'middle', class: 't-small t-bold' });
+      const rest = X1 - (X0 + lenW + hdrW + 6);
+      const ws = TENSORS.map((t) => Math.sqrt(nbytes(t)));
+      const tot = ws.reduce((a, b) => a + b, 0);
+      let x = X0 + lenW + hdrW + 6;
+      const pos: [number, number][] = [];
+      const raw = ws.map((v) => Math.max(18, (v / tot) * rest));
+      const k = rest / raw.reduce((a, b) => a + b, 0);
+      TENSORS.forEach((t, i) => {
+        const w = raw[i] * k;
+        const on = i === sel;
+        const g = s('g', { style: 'cursor:pointer', tabindex: 0, role: 'button', 'aria-label': `select ${t.name}` }, svg);
+        rect(g, x, y, w - 2, 34, on ? C.weight : C.weightSoft, { rx: 3, stroke: on ? C.text : 'none', 'stroke-width': 1.5 });
+        if (w > 54) text(g, x + 5, y + 17, t.short, { class: 't-small t-bold', fill: on ? 'var(--bg)' : C.text });
+        const pick = () => { sel = i; render(); };
+        g.addEventListener('click', pick);
+        g.addEventListener('keydown', (e) => { if ((e as KeyboardEvent).key === 'Enter' || (e as KeyboardEvent).key === ' ') { e.preventDefault(); pick(); } });
+        pos.push([x, w - 2]);
+        x += w;
+      });
+      text(svg, X0, y - 10, `byte 0`, { class: 't-small t-faint t-mono' });
+      text(svg, X0 + lenW + 2, y + 46, `8 … ${fmt.int(DATA0)}`, { class: 't-small t-faint t-mono' });
+      text(svg, X1, y - 10, `${fmt.int(DATA0 + DATA)} bytes (tensor widths √-scaled; click one)`, { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      return pos;
+    }
+
+    function renderST() {
+      const pos = strip(34);
+      const t = TENSORS[sel];
+      const [a, b] = OFFS[sel];
+      // connector from strip to detail
+      const [px, pw] = pos[sel];
+      s('path', { d: `M${px + pw / 2},${70} L${px + pw / 2},${96}`, stroke: C.text, 'stroke-width': 1.2, fill: 'none' }, svg);
+
+      // header entry
+      text(svg, 20, 110, 'Header entry (JSON, parsed before any tensor byte is touched)', { class: 't-small t-bold' });
+      rect(svg, 20, 120, 420, 92, C.surface2, { rx: 8, stroke: C.border });
+      const lines = [`"${t.name.length > 44 ? '…' + t.name.slice(-43) : t.name}": {`, `  "dtype": "BF16",`, `  "shape": [${t.shape.join(', ')}],`, `  "data_offsets": [${a}, ${b}]  }`];
+      lines.forEach((l, i) => text(svg, 32, 138 + i * 18, l, { class: 't-small t-mono' }));
+
+      // matrix with TP slices
+      const MX = 470, MY = 120, MW = 260, MH = 92;
+      text(svg, MX, 110, t.split === 'rep' ? 'Replicated: every rank reads all of it' : t.split === 'row' ? `Row-parallel: split along dim 1 (input)` : t.split === 'vocab' ? 'Vocab-parallel: split along dim 0 (rows)' : 'Column-parallel: split along dim 0 (output)', { class: 't-small t-bold' });
+      const rows = t.shape[0], cols = t.shape.length > 1 ? (t.shape[1] as number) : 1;
+      const k = t.split === 'rep' ? 1 : tp;
+      const isRow = t.split === 'row';
+      for (let r = 0; r < k; r++) {
+        const col = SERIES_SOFT[r % 8], stroke = SERIES[r % 8];
+        if (t.split === 'rep') rect(svg, MX, MY, MW, t.shape.length > 1 ? MH : 14, C.surface3, { rx: 2, stroke: C.borderStrong });
+        else if (isRow) rect(svg, MX + (r * MW) / k, MY, MW / k, MH, col, { rx: 0, stroke, 'stroke-width': 1 });
+        else rect(svg, MX, MY + (r * MH) / k, MW, MH / k, col, { rx: 0, stroke, 'stroke-width': 1 });
+        if (t.split !== 'rep' && (isRow ? MW / k : MH / k) > 14) text(svg, isRow ? MX + (r + 0.5) * MW / k : MX + MW / 2, isRow ? MY + MH / 2 : MY + (r + 0.5) * MH / k, `rank ${r}`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: stroke });
+      }
+      text(svg, MX + MW + 8, MY + 8, `${fmt.int(rows)} rows`, { class: 't-small t-faint t-mono' });
+      text(svg, MX + MW + 8, MY + 24, `× ${fmt.int(cols)} cols`, { class: 't-small t-faint t-mono' });
+      text(svg, MX + MW + 8, MY + 44, 'row-major:', { class: 't-small t-faint' });
+      text(svg, MX + MW + 8, MY + 58, 'a row is contiguous', { class: 't-small t-faint' });
+
+      // byte range of this tensor coloured by rank
+      const BY = 252, BX0 = 20, BX1 = W - 20, BWd = BX1 - BX0;
+      text(svg, 20, BY - 14, `Bytes ${fmt.int(DATA0 + a)} … ${fmt.int(DATA0 + b)} of the file, coloured by the rank that reads them`, { class: 't-small t-bold' });
+      rect(svg, BX0, BY, BWd, 26, C.surface2, { rx: 4, stroke: C.border });
+      if (t.split === 'rep') {
+        for (let r = 0; r < tp; r++) rect(svg, BX0, BY + (r * 26) / tp, BWd, 26 / tp, SERIES_SOFT[r % 8], { rx: 0 });
+        text(svg, BX0 + BWd / 2, BY + 13, `all ${tp} rank${tp > 1 ? 's' : ''} read the same ${fmt.bytes(nbytes(t))}`, { 'text-anchor': 'middle', class: 't-small t-bold' });
+      } else if (!isRow) {
+        for (let r = 0; r < tp; r++) rect(svg, BX0 + (r * BWd) / tp, BY, BWd / tp - 1, 26, SERIES_SOFT[r % 8], { rx: 0, stroke: SERIES[r % 8] });
+      } else {
+        const shown = 24; // draw a few rows of the strided pattern
+        const rw = BWd / shown;
+        for (let i = 0; i < shown; i++) for (let r = 0; r < tp; r++) rect(svg, BX0 + i * rw + (r * rw) / tp, BY, rw / tp - (tp > 4 ? 0 : 0.5), 26, SERIES_SOFT[r % 8], { rx: 0, stroke: SERIES[r % 8], 'stroke-width': 0.4 });
+        text(svg, BX1, BY + 40, `first ${shown} of ${fmt.int(rows)} rows shown`, { 'text-anchor': 'end', class: 't-small t-faint' });
+      }
+      const per = t.split === 'rep' ? nbytes(t) : nbytes(t) / tp;
+      const run = isRow ? (cols / tp) * BYTES : per;
+      text(svg, 20, BY + 40, t.split === 'rep' ? 'Tiny and replicated: cost is irrelevant.' : isRow ? `Each rank reads ${fmt.int(rows)} runs of ${fmt.bytes(run)} (one slice of every row)` : `Each rank reads one contiguous run of ${fmt.bytes(per)}`, { class: 't-small t-mono' });
+
+      // mmap explanation
+      const MY2 = 312;
+      rect(svg, 20, MY2, W - 40, 40, C.surface2, { rx: 8, stroke: C.border });
+      text(svg, 32, MY2 + 13, 'mmap: the file is mapped into the address space; the OS faults in only the 4 KiB pages a rank actually touches.', { class: 't-small' });
+      text(svg, 32, MY2 + 29, 'Header gives exact offsets, so a loader can seek straight to its slice: no parsing of other tensors, no code execution.', { class: 't-small t-dim' });
+
+      st.set('Selected tensor', t.short, `[${t.shape.join(' × ')}] BF16 · ${fmt.bytes(nbytes(t))}`);
+      st.set('Absolute byte range', `${fmt.num(DATA0 + a, 2)}–${fmt.num(DATA0 + b, 2)}`, `= 8 + ${fmt.int(HEADER_LEN)} + data_offsets`);
+      st.set('Each rank reads', fmt.bytes(per), t.split === 'rep' ? 'replicated' : isRow ? `${fmt.int(rows)} strided runs` : '1 contiguous run');
+      st.set('Header', fmt.bytes(HEADER_LEN, 1), 'little-endian u64 says how long');
+      say(t.split === 'rep'
+        ? '<b>Norm weights</b> are a few KiB and every rank keeps a full copy. They do not matter for load time.'
+        : isRow
+          ? `<b>Row-parallel</b> layers (o_proj, down_proj) split the <i>input</i> dimension. In a row-major file each rank needs a ${fmt.bytes(run)} piece of every row, so its reads are strided. With pages of 4 KiB, slices smaller than a page make neighbouring ranks fault in the same pages.`
+          : `<b>${t.split === 'vocab' ? 'Vocab-parallel embedding' : 'Column-parallel'}</b> layers split the <i>output</i> dimension, which is the row dimension of the stored matrix. Each rank's slice is one contiguous byte range, so it reads ${fmt.bytes(per)} and never touches the other ${tp - 1 > 0 ? fmt.bytes(nbytes(t) - per) : '0 B'}.`);
+    }
+
+    function renderPK() {
+      text(svg, 20, 18, 'pytorch_model.bin = a zip with data.pkl (an opcode stream) + data/0, data/1, … (raw storages)', { class: 't-small t-bold' });
+      PICKLE.forEach(([op, what, call], i) => {
+        const y = 34 + i * 30;
+        rect(svg, 20, y, 520, 24, call ? (i === PICKLE.length - 1 ? C.wasteSoft : C.prefillSoft) : C.surface2, { rx: 5, stroke: i === PICKLE.length - 1 ? C.waste : C.border });
+        text(svg, 30, y + 12, op, { class: 't-small t-mono' + (call ? ' t-bold' : '') });
+        text(svg, 552, y + 12, what, { class: 't-small' + (i === PICKLE.length - 1 ? ' t-bold' : ' t-dim'), fill: i === PICKLE.length - 1 ? C.waste : undefined });
+      });
+      text(svg, 20, H - 26, 'To learn where q_proj lives, the loader must run the stream from the top. GLOBAL + REDUCE = "import this and call it".', { class: 't-small' });
+      text(svg, 20, H - 10, 'torch.load(weights_only=True) restricts what can be imported, but safetensors removes the question entirely.', { class: 't-small t-dim' });
+      st.set('Selected tensor', '—', 'located only by executing the stream');
+      st.set('Absolute byte range', 'unknown', 'until unpickled');
+      st.set('Each rank reads', 'everything', `${tp > 1 ? `${tp} ranks each unpickle` : 'unpickle'} the full state_dict`);
+      st.set('Header', 'none', 'no index of offsets');
+      say('A <b>pickle</b> checkpoint is a small program for a stack machine. Highlighted opcodes import and call Python functions. Normally those are <code>OrderedDict</code> and <code>torch._utils._rebuild_tensor_v2</code>, but nothing in the format stops them being <code>os.system</code>. This is why hubs scan pickles, why <b>trust_remote_code</b> and <code>.bin</code> files deserve review, and why serving stacks should only accept safetensors.');
+    }
+
+    function render() { clear(svg); if (mode === 'st') renderST(); else renderPK(); }
+    render();
+  });
+</script>

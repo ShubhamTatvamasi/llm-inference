@@ -1,0 +1,136 @@
+---
+layout: ../layouts/Chapter.astro
+title: Reasoning Models & Agents
+description: Reasoning models write thousands of hidden tokens before they answer, and agents call the model again and again with a growing transcript. Both change where the time, memory and money go.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import ReasonAnatomy from '../components/viz/ReasonAnatomy.astro';
+import AgentLoop from '../components/viz/AgentLoop.astro';
+import ToolCallSteps from '../components/viz/ToolCallSteps.astro';
+
+Most of this guide assumes a chat-shaped workload: a prompt, a few hundred output tokens, done. Two newer workloads break that shape:
+
+- **Reasoning models** generate a long run of **thinking tokens** before the visible answer. Ten thousand hidden tokens behind a 300-token reply is normal. The request becomes almost pure [decode](../prefill-decode/), and its [KV cache](../kv-cache/) keeps growing for minutes.
+- **Agents** run a loop: call the model, run a tool, append the result, call the model again. A single task can be 10–50 model calls, each re-sending a transcript that only ever grows. Whether that transcript is recomputed or reused decides most of the latency.
+
+Neither needs a new kind of engine. Both make some existing mechanisms ([prefix caching](../prefix-caching/), the [scheduler](../scheduler/), [routing](../routing-autoscaling/)) go from "nice to have" to "the main thing".
+
+## A reasoning request is a decode marathon
+
+To the engine, thinking tokens are ordinary output tokens. They are sampled one decode step at a time, they get KV entries, and they are billed. The difference is the **ratio**: a chat request might be 2,000 tokens in and 300 out, while a reasoning request is 2,000 in and 8,000 out, most of which the user never sees.
+
+<Viz title="Anatomy of a reasoning request" label="Simulation">
+  <ReasonAnatomy />
+  <Fragment slot="caption">
+    <p>Top: one request, with the prefill, the hidden thinking and the visible answer on a shared time axis. Bottom: KV-cache demand if this many requests start together, against the KV pool left after FP8 weights. Push <b>Thinking tokens</b> to 16k: the first <i>answer</i> token moves out by minutes while TTFT barely changes. Then raise <b>Concurrent requests</b> until the green curve crosses the pool line partway through decode. Simple bandwidth model, illustrative.</p>
+  </Fragment>
+</Viz>
+
+Three things change compared with chat:
+
+1. **TTFT stops meaning what users feel.** The engine reports time to the first token, which is a hidden thinking token. Users feel the **time to first answer token**, which is TTFT plus thinking length × ITL. Track both. If the client streams reasoning, or a summary of it, the perceived wait shrinks even though the work does not.
+2. **KV grows mid-request.** A chat request's KV is mostly known at admission: the prompt plus a short tail. A reasoning request admitted with a 2,000-token prompt can be holding 10,000 tokens of KV ten seconds later. The scheduler admits on current usage, so a batch that fitted at admission can overflow later, and then the newest requests are [preempted](../scheduler/), which for long thinking runs means recomputing a lot.
+3. **Cost per answer is dominated by output.** Decode tokens are the expensive ones per token (one memory-bound step each), and reasoning multiplies them. Two models with the same price per token can differ several-fold in **cost per correct answer** because one thinks three times longer.
+
+<Callout type="warn" title="Plan max_tokens for the thinking, not the answer">
+`max_tokens` counts reasoning tokens too. A limit sized for chat (say 1,024) cuts the model off in the middle of thinking and returns `finish_reason: "length"` with an empty answer. Size it from the real distribution of thinking plus answer lengths, and size `max_model_len` and the KV pool so the long tail still fits.
+</Callout>
+
+## Budgets, effort levels and reasoning parsers
+
+How long a model thinks is now an API parameter. The names differ by provider and model family (an **effort level** such as low/medium/high, a **thinking token budget**, or a switch to turn thinking off), but the trade-off is the same: more thinking usually buys accuracy on hard problems, with diminishing returns, at a roughly linear cost in latency and GPU time.
+
+On a self-hosted engine, the pieces look like this in vLLM:
+
+| Piece | What it does |
+|---|---|
+| `--reasoning-parser <family>` (e.g. `deepseek_r1`, `qwen3`) | Splits the thinking block out of the output and returns it in a separate `reasoning` field (older releases called it `reasoning_content`), so clients and tool parsers see only the answer in `content` |
+| `thinking_token_budget` (per-request sampling parameter) | Counts tokens after the reasoning start marker; when the budget is reached the engine forces the end-of-thinking marker so the model moves on to its answer |
+| `chat_template_kwargs: {"enable_thinking": false}` | Model-specific template switch (Qwen3, for example) that skips thinking for cheap requests |
+
+A budget is a **latency and capacity control**, not only a cost control. Capping thinking at 4k instead of letting a model run to 30k bounds both the time to answer and the worst-case KV footprint per request, which is what the scheduler has to plan for.
+
+<Callout type="tip" title="Route by difficulty">
+Not every request needs to think. Many deployments send simple requests with thinking off or at low effort, and reserve long budgets for requests that need them, sometimes on a separate pool with its own `max_num_seqs` and context limits. A reasoning request occupies a decode slot for 10–50× longer than a chat request; mixing the two without limits lets a few long thinkers fill the KV pool.
+</Callout>
+
+**[Speculative decoding](../speculative-decoding/) pays off more here than almost anywhere else.** Reasoning output is long and often repetitive (restating the problem, checking steps), and the request is decode-bound for its whole life. Models that ship **MTP** heads (DeepSeek-V3 and its successors, for example) can use them as built-in drafters through `--speculative-config` with method `mtp`; EAGLE-3 heads and n-gram or suffix drafting are the other common choices. The usual caveat holds: the gain shrinks as the batch fills the GPU.
+
+## Agents: the same prompt, a little longer, many times
+
+An agent task is a loop of model calls. Every call sends the **whole transcript so far**: system prompt, tool schemas, the task, every earlier tool call and every tool result. Turn 10 might send 25,000 tokens, of which only the last 1,500 (the newest tool result) are new.
+
+That makes agents the strongest case for [prefix caching](../prefix-caching/), and it raises the stakes on everything that can break it.
+
+<Viz title="An agent task, turn by turn" label="Simulation">
+  <AgentLoop />
+  <Fragment slot="caption">
+    <p>Each row is one model call. The left bar is the prompt sent: green was reused from the cache, amber was prefilled again. Turn off <b>Prefix caching</b> to see TTFT climb with every turn. Turn it back on but switch off <b>Session-affine routing</b>: with 4 replicas, each call usually lands on a replica that last saw this session several turns ago. Then pick <b>Busy server</b> and drag <b>Tool time</b> above 2 s: idle KV gets evicted while the tool runs, unless you offload it. Illustrative: prefill 8k tok/s, decode 80 tok/s, 6k-token system prompt and tools.</p>
+  </Fragment>
+</Viz>
+
+The simulation shows the four ways reuse fails in practice:
+
+- **Something variable at the top.** A timestamp, request id or reordered tool list in the first block changes every hash after it. The fix is layout: stable content first (system prompt, tool schemas in a fixed order), then the conversation, with anything per-call at the end.
+- **No session affinity.** Each replica has its own cache. A load balancer that spreads one session's calls across replicas makes every call a partial miss. Route by session (a session id hashed at the gateway) or, better, with a **KV-aware router** that knows which replica holds which prefix and still weighs load. That is what the prefix-aware routing in llm-d and the KV router in Dynamo are for; see [routing](../routing-autoscaling/).
+- **Eviction while the agent waits.** While a tool runs (a web search, a test suite, a human approval), the session's KV sits idle with a reference count of zero. On a busy server, idle blocks are the first to go. **KV offload** to CPU memory or local SSD keeps them; reloading over PCIe is far cheaper than re-prefilling a long transcript (the [scheduler chapter](../scheduler/) has the break-even).
+- **Templates that rewrite history.** Some chat templates drop or reformat earlier reasoning blocks when rendering the next call. If the rendered history differs from what was cached, the match stops there.
+
+<Callout type="key" title="Agent latency is mostly TTFT and tools">
+Per call, decode is often short (a tool call is a few dozen tokens of JSON), so a multi-step task's latency is roughly **turns × (TTFT + short decode) + tool time**. TTFT is the term you control on the serving side, and with a warm prefix it stays flat as the transcript grows. Without one, it grows every turn, and total prefill work grows with the square of the number of turns.
+</Callout>
+
+## Tool calling on the server
+
+Tool calling looks like a feature of the model. On the wire, it is [structured output](../structured-output/) plus parsing. Step through one round trip:
+
+<Viz title="One tool-calling round trip" label="Step-through">
+  <ToolCallSteps />
+  <Fragment slot="caption">
+    <p>The tags shown are the Hermes / Qwen style (<code>&lt;tool_call&gt;…&lt;/tool_call&gt;</code>); other model families use other formats, which is why the parser is chosen per model. Untick <b>Parallel tool calls</b> to see the model ask for one tool per turn: one more model call, and tool times add up instead of overlapping. Timings are illustrative.</p>
+  </Fragment>
+</Viz>
+
+The serving-side details that matter:
+
+- **Parsers are per model family.** vLLM needs `--enable-auto-tool-choice` and a `--tool-call-parser` (for example `hermes`, `llama3_json`, `mistral`) matching the format the model was trained to emit. The wrong parser does not fail loudly; tool calls come back as plain text in `content`.
+- **`tool_choice` decides how hard the engine enforces the format.** With `auto`, the model may or may not call a tool, and the parser extracts what it finds; a malformed call can be dropped. With `required` or a named function, vLLM uses structured output to constrain the arguments to the tool's schema.
+- **Parallel tool calls** let the model ask for several independent calls in one response. Whether a model does this depends on its training and its parser. When it works, it removes whole model round trips from the task.
+- **Arguments arrive as a JSON string**, not an object, in the OpenAI format. Validate them before executing anything, because a model following instructions hidden in a tool result is a prompt-injection path (see [quality & safety](../quality-safety/)).
+
+## Managing a context that only grows
+
+A long agent session eventually hits `max_model_len`, and before that, every call pays attention over the whole transcript and holds its KV. Applications manage the context explicitly:
+
+| Strategy | What it does | Cache effect |
+|---|---|---|
+| **Append only** | Keep everything until the limit | Best reuse; cost and KV grow without bound |
+| **Truncate the middle** | Drop old tool results, keep system prompt and recent turns | Everything after the cut point is recomputed once |
+| **Summarise** | Replace old turns with a model-written summary | One large miss at the summary point, then reuse resumes |
+| **Trim tool output** | Store large results outside the prompt; insert excerpts | Smaller prompts and KV; fewer tokens to recompute on a miss |
+
+The cache-friendly rule is to **edit rarely and at the end**. Every change to an early part of the transcript invalidates the cache from that point on, so it is cheaper to compact in one big step every N turns than to trim a little on every call.
+
+<Interview>
+  <Q q="Why is TTFT a misleading latency metric for reasoning models?" level="core">
+    The engine's first token is a hidden thinking token, so TTFT measures only prefill and queueing. The user waits for the first <i>answer</i> token, which arrives after the whole thinking run: TTFT plus thinking tokens × ITL. Track time to first answer token (or end-to-end latency) alongside TTFT, and stream reasoning or a summary if the product allows it.
+  </Q>
+  <Q q="How does a reasoning workload change KV-cache planning compared with chat?" level="mid">
+    KV per request is dominated by generated tokens rather than the prompt, and it grows throughout the request. Admission is based on current usage, so the batch's future KV demand can exceed the pool well after admission, causing preemption of long, expensive sequences. Plan on prompt + thinking budget + answer per request, cap thinking with a budget, align <code>max_num_seqs</code> with that footprint, and consider FP8 KV or a separate pool for long thinkers.
+  </Q>
+  <Q q="What does a reasoning parser do, and what breaks without one?" level="core">
+    It splits the thinking block (delimited by model-specific markers) out of the generated text and returns it in a separate field, so <code>content</code> holds only the answer. Without it, clients receive the raw thinking inline, tool-call parsing can trip over tags inside the reasoning, and applications that parse <code>content</code> as JSON fail.
+  </Q>
+  <Q q="An agent's turns get slower as the session goes on, even though each tool result is small. What do you check?" level="senior">
+    Prefill is probably recomputing the whole transcript every call. Check the prefix-cache hit rate (<code>vllm:prefix_cache_hits_total</code> over <code>vllm:prefix_cache_queries_total</code>). If it is low: look for variable content at the top of the prompt (timestamps, reordered tools), a template that rewrites history, routing that spreads one session across replicas, and idle-KV eviction during long tool calls on a busy server. Fix layout first, then add session or KV-aware routing, then KV offload.
+  </Q>
+  <Q q="You enabled a reasoning model behind an existing chat app. Answers are now often empty with finish_reason 'length'. Why?" level="mid">
+    The app's <code>max_tokens</code> was sized for chat answers, but it also counts thinking tokens. The model runs out of budget while still thinking and never writes an answer. Raise <code>max_tokens</code> to cover thinking plus answer, set an explicit thinking budget or effort level, and alert on the rate of <code>length</code> finishes.
+  </Q>
+  <Q q="After adding a reasoning model to a shared pool, chat users report tail latency spikes and the preemption counter climbs. What happened and what do you do?" level="senior">
+    Long-thinking requests hold decode slots and KV for minutes, and their KV keeps growing after admission. The pool fills, the scheduler preempts the newest sequences, and chat requests queue behind work that will not finish soon. Options: cap thinking with budgets or effort levels, lower <code>max_num_seqs</code> to what the KV pool really supports at reasoning lengths, use speculative decoding (MTP or EAGLE) to shorten decode, and split reasoning traffic into its own pool with its own SLOs and autoscaling signal.
+  </Q>
+</Interview>

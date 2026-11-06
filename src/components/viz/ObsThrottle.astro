@@ -1,0 +1,125 @@
+---
+/* Throttling visualiser for an H100-SXM-class GPU: power cap, inlet temperature and workload
+   drive power draw, die temperature and SM clock; the matching clocks_event_reasons flags light up;
+   prefill (compute-bound) and decode (memory-bound) throughput react very differently.
+   Simplified physics (power ∝ f^2.5, temperature ∝ power), illustrative thresholds. */
+---
+<div data-viz="obs-throttle"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, slider, segmented, checkbox, stats, narration, C } from '../../lib/viz';
+
+  const FMAX = 1980, FMIN = 600;           // MHz
+  const SW_T = 83, HW_T = 87;              // °C, illustrative slowdown thresholds (vary by SKU)
+  const RTH = 0.075;                       // °C per W from inlet to die (cooling quality)
+  const DEMAND = { prefill: 760, decode: 480, idle: 90 } as const; // W the work would draw at FMAX
+  type Work = keyof typeof DEMAND;
+  const W = 920, H = 300;
+
+  function solve(cap: number, inlet: number, work: Work, brake: boolean, airflow: number) {
+    const rth = RTH / airflow;
+    const flags = { gpu_idle: work === 'idle', sw_power_cap: false, sw_thermal_slowdown: false, hw_slowdown: false, hw_thermal_slowdown: false, hw_power_brake_slowdown: brake };
+    const pAt = (f: number) => (work === 'idle' ? DEMAND.idle : 70 + (DEMAND[work] - 70) * Math.pow(f / FMAX, 2.5));
+    let f = work === 'idle' ? 345 : FMAX;
+    if (work !== 'idle' && pAt(f) > cap) { f = FMAX * Math.pow((cap - 70) / (DEMAND[work] - 70), 1 / 2.5); flags.sw_power_cap = true; }
+    let T = inlet + rth * pAt(f);
+    if (work !== 'idle' && T > SW_T) {
+      // software thermal: lower clocks until the die sits at SW_T
+      const pT = (SW_T - inlet) / rth;
+      const fT = pT > 70 ? FMAX * Math.pow(Math.max(0, pT - 70) / (DEMAND[work] - 70), 1 / 2.5) : FMIN;
+      if (fT < f) { f = Math.max(FMIN, fT); flags.sw_thermal_slowdown = true; }
+      T = inlet + rth * pAt(f);
+      // cooling so poor that holding SW_T needs a deep cut: the die overshoots to the hardware threshold
+      if (f < FMAX * 0.7) { flags.hw_thermal_slowdown = true; flags.hw_slowdown = true; f = Math.max(FMIN * 0.8, f * 0.5); }
+    }
+    if (brake && work !== 'idle') { f = Math.min(f, FMIN); flags.hw_slowdown = true; }
+    const P = pAt(f);
+    T = flags.hw_thermal_slowdown ? HW_T : inlet + rth * P;
+    return { f, P, T, flags };
+  }
+
+  mountAll('obs-throttle', (root) => {
+    let cap = 700, inlet = 25, work: Work = 'prefill', brake = false, airflow = 1;
+    const b1 = ctrlBar(root);
+    segmented(b1, [{ value: 'prefill', label: 'Prefill-heavy (compute-bound)' }, { value: 'decode', label: 'Decode-heavy (memory-bound)' }, { value: 'idle', label: 'Idle' }], work, (v) => { work = v as Work; render(); });
+    checkbox(b1, 'External power brake asserted', brake, (v) => { brake = v; render(); });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'Power limit', min: 300, max: 700, step: 10, value: cap, format: (v) => `${v} W`, onInput: (v) => { cap = v; render(); } });
+    slider(b2, { label: 'Inlet air', min: 15, max: 45, value: inlet, format: (v) => `${v} °C`, onInput: (v) => { inlet = v; render(); } });
+    slider(b2, { label: 'Airflow', min: 0.6, max: 1.4, step: 0.05, value: airflow, format: (v) => `${Math.round(v * 100)}%`, onInput: (v) => { airflow = v; render(); } });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'GPU clock, power and temperature with clock event reason flags' });
+    const st = stats(root, ['SM clock', 'Prefill speed', 'Decode speed', 'Power / temp']);
+    const say = narration(root);
+
+    function gauge(x: number, y: number, label: string, metric: string, v: number, lo: number, hi: number, unit: string, col: string, marks: [number, string][] = []) {
+      const f = (u: number) => Math.max(0, Math.min(1, (u - lo) / (hi - lo)));
+      text(svg, x, y, label, { class: 't-small t-bold' });
+      text(svg, x + 270, y, `${Math.round(v)} ${unit}`, { 'text-anchor': 'end', class: 't-small t-mono t-bold' });
+      rect(svg, x, y + 10, 270, 14, C.surface2, { rx: 4, stroke: C.border });
+      rect(svg, x, y + 10, 270 * f(v), 14, col, { rx: 4 });
+      text(svg, x, y + 36, metric, { class: 't-small t-mono t-faint' });
+      marks.forEach(([m, l], i) => { const mx = x + 270 * f(m); line(svg, mx, y + 6, mx, y + 40, C.text, { 'stroke-width': 1.2, 'stroke-dasharray': '2 2' }); text(svg, mx + (i % 2 ? 4 : -4), y + 47, l, { 'text-anchor': i % 2 ? 'start' : 'end', class: 't-small t-faint' }); });
+    }
+
+    function render() {
+      clear(svg);
+      const r = solve(cap, inlet, work, brake, airflow);
+      gauge(20, 16, 'SM clock', 'DCGM_FI_DEV_SM_CLOCK', r.f, 0, FMAX, 'MHz', C.compute);
+      gauge(20, 76, 'Power draw', 'DCGM_FI_DEV_POWER_USAGE', r.P, 0, 760, 'W', C.prefill, [[cap, 'limit']]);
+      gauge(20, 136, 'GPU temperature', 'DCGM_FI_DEV_GPU_TEMP', r.T, 20, 100, '°C', r.T > SW_T - 0.5 ? C.waste : C.kv, [[SW_T, 'sw'], [HW_T, 'hw']]);
+
+      // flags
+      const FX = 330;
+      text(svg, FX, 16, 'nvidia-smi --query-gpu=clocks_event_reasons.*', { class: 't-small t-mono t-bold' });
+      const F: [keyof typeof r.flags, string, string][] = [
+        ['gpu_idle', 'gpu_idle', 'Nothing to run: clocks drop to save power. Not a problem.'],
+        ['sw_power_cap', 'sw_power_cap', 'Driver lowers clocks to stay under the power limit.'],
+        ['sw_thermal_slowdown', 'sw_thermal_slowdown', 'Driver lowers clocks to hold the temperature target.'],
+        ['hw_slowdown', 'hw_slowdown', 'Hardware-forced slowdown (thermal or power brake), large clock cut.'],
+        ['hw_thermal_slowdown', 'hw_thermal_slowdown', 'Die hit the hardware slowdown temperature: cooling problem.'],
+        ['hw_power_brake_slowdown', 'hw_power_brake_slowdown', 'External signal from the PSU / chassis: power delivery problem.'],
+      ];
+      F.forEach(([k, name, hint], i) => {
+        const y = 30 + i * 38;
+        const on = r.flags[k];
+        const bad = on && k !== 'gpu_idle';
+        rect(svg, FX, y, W - FX - 20, 32, on ? (bad ? C.wasteSoft : C.decodeSoft) : C.surface2, { rx: 7, stroke: on ? (bad ? C.waste : C.decode) : C.border });
+        s('circle', { cx: FX + 16, cy: y + 16, r: 6, fill: on ? (bad ? C.waste : C.decode) : 'transparent', stroke: on ? 'none' : C.borderStrong }, svg);
+        text(svg, FX + 30, y + 11, name, { class: 't-small t-mono t-bold' });
+        text(svg, FX + 30, y + 24, hint, { class: 't-small t-dim' });
+        text(svg, W - 30, y + 11, on ? 'Active' : 'Not Active', { 'text-anchor': 'end', class: 't-small t-bold', fill: on ? (bad ? C.waste : C.decode) : C.faint });
+      });
+
+      // throughput vs clock
+      const fr = r.f / FMAX;
+      const prefill = work === 'idle' ? 0 : fr;                       // compute-bound: ∝ clock
+      const decode = work === 'idle' ? 0 : Math.min(1, 0.82 + 0.18 * fr); // memory-bound: HBM clock unaffected by SM clock
+      text(svg, 20, 200, 'Relative speed at this clock', { class: 't-small t-bold' });
+      [['prefill tokens/s (TTFT)', prefill, C.prefill], ['decode tokens/s (ITL)', decode, C.decode]].forEach(([l, v, c], i) => {
+        const y = 212 + i * 34;
+        text(svg, 20, y + 8, l as string, { class: 't-small t-dim' });
+        rect(svg, 160, y, 140, 16, C.surface2, { rx: 4, stroke: C.border });
+        rect(svg, 160, y, 140 * (v as number), 16, c as string, { rx: 4 });
+        text(svg, 306, y + 8, `${Math.round((v as number) * 100)}%`, { class: 't-small t-mono t-bold' });
+      });
+      text(svg, 20, H - 10, 'Illustrative: power ∝ clock^2.5, die temp = inlet + R·power. Thresholds vary by SKU; check nvidia-smi -q -d TEMPERATURE.', { class: 't-small t-faint' });
+
+      st.set('SM clock', `${Math.round(r.f)} MHz`, `${Math.round(fr * 100)}% of max`, fr < 0.7 && work !== 'idle' ? C.waste : undefined);
+      st.set('Prefill speed', work === 'idle' ? '—' : `${Math.round(prefill * 100)}%`, 'compute-bound: follows the clock');
+      st.set('Decode speed', work === 'idle' ? '—' : `${Math.round(decode * 100)}%`, 'memory-bound: barely cares');
+      st.set('Power / temp', `${Math.round(r.P)} W · ${Math.round(r.T)} °C`);
+      say(brake && work !== 'idle'
+        ? '<b>hw_power_brake_slowdown</b> is driven from outside the GPU, typically by the PSU or chassis management when power delivery is in trouble. Clocks collapse on every GPU in the chassis at once. This is a facilities or hardware ticket, not a tuning problem.'
+        : r.flags.hw_thermal_slowdown
+          ? '<b>Hardware thermal slowdown.</b> The die hit its slowdown temperature and clocks were cut hard. Check inlet temperature, fans and airflow (a failed fan or blocked rack), and compare with neighbouring nodes. Cordon the node if it keeps happening.'
+          : r.flags.sw_thermal_slowdown
+            ? '<b>Software thermal slowdown.</b> The driver is trading clocks for temperature. Prefill (TTFT) slows roughly in proportion; decode barely moves because it waits on HBM, not on the SMs.'
+            : r.flags.sw_power_cap
+              ? `<b>sw_power_cap</b> is active. Under a ${cap} W limit, a compute-heavy load cannot hold max clocks. That is expected behaviour for prefill on a capped GPU, not a fault. ${work === 'decode' ? 'Decode draws less power, so it rarely hits the cap.' : 'Try the decode workload: same cap, no throttling.'}`
+              : work === 'idle'
+                ? '<b>gpu_idle</b> is the only flag set, and low clocks here are normal. Alerting on "low clock" without checking the reason produces noise.'
+                : 'No throttling: full clocks within the power and thermal budget. Lower the power limit or raise the inlet temperature to see which flag appears first.');
+    }
+    render();
+  });
+</script>

@@ -1,0 +1,146 @@
+---
+/* The collectives zoo: before → traffic → after for all-reduce, reduce-scatter, all-gather,
+   all-to-all (with optional routing skew) and point-to-point, on 4 GPUs, with the bytes each
+   GPU must send and where inference uses each one. */
+---
+<div data-viz="net-collectives"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, segmented, checkbox, player, stats, legend, narration, arrowDefs, uniq, rng, C } from '../../lib/viz';
+
+  type Kind = 'ar' | 'rs' | 'ag' | 'a2a' | 'p2p';
+  const N = 4;
+  const GPUC = [C.decode, C.prefill, C.token, C.weight]; // distinct from Reduced (kv) and Traffic (comm)
+  const W = 940, H = 330;
+  const INFO: Record<Kind, { name: string; use: string; sent: string; factor: number }> = {
+    ar: { name: 'All-reduce', use: 'Tensor parallelism: sums the partial outputs of the row-parallel matmul, twice per layer.', sent: '2(N−1)/N × S', factor: (2 * (N - 1)) / N },
+    rs: { name: 'Reduce-scatter', use: 'First half of a ring all-reduce; also sequence-parallel layouts that keep activations sharded between layers.', sent: '(N−1)/N × S', factor: (N - 1) / N },
+    ag: { name: 'All-gather', use: 'Second half of all-reduce; gathering sharded logits for sampling; reassembling sharded weights or activations.', sent: '(N−1)/N × S', factor: (N - 1) / N },
+    a2a: { name: 'All-to-all', use: 'Expert parallelism: dispatch tokens to the GPUs holding their experts, then combine the results. Twice per MoE layer.', sent: '≈ (N−1)/N × S, if balanced', factor: (N - 1) / N },
+    p2p: { name: 'Send / recv', use: 'Pipeline parallelism (activations between stages) and P/D disaggregation (KV cache from prefill to decode).', sent: 'S, one pair only', factor: 1 },
+  };
+
+  mountAll('net-collectives', (root) => {
+    let kind: Kind = 'ar';
+    let phase = 0; // 0 before, 1 traffic, 2 after
+    let skew = false;
+    const bar = ctrlBar(root);
+    const bar2 = ctrlBar(root);
+    segmented(bar2, (Object.keys(INFO) as Kind[]).map((k) => ({ value: k, label: INFO[k].name })), kind, (v) => { kind = v; phase = 0; render(); });
+    checkbox(bar2, 'Skewed expert routing (all-to-all)', skew, (v) => { skew = v; render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Buffers on four GPUs before and after a collective operation' });
+    const st = stats(root, ['Collective', 'Sent per GPU', 'Busiest receiver', 'Used for']);
+    legend(root, [['GPU 0 data', GPUC[0]], ['GPU 1', GPUC[1]], ['GPU 2', GPUC[2]], ['GPU 3', GPUC[3]], ['Reduced (summed)', C.kv], ['Traffic', C.comm]]);
+    const say = narration(root);
+
+    // all-to-all matrix: a2a[src][dst] = relative chunk size
+    function a2aMatrix() {
+      const r = rng(7);
+      return Array.from({ length: N }, () => Array.from({ length: N }, (_, d) => (skew ? (d === 1 ? 2.6 : 0.45) * (0.8 + 0.4 * r()) : 1)));
+    }
+
+    const COLW = 186, GAP = 24, X0 = (W - (N * COLW + (N - 1) * GAP)) / 2;
+    const YB = 40, YA = 238, BH = 46;
+    const colX = (g: number) => X0 + g * (COLW + GAP);
+
+    // Each cell: { color, label, opacity, w }
+    type Cell = { fill: string; label: string; op: number; w: number };
+    function buffers(after: boolean): Cell[][] {
+      const own = (g: number, c: number): Cell => ({ fill: GPUC[g], label: `${'abcd'[g]}${c}`, op: 1, w: 1 });
+      const empty = (): Cell => ({ fill: C.surface3, label: '', op: 1, w: 1 });
+      const sum = (c: number): Cell => ({ fill: C.kv, label: `Σ${c}`, op: 1, w: 1 });
+      const m = a2aMatrix();
+      return Array.from({ length: N }, (_, g) => Array.from({ length: N }, (_, c) => {
+        switch (kind) {
+          case 'ar': return after ? sum(c) : own(g, c);
+          case 'rs': return after ? (c === g ? sum(c) : { ...own(g, c), op: 0.18 }) : own(g, c);
+          case 'ag': return after ? { fill: GPUC[c], label: `${'abcd'[c]}${c}`, op: 1, w: 1 } : (c === g ? own(g, c) : empty());
+          case 'a2a': return after
+            ? { fill: GPUC[c], label: `${'abcd'[c]}→${g}`, op: 1, w: m[c][g] }
+            : { fill: GPUC[g], label: `${'abcd'[g]}→${c}`, op: 1, w: m[g][c] };
+          case 'p2p': return g === 0 ? own(0, c) : g === 1 ? (after ? own(0, c) : empty()) : { ...empty(), op: 0.5 };
+        }
+      }));
+    }
+
+    // traffic[src][dst] in units of S (per-GPU buffer size)
+    function traffic(): number[][] {
+      const t = Array.from({ length: N }, () => Array(N).fill(0));
+      const m = a2aMatrix();
+      for (let a = 0; a < N; a++) for (let b = 0; b < N; b++) {
+        if (a === b) continue;
+        if (kind === 'ar') t[a][b] = 2 / N; // ring total 2(N−1)/N × S, spread conceptually over all peers
+        if (kind === 'rs' || kind === 'ag') t[a][b] = 1 / N;
+        if (kind === 'a2a') t[a][b] = m[a][b] / N;
+      }
+      if (kind === 'p2p') t[0][1] = 1;
+      return t;
+    }
+
+    function drawBuf(y: number, cells: Cell[][], title: string) {
+      text(svg, 6, y + BH / 2, title, { class: 't-small t-bold t-dim' });
+      const maxTot = Math.max(N, ...cells.map((r) => r.reduce((a, c) => a + c.w, 0)));
+      for (let g = 0; g < N; g++) {
+        const x = colX(g);
+        rect(svg, x, y - 18, COLW, BH + 24, C.surface2, { rx: 8, stroke: C.border });
+        text(svg, x + 8, y - 8, `GPU ${g}`, { class: 't-small t-bold' });
+        const row = cells[g];
+        const tot = row.reduce((a, c) => a + c.w, 0);
+        const scale = (COLW - 16 - 3 * (N - 1)) / (kind === 'a2a' ? maxTot : N);
+        let cx = x + 8;
+        for (const c of row) {
+          const w = c.w * scale;
+          rect(svg, cx, y, w, BH - 6, c.fill, { opacity: c.op, rx: 4 });
+          if (c.label && w > 26) text(svg, cx + w / 2, y + (BH - 6) / 2, c.label, { 'text-anchor': 'middle', class: 't-small t-mono t-bold', fill: 'var(--bg)', opacity: c.op < 0.5 ? 0.6 : 1 });
+          cx += w + 3;
+        }
+        if (kind === 'a2a') text(svg, x + COLW - 8, y - 8, `${(tot / N).toFixed(2)}× S`, { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+      }
+    }
+
+    function render() {
+      clear(svg);
+      const arrow = arrowDefs(svg, uniq('nc'), C.comm);
+      drawBuf(YB, buffers(false), 'Before');
+      if (phase >= 2) drawBuf(YA, buffers(true), 'After');
+      else {
+        text(svg, 6, YA + BH / 2, 'After', { class: 't-small t-bold t-faint' });
+        for (let g = 0; g < N; g++) rect(svg, colX(g), YA - 18, COLW, BH + 24, 'none', { rx: 8, stroke: C.border, 'stroke-dasharray': '4 4' });
+      }
+      const t = traffic();
+      const maxT = Math.max(...t.flat(), 1e-9);
+      if (phase >= 1) {
+        for (let a = 0; a < N; a++) for (let b = 0; b < N; b++) {
+          if (!t[a][b]) continue;
+          const x1 = colX(a) + COLW / 2 + (b - a) * 14, y1 = YB + BH + 8;
+          const x2 = colX(b) + COLW / 2 + (b - a) * 6, y2 = YA - 22;
+          const wdt = 1 + 5 * (t[a][b] / maxT);
+          s('path', { d: `M${x1},${y1} C${x1},${(y1 + y2) / 2} ${x2},${(y1 + y2) / 2} ${x2},${y2}`, fill: 'none', stroke: C.comm, 'stroke-width': wdt, opacity: phase === 1 ? 0.85 : 0.3, 'marker-end': arrow }, svg);
+        }
+      }
+      // per-GPU receive totals
+      const recv = Array.from({ length: N }, (_, b) => t.reduce((acc, row) => acc + row[b], 0));
+      const sent = t.map((row) => row.reduce((a, x) => a + x, 0));
+      const meanR = recv.reduce((a, x) => a + x, 0) / N;
+      const maxR = Math.max(...recv);
+
+      const inf = INFO[kind];
+      st.set('Collective', inf.name, phase === 0 ? 'before' : phase === 1 ? 'data in flight' : 'after');
+      const sentFactor = kind === 'a2a' ? Math.max(...sent) : inf.factor;
+      st.set('Sent per GPU', kind === 'a2a' ? `${sentFactor.toFixed(2)}× S` : inf.sent, kind === 'ar' ? 'ring algorithm; S = buffer size' : 'S = buffer size per GPU');
+      st.set('Busiest receiver', kind === 'p2p' ? 'GPU 1' : `${(maxR / Math.max(meanR, 1e-9)).toFixed(2)}× mean`, kind === 'a2a' && skew ? 'everyone waits for it' : 'per-GPU inbound bytes', kind === 'a2a' && skew ? C.waste : undefined);
+      st.set('Used for', kind === 'ar' ? 'TP' : kind === 'a2a' ? 'EP (MoE)' : kind === 'p2p' ? 'PP, KV transfer' : 'TP / SP');
+
+      if (phase === 0) say(`<b>${inf.name}.</b> Each GPU starts with a buffer of size S, drawn as ${N} chunks. Press <b>Step</b> to see who sends what, then the result.`);
+      else if (phase === 1) {
+        if (kind === 'ar') say('Every GPU needs every other GPU’s contribution to each chunk. A ring does this in 2(N−1) neighbour steps, as a reduce-scatter followed by an all-gather, so no single link carries more than 2(N−1)/N × S.');
+        else if (kind === 'a2a') say(skew ? 'With skewed routing, most tokens pick experts on <b>GPU 1</b>. Its inbound traffic is several times the average, and the whole MoE layer waits for that transfer and that GPU’s expert compute.' : 'Every GPU sends a <b>different</b> chunk to every other GPU. Unlike all-reduce, nothing is summed; the data is transposed. Sizes depend on how the router sent tokens.');
+        else if (kind === 'p2p') say('One sender, one receiver. No other GPU is involved, so it tolerates slower links and can cross nodes. The cost is simply α + S/β.');
+        else say(`${inf.name}: each GPU exchanges one chunk with each other GPU, so it sends (N−1)/N of its buffer.`);
+      } else say(`<b>Result.</b> ${inf.use}`);
+    }
+
+    player(bar, root, { step: () => { phase = Math.min(2, phase + 1); return phase < 2; }, reset: () => { phase = 0; }, render, interval: 1400, autoplay: true });
+  });
+</script>

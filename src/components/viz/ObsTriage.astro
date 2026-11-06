@@ -1,0 +1,155 @@
+---
+/* Interactive triage tree: pick a symptom, answer yes/no checks (each names the metric or command
+   to look at) until you reach a likely cause and fix. The whole tree for the symptom is drawn, with
+   the path you took highlighted. */
+---
+<div data-viz="obs-triage"></div>
+
+<script>
+  import { mountAll, h, svgRoot, s, rect, text, clear, ctrlBar, select, button, C } from '../../lib/viz';
+
+  interface Leaf { leaf: true; short: string; cause: string; fix: string; }
+  interface Ask { leaf?: false; short: string; q: string; check: string; yes: N; no: N; }
+  type N = Leaf | Ask;
+  const L = (short: string, cause: string, fix: string): Leaf => ({ leaf: true, short, cause, fix });
+
+  const TREES: { id: string; label: string; root: N }[] = [
+    { id: 'pending', label: 'Pod stuck in Pending', root: {
+      short: 'Insufficient nvidia.com/gpu?', q: 'Do the pod events say <code>Insufficient nvidia.com/gpu</code>?', check: 'kubectl describe pod &lt;pod&gt;   (Events at the bottom)',
+      yes: { short: 'Nodes advertise GPUs?', q: 'Does any node report allocatable GPUs?', check: "kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\\.com/gpu",
+        yes: L('All GPUs taken / fragmented', 'GPUs exist but none are free in the shape you asked for. A TP=4 pod needs 4 free GPUs on <b>one</b> node; 4 nodes with 1 free GPU each do not help.', 'Compare requests with free GPUs per node, check quotas (Kueue admission, ResourceQuota), let the cluster autoscaler add a node, or use gang/topology-aware scheduling.'),
+        no: L('Device plugin not advertising', 'The node has GPUs but Kubernetes cannot see them: driver, toolkit or device-plugin pod not healthy.', 'Check the GPU Operator pods on that node (driver, toolkit, device-plugin, validator), run <code>nvidia-smi</code> in the driver container. See <a href="../gpus-on-kubernetes/">GPUs on Kubernetes</a>.') },
+      no: { short: 'Selector / taint mismatch?', q: 'Do events mention node affinity, selector or an untolerated taint?', check: 'kubectl describe pod &lt;pod&gt;;  kubectl get nodes -L nvidia.com/gpu.product',
+        yes: L('Scheduling constraints', 'The pod asks for a label value no node has (e.g. a misspelt <code>nvidia.com/gpu.product</code>), or lacks a toleration for the GPU node taint.', 'Copy label values from the nodes rather than typing them; add the toleration; prefer DRA selectors for device attributes.'),
+        no: L('Volume or admission', 'Something else blocks scheduling: an unbound PVC (no RWX storage class), or a queueing system has not admitted the workload yet.', '<code>kubectl get pvc</code>, check the storage class; for Kueue, <code>kubectl get workloads</code> and the ClusterQueue quota.') } } },
+
+    { id: 'restart', label: 'Pod restarts during start-up', root: {
+      short: 'OOMKilled (exit 137)?', q: 'Is the last terminated reason <code>OOMKilled</code>?', check: "kubectl get pod &lt;pod&gt; -o jsonpath='{.status.containerStatuses[0].lastState}'",
+      yes: L('Host RAM limit during load', 'The container memory cgroup, not the GPU, ran out: loader CPU copies, pinned buffers, pickle state dicts per rank, plus <code>/dev/shm</code> tmpfs, all count against the limit.', 'Measure peak RSS during a load and size the limit above it; use mmap’d safetensors; bound /dev/shm. See <a href="../model-loading/">weights & loading</a>.'),
+      no: { short: 'CUDA OOM in the logs?', q: 'Do the engine logs show CUDA out-of-memory, or the engine failing to fit the KV cache?', check: 'kubectl logs &lt;pod&gt; --previous | grep -iE "out of memory|cache"',
+        yes: { short: 'Memory already used?', q: 'Was GPU memory already in use before the engine started (another process, or a shared GPU)?', check: 'DCGM_FI_DEV_FB_USED before start;  nvidia-smi --query-compute-apps=pid,used_memory --format=csv',
+          yes: L('GPU not exclusive', 'Another process holds memory on the GPU: a time-sliced neighbour, a leftover process, or a second engine. The engine budgets a fraction of the <i>total</i> memory.', 'Find the other process; avoid time-slicing for large engines or lower <code>--gpu-memory-utilization</code>. See <a href="../gpu-sharing/">GPU sharing</a>.'),
+          no: L('Budget does not fit', 'Weights + activation peak + one full <code>max-model-len</code> sequence of KV exceed the memory budget.', 'Lower <code>--max-model-len</code>, use FP8 weights or KV, or raise tensor parallelism. The <a href="../kv-cache/">KV calculator</a> shows the arithmetic.') },
+        no: L('Killed by the startup probe', 'Nothing crashed: the startup probe gave up before loading finished, so the kubelet restarted a healthy pod.', 'Events show <code>Startup probe failed</code> then <code>Killing</code>. Make failureThreshold × periodSeconds exceed the worst-case load time.') } } },
+
+    { id: 'ttft', label: 'High TTFT, normal ITL', root: {
+      short: 'Requests waiting?', q: 'Is <code>vllm:num_requests_waiting</code> above zero for sustained periods?', check: 'max by (pod) (vllm:num_requests_waiting)',
+      yes: { short: 'KV cache full?', q: 'Is <code>vllm:kv_cache_usage_perc</code> near 1 on the replicas that queue?', check: 'max by (pod) (vllm:kv_cache_usage_perc)',
+        yes: L('KV-bound capacity', 'Concurrency is limited by KV-cache memory: new requests wait for blocks to free up.', 'Scale out on KV usage, FP8 KV cache, a shorter max-model-len, and check preemptions. See <a href="../routing-autoscaling/">routing & autoscaling</a>.'),
+        no: L('Batch cap or imbalance', 'Queues build while KV has room: max-num-seqs or the token budget is too low, or routing piles requests onto one replica while others idle.', 'Compare waiting across replicas; use load-aware routing; tune <code>--max-num-seqs</code> and the batched-token budget against the SLO.') },
+      no: { short: 'Prefix hit rate dropped?', q: 'Did the prefix-cache hit rate fall?', check: 'rate(vllm:prefix_cache_hits_total[5m]) / rate(vllm:prefix_cache_queries_total[5m])',
+        yes: L('Lost prefix reuse', 'Prefill work went up: new replicas with cold caches, a routing change that scatters prefixes, or a system prompt that now varies (a timestamp at the top).', 'Restore prefix-aware routing; keep the shared prefix byte-identical. See <a href="../prefix-caching/">prefix caching</a>.'),
+        no: L('Longer prompts or slow front', 'Either prompts got longer (prompt tokens per request rose), or the time is spent before the engine: gateway, auth, retrieval, tokenizer.', 'Compare client-side and engine-side TTFT; trace gateway → engine; look at prompt-token rate per request.') } } },
+
+    { id: 'itl', label: 'Normal TTFT, high ITL', root: {
+      short: 'Spikes match prompt bursts?', q: 'Do ITL spikes line up with bursts of prompt tokens?', check: 'rate(vllm:prompt_tokens_total[1m])  vs  p99 vllm:inter_token_latency_seconds',
+      yes: L('Prefill interference', 'Long prompts are prefilling in the same steps as everyone’s decode, stretching those steps.', 'Smaller chunked-prefill budget, separate ingestion traffic, or <a href="../disaggregation/">P/D disaggregation</a>.'),
+      no: { short: 'Preemptions rising?', q: 'Is <code>vllm:num_preemptions_total</code> increasing?', check: 'rate(vllm:num_preemptions_total[5m]) > 0',
+        yes: L('KV pressure → preemption', 'Running sequences are evicted and recomputed when KV runs out, which stalls their streams.', 'Lower max-num-seqs, give KV more memory, scale out earlier. See <a href="../scheduler/">scheduler & preemption</a>.'),
+        no: { short: 'Clocks throttled?', q: 'Is the SM clock below max with a clock event reason active?', check: 'nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,clocks_event_reasons.active --format=csv',
+          yes: L('Power or thermal throttling', 'The GPU runs below its clocks because of a power cap or temperature. Prefill suffers most; decode a little.', 'Check which reason is active; fix cooling or power limits; compare with neighbouring nodes.'),
+          no: L('Bigger batches or slow comms', 'Either the running batch grew (normal: ITL rises with batch), or TP all-reduce slowed: NVLink errors, or P2P disabled so traffic goes over PCIe.', 'Check <code>vllm:num_requests_running</code>; <code>nvidia-smi topo -m</code>, NVLink bandwidth and error counters.') } } } },
+
+    { id: 'nccl', label: 'NCCL timeout / engine hang', root: {
+      short: 'Xid on that node?', q: 'Did an Xid appear on one of the GPUs around that time?', check: 'dmesg -T | grep -i xid   ·   DCGM_FI_DEV_XID_ERRORS',
+      yes: L('Hardware fault on one rank', 'One GPU or link failed (Xid 74, 79, 48, 95…). Its peers block in the collective until the timeout fires.', 'Cordon and drain the node; reset or RMA the GPU; restart the whole TP group elsewhere. Use the Xid explorer above.'),
+      no: { short: 'One rank died first?', q: 'Did one rank’s process exit or get OOMKilled while the others waited?', check: 'kubectl get pods -l &lt;group&gt;;  kubectl logs &lt;rank&gt; --previous',
+        yes: L('Lost peer', 'A single rank died for its own reason; the others sit in all-reduce until NCCL times out.', 'Fix the root cause on that rank; restart the group as one unit (e.g. LeaderWorkerSet restart policy).'),
+        no: { short: '/dev/shm only 64 MiB?', q: 'Is <code>/dev/shm</code> still the container default (64 MiB)?', check: 'kubectl exec &lt;pod&gt; -- df -h /dev/shm',
+          yes: L('Shared memory too small', 'NCCL and multiprocess workers use shared memory for intra-node transport; 64 MiB is not enough.', 'Mount an <code>emptyDir</code> with <code>medium: Memory</code> and a sizeLimit at /dev/shm.'),
+          no: L('Wrong transport or topology', 'NCCL picked a slow or broken path: TCP instead of RDMA across nodes, the wrong NIC, or P2P disabled within the node.', 'Run with <code>NCCL_DEBUG=INFO</code> to see the transport; <code>nvidia-smi topo -m</code>; check the RDMA device plugin and NIC selection.') } } } },
+
+    { id: 'garbled', label: 'Garbled or endless output', root: {
+      short: 'Template tokens in output?', q: 'Does the output contain literal template markers, or the model writing both sides of a conversation?', check: 'POST /v1/completions with the raw prompt  vs  /v1/chat/completions; inspect /tokenize',
+      yes: L('Wrong chat template', 'The prompt is not in the format the model was trained on: missing template, a template for another model family, or a base model served as chat.', 'Serve the model’s own template (tokenizer_config.json or chat_template.jinja) pinned to the weights’ revision. See <a href="../tokenization/">tokenization</a>.'),
+      no: { short: 'Runs to max_tokens?', q: 'Does generation run until max_tokens without stopping?', check: 'finish_reason == "length" share  ·  vllm:generation_tokens_total per request',
+        yes: L('EOS not configured', 'The engine does not know the real end-of-turn token: generation_config.json missing or ignored, or eos_token_id differs from the template’s end-of-turn token.', 'Ship generation_config.json with the weights; check the EOS IDs; keep <code>--generation-config auto</code>.'),
+        no: { short: 'After quant / upgrade?', q: 'Did it start after a quantization, engine upgrade or KV-dtype change?', check: 'deploy history  ·  eval suite on old vs new',
+          yes: L('Numerical regression', 'The new kernels, scales or KV dtype changed the model’s outputs beyond tolerance.', 'Roll back; rerun task evals on both; compare against BF16. See <a href="../quality-safety/">quality & safety</a>.'),
+          no: L('Mismatched files', 'Weights, tokenizer or config from different revisions: a half-updated cache or a tokenizer loaded from a different repo.', 'Pin every file to one commit hash; verify checksums; rebuild the cache.') } } } },
+  ];
+
+  const W = 920, H = 280, BW = 190, BH = 34;
+
+  mountAll('obs-triage', (root) => {
+    let tree = TREES[0];
+    let path: { node: Ask; ans: boolean }[] = [];
+    const bar = ctrlBar(root);
+    select(bar, 'Symptom', TREES.map((t) => ({ value: t.id, label: t.label })), tree.id, (v) => { tree = TREES.find((t) => t.id === v)!; path = []; render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Decision tree for the selected symptom with the answered path highlighted' });
+    const panel = h('div', { class: 'narr obs-tri' }, root);
+    const btns = ctrlBar(root);
+    const yesB = button(btns, 'Yes', () => answer(true), { primary: true });
+    const noB = button(btns, 'No', () => answer(false), { primary: true });
+    button(btns, 'Back', () => { path.pop(); render(); });
+    button(btns, 'Start over', () => { path = []; render(); }, { icon: 'reset' });
+
+    const current = (): N => { let n: N = tree.root; for (const p of path) n = p.ans ? (n as Ask).yes : (n as Ask).no; return n; };
+    function answer(v: boolean) { const n = current(); if (n.leaf) return; path.push({ node: n, ans: v }); render(); }
+
+    function layout(root0: N) {
+      const pos = new Map<N, { x: number; y: number }>();
+      let leafI = 0; const leaves: N[] = [];
+      const count = (n: N): void => { if (n.leaf) leaves.push(n); else { count(n.yes); count(n.no); } };
+      count(root0);
+      const gap = (H - 30) / leaves.length;
+      const depth = (n: N): number => (n.leaf ? 0 : 1 + Math.max(depth(n.yes), depth(n.no)));
+      const maxD = depth(root0);
+      const colW = (W - 32 - BW) / maxD;
+      const walk = (n: N, d: number): number => {
+        let y: number;
+        if (n.leaf) { y = 20 + gap * (leafI++ + 0.5); }
+        else { const a = walk(n.yes, d + 1), b = walk(n.no, d + 1); y = (a + b) / 2; }
+        // leaves all sit in the last column
+        pos.set(n, { x: 16 + (n.leaf ? maxD : d) * colW, y });
+        return y;
+      };
+      walk(root0, 0);
+      return pos;
+    }
+
+    function render() {
+      clear(svg);
+      const pos = layout(tree.root);
+      const cur = current();
+      const onPath = new Set<N>([tree.root]);
+      let n: N = tree.root;
+      for (const p of path) { n = p.ans ? (n as Ask).yes : (n as Ask).no; onPath.add(n); }
+      // edges
+      pos.forEach((p, node) => {
+        if (node.leaf) return;
+        ([['yes', node.yes], ['no', node.no]] as [string, N][]).forEach(([lab, ch]) => {
+          const c = pos.get(ch)!;
+          const taken = onPath.has(node) && onPath.has(ch);
+          const x1 = p.x + BW, x2 = c.x, mx = (x1 + x2) / 2;
+          s('path', { d: `M${x1},${p.y} C${mx},${p.y} ${mx},${c.y} ${x2},${c.y}`, fill: 'none', stroke: taken ? C.accent : C.border, 'stroke-width': taken ? 2.4 : 1.2 }, svg);
+          const lx = mx, ly = (p.y + c.y) / 2;
+          rect(svg, lx - 13, ly - 8, 26, 16, C.surface, { rx: 8, stroke: taken ? C.accent : C.border });
+          text(svg, lx, ly + 0.5, lab, { 'text-anchor': 'middle', class: 't-small t-bold', fill: taken ? C.accent : C.faint });
+        });
+      });
+      // nodes
+      pos.forEach((p, node) => {
+        const isCur = node === cur, visited = onPath.has(node);
+        const isLeaf = !!node.leaf;
+        const fill = isLeaf ? (isCur ? C.good : C.surface2) : isCur ? C.accent : visited ? C.accentSoft : C.surface2;
+        const stroke = isLeaf ? (isCur ? C.good : C.border) : visited ? C.accent : C.border;
+        rect(svg, p.x, p.y - BH / 2, BW, BH, fill, { rx: isLeaf ? 6 : 10, stroke, 'stroke-width': isCur ? 2 : 1, 'stroke-dasharray': isLeaf && !isCur ? '3 3' : null });
+        text(svg, p.x + BW / 2, p.y, node.short, { 'text-anchor': 'middle', class: 't-small' + (visited ? ' t-bold' : ''), fill: isCur ? 'var(--bg)' : visited ? C.text : C.dim });
+      });
+
+      if (cur.leaf) {
+        panel.innerHTML = `<b>Likely cause: ${cur.short}.</b> ${cur.cause}<br><span style="color:var(--text-dim)"><b style="color:var(--c-good)">Fix:</b> ${cur.fix}</span>`;
+        yesB.disabled = true; noB.disabled = true;
+      } else {
+        panel.innerHTML = `<b>Step ${path.length + 1}.</b> ${cur.q}<br><span style="color:var(--text-dim)">Check:</span> <code>${cur.check}</code>`;
+        yesB.disabled = false; noB.disabled = false;
+      }
+    }
+    render();
+  });
+</script>
+
+<style is:global>
+  .obs-tri code { font-size: 0.78rem; word-break: break-word; }
+</style>

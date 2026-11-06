@@ -1,0 +1,155 @@
+---
+/* Image → tokens calculator. Three common schemes:
+   - Native resolution (Qwen2.5-VL style): resize to multiples of 28 px within [min_pixels, max_pixels];
+     ViT on 14×14 patches, then 2×2 patch merge → one LLM token per 28×28 px.
+   - Fixed resolution (LLaVA-1.5 style): resize to 336×336, 14 px patches → 24×24 = 576 tokens.
+   - Dynamic tiling (InternVL style): split into up to 12 tiles of 448×448 (+ a thumbnail),
+     256 tokens per tile after pixel shuffle.
+   Draws the token grid over the (resized) image and reports LLM tokens, encoder patches, KV bytes and
+   rough prefill cost for a 7B VLM (Qwen2.5-VL-7B shape: 28 layers, 4 KV heads, head dim 128). */
+---
+<div data-viz="mm-image-tokens"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, group, select, slider, segmented, stats, narration, C, fmt } from '../../lib/viz';
+
+  type Scheme = 'native' | 'fixed' | 'tile';
+  const PRESETS = [
+    { id: 'phone', label: 'Phone photo 4032×3024', w: 4032, h: 3024 },
+    { id: 'shot', label: 'Screenshot 1920×1080', w: 1920, h: 1080 },
+    { id: 'doc', label: 'A4 scan 2480×3508', w: 2480, h: 3508 },
+    { id: 'sq', label: 'Square 1024×1024', w: 1024, h: 1024 },
+    { id: 'thumb', label: 'Thumbnail 448×336', w: 448, h: 336 },
+    { id: 'pano', label: 'Wide banner 3000×600', w: 3000, h: 600 },
+  ];
+  const MAXTOK = [256, 512, 1024, 1280, 2048, 4096, 16384];
+  const LLM_PARAMS = 7.6e9, VIT_PARAMS = 0.67e9, KV_TOK = 2 * 28 * 4 * 128 * 2; // 56 KiB / token (BF16)
+  const EFF_FLOPS = 989e12 * 0.35; // H100 BF16 dense at ~35% utilisation
+  const W = 940, H = 330;
+
+  function native(w: number, h: number, maxTok: number) {
+    const F = 28, minPx = 4 * 784, maxPx = maxTok * 784;
+    let hb = Math.max(F, Math.round(h / F) * F), wb = Math.max(F, Math.round(w / F) * F);
+    if (hb * wb > maxPx) { const b = Math.sqrt((h * w) / maxPx); hb = Math.max(F, Math.floor(h / b / F) * F); wb = Math.max(F, Math.floor(w / b / F) * F); }
+    else if (hb * wb < minPx) { const b = Math.sqrt(minPx / (h * w)); hb = Math.ceil((h * b) / F) * F; wb = Math.ceil((w * b) / F) * F; }
+    return { rw: wb, rh: hb, gx: wb / F, gy: hb / F, tokens: (wb / F) * (hb / F), patches: (wb / 14) * (hb / 14) };
+  }
+  function tiles(w: number, h: number, maxTiles = 12) {
+    const ar = w / h; let best = [1, 1], bd = Infinity;
+    const cands: [number, number][] = [];
+    for (let i = 1; i <= maxTiles; i++) for (let j = 1; j <= maxTiles; j++) if (i * j <= maxTiles) cands.push([i, j]);
+    cands.sort((a, b) => a[0] * a[1] - b[0] * b[1]);
+    for (const [i, j] of cands) {
+      const d = Math.abs(ar - i / j);
+      if (d < bd) { bd = d; best = [i, j]; }
+      else if (d === bd && w * h > 0.5 * 448 * 448 * i * j) best = [i, j];
+    }
+    const n = best[0] * best[1];
+    const total = n + (n > 1 ? 1 : 0);
+    return { cols: best[0], rows: best[1], n, total, tokens: total * 256, patches: total * 1024 };
+  }
+
+  mountAll('mm-image-tokens', (root) => {
+    let preset = PRESETS[0], scheme: Scheme = 'native', mI = 3, nImg = 1;
+    const bar1 = ctrlBar(root);
+    const g = group(bar1);
+    select(g, 'Image', PRESETS.map((p) => ({ value: p.id, label: p.label })), preset.id, (v) => { preset = PRESETS.find((p) => p.id === v)!; render(); });
+    segmented(bar1, [{ value: 'native', label: 'Native resolution' }, { value: 'fixed', label: 'Fixed 336 px' }, { value: 'tile', label: 'Tiles of 448 px' }], scheme, (v) => { scheme = v as Scheme; render(); });
+    const bar2 = ctrlBar(root);
+    const mx = slider(bar2, { label: 'max_pixels (as tokens)', min: 0, max: MAXTOK.length - 1, value: mI, format: (i) => `${fmt.int(MAXTOK[i])} tok`, onInput: (i) => { mI = i; render(); } });
+    slider(bar2, { label: 'Images per request', min: 1, max: 16, value: nImg, onInput: (v) => { nImg = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Image with the grid of LLM tokens it becomes' });
+    const say = narration(root);
+    const st = stats(root, ['LLM tokens / image', 'Encoder patches', 'KV for the images', 'Encoder + prefill (est.)']);
+
+    function render() {
+      clear(svg);
+      mx.input.disabled = scheme !== 'native';
+      const { w, h } = preset;
+      // drawing area for the image
+      const AX = 20, AY = 34, AW = 560, AH = 270;
+      const sc = Math.min(AW / w, AH / h);
+      const iw = w * sc, ih = h * sc, ix = AX + (AW - iw) / 2, iy = AY + (AH - ih) / 2;
+      text(svg, AX, 14, `Original ${w}×${h} (${(w * h / 1e6).toFixed(1)} MP)`, { class: 't-small t-bold' });
+      rect(svg, ix, iy, iw, ih, C.surface3, { rx: 2, stroke: C.borderStrong });
+      // faint "photo" content so the grid has something to sit on
+      s('circle', { cx: ix + iw * 0.3, cy: iy + ih * 0.35, r: Math.min(iw, ih) * 0.12, fill: C.prefillSoft }, svg);
+      s('path', { d: `M${ix},${iy + ih} L${ix + iw * 0.35},${iy + ih * 0.5} L${ix + iw * 0.6},${iy + ih * 0.75} L${ix + iw * 0.8},${iy + ih * 0.45} L${ix + iw},${iy + ih * 0.7} L${ix + iw},${iy + ih} Z`, fill: C.kvSoft }, svg);
+
+      let tokens = 0, patches = 0, detail = '', resized = '';
+      const grid = (x: number, y: number, ww: number, hh: number, gx: number, gy: number, col: string) => {
+        const stepX = gx > 70 ? Math.ceil(gx / 70) : 1, stepY = gy > 70 ? Math.ceil(gy / 70) : 1;
+        for (let i = 0; i <= gx; i += stepX) line(svg, x + (i / gx) * ww, y, x + (i / gx) * ww, y + hh, col, { 'stroke-width': 0.6, opacity: 0.8 });
+        for (let j = 0; j <= gy; j += stepY) line(svg, x, y + (j / gy) * hh, x + ww, y + (j / gy) * hh, col, { 'stroke-width': 0.6, opacity: 0.8 });
+        rect(svg, x, y, ww, hh, 'none', { stroke: col, 'stroke-width': 1.5, rx: 0 });
+        return stepX > 1 || stepY > 1 ? Math.max(stepX, stepY) : 1;
+      };
+
+      if (scheme === 'native') {
+        const r = native(w, h, MAXTOK[mI]);
+        tokens = r.tokens; patches = r.patches;
+        // resized image drawn at the same aspect within original box
+        const k = grid(ix, iy, iw, ih, r.gx, r.gy, C.token);
+        resized = `resized to ${r.rw}×${r.rh}`;
+        detail = `${r.gx} × ${r.gy} grid of 28 px cells${k > 1 ? ` (every ${k}th line drawn)` : ''}; each cell = 2×2 ViT patches of 14 px merged into one token`;
+      } else if (scheme === 'fixed') {
+        tokens = 576; patches = 576;
+        const side = Math.min(iw, ih);
+        const fx = ix + (iw - side) / 2, fy = iy + (ih - side) / 2;
+        rect(svg, ix, iy, iw, ih, C.surface, { opacity: 0.55, rx: 2 });
+        grid(fx, fy, side, side, 24, 24, C.token);
+        resized = 'squashed or padded to 336×336';
+        detail = '24 × 24 grid of 14 px patches, one token each, whatever the input size. Fine detail in a large image is simply lost.';
+      } else {
+        const t = tiles(w, h);
+        tokens = t.tokens; patches = t.patches;
+        const tw = iw / t.cols, th = ih / t.rows;
+        for (let i = 0; i < t.cols; i++) for (let j = 0; j < t.rows; j++) {
+          rect(svg, ix + i * tw + 1.5, iy + j * th + 1.5, tw - 3, th - 3, 'none', { stroke: C.token, 'stroke-width': 1.5, rx: 2 });
+          text(svg, ix + i * tw + 6, iy + j * th + 12, '256', { class: 't-small t-mono', fill: C.token });
+        }
+        resized = `${t.cols}×${t.rows} tiles of 448×448${t.n > 1 ? ' + 1 thumbnail' : ''}`;
+        detail = `${t.total} tile${t.total > 1 ? 's' : ''} × 256 tokens. The grid is chosen to match the aspect ratio; a thumbnail of the whole image keeps global context.`;
+        if (t.n > 1) {
+          const thx = AX + AW - 70, thy = AY + AH - 50;
+          rect(svg, thx, thy, 64, 48, C.tokenSoft, { stroke: C.token, rx: 3 });
+          text(svg, thx + 32, thy + 24, 'thumb', { 'text-anchor': 'middle', class: 't-small t-mono', fill: C.token });
+        }
+      }
+      text(svg, AX, H - 10, resized, { class: 't-small t-mono t-dim' });
+
+      // right panel: token budget bar for all images
+      const PX = 610, PW = 310;
+      const totalTok = tokens * nImg;
+      const kv = totalTok * KV_TOK;
+      const flops = nImg * (2 * VIT_PARAMS * patches) + 2 * LLM_PARAMS * totalTok;
+      const ms = (flops / EFF_FLOPS) * 1000;
+      text(svg, PX, 14, `${nImg} image${nImg > 1 ? 's' : ''} in one request`, { class: 't-small t-bold' });
+      const ctxs = [8192, 32768, 131072];
+      ctxs.forEach((cx, i) => {
+        const y = 40 + i * 44;
+        const frac = Math.min(1, totalTok / cx);
+        text(svg, PX, y, `vs ${cx / 1024}K context`, { class: 't-small t-dim' });
+        rect(svg, PX, y + 10, PW, 14, C.surface2, { stroke: C.border, rx: 3 });
+        rect(svg, PX, y + 10, PW * frac, 14, totalTok > cx ? C.waste : C.token, { rx: 3 });
+        text(svg, PX + PW, y, totalTok > cx ? 'does not fit' : fmt.pct(totalTok / cx, 1), { 'text-anchor': 'end', class: 't-small t-mono t-bold', fill: totalTok > cx ? C.waste : C.text });
+      });
+      const lines = [
+        `${fmt.int(totalTok)} image tokens in the prompt`,
+        `KV: ${fmt.bytes(kv)} (56 KiB/token, 7B VLM)`,
+        `≈ ${fmt.num(flops / 1e12, 1)} TFLOP before the first token`,
+      ];
+      lines.forEach((l, i) => text(svg, PX, 190 + i * 20, l, { class: 't-small t-mono' }));
+      text(svg, PX, 262, 'A text prompt of the same length costs', { class: 't-small t-dim' });
+      text(svg, PX, 278, 'the same KV and prefill: a token is a token.', { class: 't-small t-dim' });
+
+      st.set('LLM tokens / image', fmt.int(tokens), scheme === 'native' ? `cap ${fmt.int(MAXTOK[mI])} tokens` : scheme === 'fixed' ? 'always 576' : '256 per tile');
+      st.set('Encoder patches', fmt.int(patches), 'ViT sequence length per image');
+      st.set('KV for the images', fmt.bytes(kv), `${nImg} × ${fmt.int(tokens)} tokens`);
+      st.set('Encoder + prefill (est.)', fmt.ms(ms), 'H100, ~35% of peak, excl. CPU work', ms > 500 ? C.waste : undefined);
+      say(`<b>${preset.label}:</b> ${detail}`);
+    }
+    render();
+  });
+</script>

@@ -1,0 +1,168 @@
+---
+layout: ../layouts/Chapter.astro
+title: Observability & Troubleshooting
+description: When an LLM service misbehaves, the cause can sit anywhere from a failing HBM row to a wrong chat template. This chapter covers the GPU and platform signals worth collecting, why the most popular one misleads, how to read Xid errors and throttling, and a symptom-first path to the cause.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import ObsUtilLies from '../components/viz/ObsUtilLies.astro';
+import ObsThrottle from '../components/viz/ObsThrottle.astro';
+import ObsXid from '../components/viz/ObsXid.astro';
+import ObsTriage from '../components/viz/ObsTriage.astro';
+
+The [metrics chapter](../metrics/) defined what users feel: TTFT, ITL, goodput and the dashboard panels that show them. This chapter goes one level lower. A latency SLO alert says *that* something is wrong. Finding out *where* means looking through six layers, each with its own signals and failure modes:
+
+| Layer | What goes wrong | Where to look |
+|---|---|---|
+| **Hardware** | ECC errors, failing HBM rows, NVLink faults, overheating, a GPU falling off the bus | DCGM health fields, Xid in the kernel log, `dcgmi diag` |
+| **Driver / firmware** | Driver–CUDA mismatch, GSP hangs, persistence mode off | `nvidia-smi`, driver container logs, Xid 119/120 |
+| **Kubernetes** | Pending pods, OOMKilled containers, probe restarts, GPUs not advertised | Pod events, `lastState`, GPU Operator pods, node allocatable |
+| **Engine** | Queueing, KV cache full, preemptions, cold prefix cache, wrong template | `vllm:*` metrics, engine logs |
+| **Router / gateway** | Imbalanced routing, buffering proxies, retry storms | Per-replica queue depth, gateway latency |
+| **Client** | Long prompts, abandoned streams, retries without jitter | Client-side TTFT, request shapes |
+
+Two rules make this tractable. First, **collect every layer with the same labels** (node, GPU UUID, pod, model) so a slow request can be followed down to a physical GPU. Second, **start from the symptom**, not from whichever dashboard is open.
+
+## GPU signals from DCGM
+
+On Kubernetes the GPU Operator runs **dcgm-exporter** as a DaemonSet. It scrapes NVIDIA's Data Center GPU Manager and exposes Prometheus metrics labelled with GPU, node and, when pod mapping is on, the pod and namespace using the GPU. The default counter list covers the essentials. Some of the most useful profiling fields ship **commented out** and have to be enabled in a custom counters CSV.
+
+| Metric | What it measures | Use it for |
+|---|---|---|
+| `DCGM_FI_DEV_FB_USED` | HBM in use, MiB | Unexpected usage *before* the engine starts (engines pre-allocate, so it sits flat afterwards) |
+| `DCGM_FI_DEV_GPU_UTIL` | % of time *any* kernel ran | Finding idle, allocated GPUs, and little else |
+| `DCGM_FI_PROF_SM_ACTIVE` | Cycles with ≥1 warp per SM | How much of the chip is in use (off by default) |
+| `DCGM_FI_PROF_SM_OCCUPANCY` | Resident warps vs maximum | Latency hiding; low is normal for GEMMs (off by default) |
+| `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | Cycles the tensor pipe was busy | Distance to the compute roof |
+| `DCGM_FI_PROF_DRAM_ACTIVE` | Cycles the HBM interface was busy | Distance to the memory roof; high in decode |
+| `DCGM_FI_DEV_POWER_USAGE`, `DCGM_FI_DEV_GPU_TEMP`, `DCGM_FI_DEV_SM_CLOCK` | Power, temperature, clocks | Throttling and cooling |
+| `DCGM_FI_DEV_XID_ERRORS` | The **last** Xid code seen | Hardware and driver faults; alert on changes |
+| `DCGM_FI_DEV_ROW_REMAP_FAILURE` and remapped-row counters | HBM rows replaced after ECC errors | Memory health, RMA decisions |
+| `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL` | NVLink traffic | Tensor-parallel communication health |
+
+The single most misread number is the first utilisation column. Play with the kernel pattern of a decode step and watch what each counter says:
+
+<Viz title="GPU utilisation lies" label="Interactive">
+  <ObsUtilLies />
+  <Fragment slot="caption">
+    <p>At batch 1, GPU_UTIL reads close to 100% while the tensor pipe is idle more than 99% of the time, because decode streams weights from HBM. Slide the batch to 128: GPU_UTIL barely moves, yet tokens/s rises by about 100×. Then shrink the kernel grid to 20% of the SMs, and turn CUDA graphs off to see launch gaps. Illustrative model of an 8B model on an H100-class GPU, not a profiler trace.</p>
+  </Fragment>
+</Viz>
+
+`GPU_UTIL` is a time-based "was anything running?" flag. It cannot tell one warp on one SM from all 132 SMs saturating their tensor cores. For capacity questions, use the profiling metrics together with the engine's own numbers: running batch, KV usage and tokens per second. The [roofline](../roofline/) explains why decode lives at high DRAM activity and low tensor activity, and why that is fine.
+
+## Clocks, power and heat
+
+A GPU slower than its neighbours is often running below its maximum clocks. The driver records **why** in a set of clock event reasons (older drivers and tools call them "throttle reasons"):
+
+<Viz title="Why is this GPU slower?" label="Interactive">
+  <ObsThrottle />
+  <Fragment slot="caption">
+    <p>With the compute-heavy workload, lower the power limit and <code>sw_power_cap</code> lights up while prefill speed follows the clock down. Switch to decode with the same cap: it draws less power and barely notices. Then raise the inlet air temperature or cut the airflow to trigger software, then hardware, thermal slowdown. Simplified physics with illustrative thresholds. Check the real limits with <code>nvidia-smi -q -d TEMPERATURE</code>.</p>
+  </Fragment>
+</Viz>
+
+Two lessons carry over to real fleets:
+
+- **Prefill feels clocks, decode mostly does not.** A power-capped GPU shows up as worse TTFT under long prompts, while ITL stays nearly flat. Decode waits on HBM, and memory clocks are not what the power cap reduces first.
+- **The reason matters more than the clock.** `gpu_idle` and `sw_power_cap` on a capped GPU are normal behaviour. `hw_thermal_slowdown` on one node and not its neighbours points to a fan, a blocked inlet or a rack hot spot. `hw_power_brake_slowdown` points to the facility or the PSU. dcgm-exporter can count clock events per reason through its custom collector; enable it if you want alerts on reasons rather than raw clocks.
+
+## Xid errors and memory health
+
+When the driver detects a GPU error, it writes an **Xid** line to the kernel log (`NVRM: Xid (PCI:0000:…): 79, …`). The number tells you whether to look at your code or call the hardware vendor:
+
+<Viz title="Xid explorer" label="Interactive">
+  <ObsXid />
+  <Fragment slot="caption">
+    <p>Click through the codes. Blue codes usually come from the application, red ones from the hardware. Watch the blast radius: even a process-level error takes down a whole tensor-parallel replica, because its peers stall in the next all-reduce. The app-versus-hardware lean is a rough guide based on NVIDIA's Xid catalogue.</p>
+  </Fragment>
+</Viz>
+
+Modern data-centre GPUs (A100 and later) handle HBM errors by **row remapping**: a row with uncorrectable errors is replaced by a spare. The remap is recorded immediately (Xid 63) but only takes effect after a GPU reset. If the spares run out or the remap fails (Xid 64), the GPU should leave service. That gives a simple policy: alert on `DCGM_FI_DEV_ROW_REMAP_FAILURE`, track `UNCORRECTABLE_REMAPPED_ROWS` per GPU, and schedule a drain and reset when remaps are pending.
+
+<Callout type="warn" title="Drain before you debug">
+When a GPU shows a hardware-class Xid, take it out of scheduling first: `kubectl cordon <node>`, then `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data`, so the GPU Operator DaemonSets stay and the inference pods move. Otherwise Kubernetes keeps rescheduling fresh pods onto the bad GPU, and a single fault turns into a crash loop. Then run `dcgmi diag -r 3` (about 15 minutes of hardware tests) before the node goes back with `kubectl uncordon`. The quick `-r 1` only checks the software deployment.
+</Callout>
+
+## Engine signals in a triage
+
+The engine metrics from the [metrics chapter](../metrics/) do the second half of the diagnosis. These are the ones that separate causes:
+
+- **`vllm:num_requests_waiting`** above zero for a sustained period means queueing, so TTFT will rise. Compare it across replicas: if one replica queues while others idle, the problem is routing, not capacity.
+- **`vllm:kv_cache_usage_perc`** near 1 means concurrency is limited by [KV memory](../kv-cache/), not by compute.
+- **`vllm:num_preemptions_total`** increasing means running sequences are being evicted and recomputed. This shows up as ITL spikes and wasted GPU time. See the [scheduler](../scheduler/) chapter.
+- **Prefix hit rate**: the rate of `vllm:prefix_cache_hits_total` divided by the rate of `vllm:prefix_cache_queries_total`. A sudden drop means more prefill per request: new replicas, a routing change, or a prompt that stopped being byte-identical.
+
+## Symptom first: a triage path
+
+Pick the symptom you see, then answer each check in turn. Each step names the command or metric that answers it:
+
+<Viz title="From symptom to cause" label="Interactive">
+  <ObsTriage />
+  <Fragment slot="caption">
+    <p>Each tree covers the common causes, not every possible one. Compare the two restart paths: <b>OOMKilled</b> is the host memory cgroup, while <b>CUDA out of memory</b> is HBM. They have unrelated fixes. Garbled output almost never comes from the GPU: check the template and EOS tokens before the hardware.</p>
+  </Fragment>
+</Viz>
+
+The commands that come up again and again:
+
+```bash
+# Live per-GPU view: clocks, power, temperature, why clocks are reduced
+nvidia-smi --query-gpu=index,name,temperature.gpu,power.draw,power.limit,clocks.sm,clocks.max.sm,utilization.gpu,memory.used,clocks_event_reasons.active --format=csv -l 5
+nvidia-smi -q -d PERFORMANCE          # clock event reasons, human-readable
+nvidia-smi -q -d ECC,ROW_REMAPPER     # ECC counters and remapped rows
+nvidia-smi topo -m                    # NV# = NVLink, PIX/PXB/PHB/SYS = PCIe paths between GPUs and NICs
+nvidia-smi nvlink -s                  # per-link status
+dmesg -T | grep -i xid                # driver-reported GPU errors on the node
+dcgmi diag -r 1                       # seconds: deployment / software checks
+dcgmi diag -r 3                       # ~15 min: hardware tests, run on a drained node
+```
+
+And a starting set of alerts. Label names depend on your exporter configuration:
+
+```yaml
+- alert: GpuXidError            # Xid gauge holds the last code; alert when it changes
+  expr: changes(DCGM_FI_DEV_XID_ERRORS[10m]) > 0
+- alert: GpuRowRemapFailure     # take the GPU out of service
+  expr: DCGM_FI_DEV_ROW_REMAP_FAILURE > 0
+- alert: GpuUncorrectableRemap  # schedule drain + reset
+  expr: increase(DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS[1h]) > 0
+- alert: GpuHot
+  expr: DCGM_FI_DEV_GPU_TEMP > 85
+  for: 10m
+- alert: GpuAllocatedButIdle    # paying for a GPU nobody uses
+  expr: avg_over_time(DCGM_FI_DEV_GPU_UTIL{pod!=""}[1h]) < 1
+- alert: EngineQueueing
+  expr: max by (pod) (vllm:num_requests_waiting) > 0
+  for: 5m
+- alert: EnginePreempting
+  expr: rate(vllm:num_preemptions_total[5m]) > 0
+  for: 10m
+```
+
+<Callout type="key" title="Correlate, then act">
+Most incidents are confirmed by lining up two signals on one time axis. ITL spikes line up with prompt-token bursts, so the cause is prefill interference. An NCCL timeout lines up with an Xid 74 on one node, so the cause is a link fault. A TTFT regression lines up with a deploy and a falling prefix hit rate, so the deploy changed the prompt. Keep GPU, engine and gateway metrics in one Prometheus with shared labels, so this comparison takes one query and no guesswork.
+</Callout>
+
+<Interview>
+  <Q q="Why is nvidia-smi's GPU utilisation a poor measure of how busy an inference GPU is?" level="core">
+    It reports the fraction of time in which at least one kernel was running. It says nothing about how many SMs were used or whether the tensor cores were busy. A batch-1 decode loop reads close to 100% while the tensor pipe is mostly idle, waiting on HBM. Use DCGM profiling metrics (SM_ACTIVE, PIPE_TENSOR_ACTIVE, DRAM_ACTIVE) for hardware efficiency, and engine metrics (running batch, KV usage, tokens/s) for capacity.
+  </Q>
+  <Q q="What is the difference between a CUDA out-of-memory error and an OOMKilled pod?" level="core">
+    CUDA OOM is an allocation failure in **GPU HBM**, raised inside the process with a Python traceback. Causes include weights plus KV not fitting the memory budget, or another process on the GPU. OOMKilled is the kernel killing the container because it exceeded its **host memory cgroup** limit (exit code 137, no traceback). It usually happens during weight loading or because of a memory-backed /dev/shm. Different memory, different fixes.
+  </Q>
+  <Q q="Which Xid codes would make you cordon a node immediately, and which would you treat as application bugs first?" level="mid">
+    Hardware-class codes call for a cordon and drain: 48 (double-bit ECC), 64 (row remap failure), 74 (NVLink), 79 (fallen off the bus) and 95 (uncontained ECC). Codes 119 and 120 (GSP) call for a reset or reboot plus a driver check. Codes 13, 31 and 43 usually come from the application or a kernel: check the recent deploy first, and suspect the GPU only if the code repeats across different workloads on the same device. Code 45 is a consequence of another error, and 63 means a reset should be scheduled.
+  </Q>
+  <Q q="TTFT p95 doubled but ITL is unchanged. Where do you look?" level="mid">
+    If ITL is unchanged, decode is fine, so look at what happens before the first token. Check queueing (`num_requests_waiting` per replica, and whether it is imbalanced), KV usage (is concurrency capped?), prefix hit rate (did reuse drop?), prompt length per request, and time spent before the engine (gateway, retrieval). Power-capped clocks also hurt prefill much more than decode, so check clock event reasons if only some nodes are affected.
+  </Q>
+  <Q q="A TP=8 replica hangs and then fails with an NCCL timeout every few hours, always on the same node. Walk through it." level="senior">
+    Same node every time points to the node, not the code. Check `dmesg` and `DCGM_FI_DEV_XID_ERRORS` around each event, looking for Xid 74 (NVLink) or 79/48/95 on one GPU. Check NVLink error counters and `nvidia-smi topo -m` against the expected topology, and the SM clocks and temperature of each GPU. A single slow or faulty rank stalls every all-reduce. Cordon and drain the node, run `dcgmi diag -r 3`, reset or RMA the GPU, and restart the replica as one unit elsewhere. If nothing shows up, enable `NCCL_DEBUG=INFO` to see which transport and which rank stalls.
+  </Q>
+  <Q q="After moving to a new model revision, users report the assistant answers its own questions and never stops. GPU metrics look perfect. What happened?" level="senior">
+    This is a prompt-format problem, not a GPU one. The chat template or EOS configuration does not match the weights. Typical causes: the new revision moved the template to `chat_template.jinja` and the serving image's tokenizer did not pick it up, `generation_config.json` (with the end-of-turn EOS IDs) was not copied with the weights, or the tokenizer came from a different revision. Inspect a rendered prompt with `/tokenize`, check `finish_reason` statistics, pin every file to one commit hash, and add a smoke test that checks the stop behaviour to the rollout.
+  </Q>
+</Interview>

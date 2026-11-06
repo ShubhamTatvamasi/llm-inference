@@ -1,0 +1,103 @@
+---
+/* Guardrails on a streaming response. Lanes: guard model checks, engine (prefill + decode),
+   and what the client actually receives. Input check can run before prefill or in parallel;
+   output checks can be off, per chunk (buffer, check, release), once at the end, or async
+   (stream immediately, retract if flagged). Computes user-visible TTFT, E2E, worst stall and
+   the exposure window. Illustrative timings: 8B-class engine, small guard classifier. */
+---
+<div data-viz="qual-guardrail"></div>
+
+<script>
+  import { mountAll, h, svgRoot, rect, text, line, clear, ctrlBar, group, slider, segmented, stats, legend, narration, C } from '../../lib/viz';
+
+  type In = 'none' | 'seq' | 'par';
+  type Out = 'none' | 'chunk' | 'end' | 'async';
+  const PREFILL = 0.15, ITL = 0.025, OSL = 160;
+  const W = 940, H = 210;
+
+  mountAll('qual-guardrail', (root) => {
+    let inMode: In = 'seq', outMode: Out = 'chunk', g = 0.08, chunk = 32;
+    const bar = ctrlBar(root);
+    const g1 = group(bar);
+    h('span', { class: 'field', text: 'Input check' }, g1);
+    segmented(g1, [{ value: 'none', label: 'off' }, { value: 'seq', label: 'before prefill' }, { value: 'par', label: 'parallel' }], inMode, (v) => { inMode = v as In; render(); });
+    const g2 = group(bar);
+    h('span', { class: 'field', text: 'Output check' }, g2);
+    segmented(g2, [{ value: 'none', label: 'off' }, { value: 'chunk', label: 'per chunk' }, { value: 'end', label: 'at end' }, { value: 'async', label: 'async' }], outMode, (v) => { outMode = v as Out; render(); });
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'Guard latency per check', min: 20, max: 1000, step: 10, value: g * 1000, format: (v) => `${v} ms`, onInput: (v) => { g = v / 1000; render(); } });
+    slider(bar2, { label: 'Chunk size', min: 8, max: 128, step: 8, value: chunk, format: (v) => `${v} tokens`, onInput: (v) => { chunk = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Timeline of guard checks, generation and client-visible tokens' });
+    const st = stats(root, ['User-visible TTFT', 'E2E', 'Worst stall', 'Exposure window']);
+    legend(root, [['Guard check (input)', C.comm], ['Guard check (output)', C.token], ['Prefill', C.prefill], ['Decode', C.decode], ['Tokens reaching the user', C.kv]]);
+    const say = narration(root);
+
+    function model() {
+      const checks: { s: number; e: number; kind: 'in' | 'out' }[] = [];
+      let pStart = 0;
+      if (inMode === 'seq') { checks.push({ s: 0, e: g, kind: 'in' }); pStart = g; }
+      if (inMode === 'par') checks.push({ s: 0, e: g, kind: 'in' });
+      const tFirst = pStart + PREFILL;
+      const gen = Array.from({ length: OSL }, (_, i) => tFirst + i * ITL);
+      const gate = inMode === 'par' ? g : 0; // nothing is released before the input verdict
+      let rel = gen.map((t) => Math.max(t, gate));
+      let exposure = 0;
+      if (outMode === 'chunk' || outMode === 'async') {
+        let prev = 0; const nCh = Math.ceil(OSL / chunk);
+        const ends: number[] = [];
+        for (let j = 0; j < nCh; j++) {
+          const last = gen[Math.min(OSL - 1, (j + 1) * chunk - 1)];
+          const s = Math.max(last, prev); const e = s + g; prev = e;
+          checks.push({ s, e, kind: 'out' }); ends.push(e);
+        }
+        if (outMode === 'chunk') rel = rel.map((t, i) => Math.max(t, ends[Math.floor(i / chunk)]));
+        else exposure = Math.max(...ends.map((e, j) => e - rel[j * chunk]));
+      }
+      if (outMode === 'end') { const s = gen[OSL - 1]; const e = s + g * 1.5; checks.push({ s, e, kind: 'out' }); rel = rel.map(() => e); }
+      let stall = 0; for (let i = 1; i < OSL; i++) stall = Math.max(stall, rel[i] - rel[i - 1]);
+      return { checks, pStart, tFirst, gen, rel, exposure, stall, ttft: rel[0], e2e: rel[OSL - 1] };
+    }
+
+    function render() {
+      clear(svg);
+      const m = model();
+      const T = Math.max(m.e2e, ...m.checks.map((c) => c.e)) * 1.03;
+      const X0 = 110, X1 = 920;
+      const px = (t: number) => X0 + (t / T) * (X1 - X0);
+      const lanes = [['Guard', 24], ['Engine', 74], ['User sees', 124]] as [string, number][];
+      lanes.forEach(([lab, y]) => { text(svg, 20, y + 14, lab, { class: 't-small t-bold' }); rect(svg, X0, y, X1 - X0, 28, C.surface2, { rx: 4, stroke: C.border }); });
+      m.checks.forEach((c) => rect(svg, px(c.s), 26, Math.max(2, px(c.e) - px(c.s) - 1), 24, c.kind === 'in' ? C.comm : C.token, { rx: 2, opacity: 0.85 }));
+      rect(svg, px(m.pStart), 76, px(m.tFirst) - px(m.pStart), 24, C.prefill, { rx: 2 });
+      rect(svg, px(m.tFirst), 76, px(m.gen[OSL - 1]) - px(m.tFirst), 24, C.decode, { rx: 2, opacity: 0.75 });
+      m.rel.forEach((t) => line(svg, px(t), 128, px(t), 148, C.kv, { 'stroke-width': 1, opacity: 0.8 }));
+      // axis
+      line(svg, X0, 162, X1, 162, C.borderStrong, { 'stroke-width': 1 });
+      const stepS = T > 8 ? 2 : T > 4 ? 1 : 0.5;
+      for (let t = 0; t <= T; t += stepS) { line(svg, px(t), 162, px(t), 166, C.borderStrong, { 'stroke-width': 1 }); text(svg, px(t), 177, `${t}s`, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' }); }
+      // markers
+      line(svg, px(m.ttft), 118, px(m.ttft), 196, C.accent, { 'stroke-width': 1.4 });
+      text(svg, px(m.ttft) + 4, 194, `TTFT ${Math.round(m.ttft * 1000)} ms`, { class: 't-small t-bold', fill: C.accent });
+      const nOut = m.checks.filter((c) => c.kind === 'out').length;
+      if (nOut) text(svg, X1, 194, `${nOut} output check${nOut > 1 ? 's' : ''} · ${Math.round((nOut * g + (inMode !== 'none' ? g : 0)) * 1000)} ms of guard compute`, { 'text-anchor': 'end', class: 't-small t-dim' });
+
+      const base = PREFILL;
+      st.set('User-visible TTFT', `${Math.round(m.ttft * 1000)} ms`, `+${Math.round((m.ttft - base) * 1000)} ms vs no guard`, m.ttft - base > 0.3 ? C.waste : undefined);
+      st.set('E2E', `${m.e2e.toFixed(2)} s`, `${OSL} tokens at ${ITL * 1000} ms ITL`);
+      st.set('Worst stall', `${Math.round(m.stall * 1000)} ms`, m.stall > 0.25 ? 'stream visibly freezes' : 'smooth enough', m.stall > 0.25 ? C.waste : C.good);
+      st.set('Exposure window', outMode === 'async' ? `${Math.round(m.exposure * 1000)} ms` : outMode === 'none' ? 'unbounded' : '0 ms', outMode === 'async' ? 'unsafe text on screen before retraction' : outMode === 'none' ? 'nothing checks the output' : 'nothing shown before it is checked', outMode === 'chunk' || outMode === 'end' ? C.good : C.waste);
+
+      const slow = outMode === 'chunk' && g > chunk * ITL;
+      const msgs: Record<Out, string> = {
+        none: 'No output check: the stream is as fast as the engine, and anything the model writes reaches the user.',
+        chunk: slow
+          ? `<b>The guard is slower than the engine.</b> A ${chunk}-token chunk takes ${Math.round(chunk * ITL * 1000)} ms to generate but ${Math.round(g * 1000)} ms to check, so checks queue up and the stream falls further behind with every chunk.`
+          : `<b>Buffer, check, release.</b> The user gets ${chunk} tokens at a time after each check: TTFT grows by one chunk plus one check, and the stream arrives in bursts. Smaller chunks feel smoother but cost more checks.`,
+        end: '<b>Check the whole answer, then send it.</b> Safest and simplest, but streaming is gone: the user waits for the full generation. Fine for batch and agent tool calls, painful for chat.',
+        async: '<b>Stream now, check alongside.</b> Latency is untouched, but flagged text has already been on screen for the exposure window before the client can retract it. Acceptable for mild policies, not for leaking secrets or PII.',
+      };
+      say(msgs[outMode] + (inMode === 'par' ? ' The input check runs in parallel with prefill, so it only adds latency if it is slower than prefill; a flagged prompt cancels the request.' : ''));
+    }
+    render();
+  });
+</script>

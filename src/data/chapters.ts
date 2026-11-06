@@ -23,6 +23,8 @@ export const parts: Part[] = [
   { id: 'faster', num: 'IV', title: 'Faster & cheaper', blurb: 'Tricks that buy speed, memory and features.' },
   { id: 'scale', num: 'V', title: 'Scaling out', blurb: 'When one GPU is not enough.' },
   { id: 'prod', num: 'VI', title: 'Production', blurb: 'Measuring, routing, scaling and paying for it.' },
+  { id: 'beyond', num: 'VII', title: 'Beyond chat', blurb: 'Reasoning, agents, images and embeddings stress the engine differently.' },
+  { id: 'k8s', num: 'VIII', title: 'Running on Kubernetes', blurb: 'Getting GPUs, weights and visibility into a cluster.' },
 ];
 
 export const chapters: Chapter[] = [
@@ -55,15 +57,29 @@ export const chapters: Chapter[] = [
   { slug: 'multi-lora', part: 'faster', title: 'Multi-LoRA Serving', short: 'Multi-LoRA', blurb: 'One base model, many adapters, all in the same batch.' },
 
   // V — Scaling out
+  { slug: 'interconnects', part: 'scale', title: 'Interconnects & Collectives', short: 'Interconnects', blurb: 'PCIe, NVLink, NVSwitch, InfiniBand and the all-reduce that rides on them.' },
   { slug: 'parallelism', part: 'scale', title: 'Parallelism', short: 'TP / PP / DP', blurb: 'Tensor, pipeline, data and context parallelism and their communication.' },
   { slug: 'moe', part: 'scale', title: 'Mixture of Experts', short: 'MoE & expert parallel', blurb: 'Routers, top-k experts, load imbalance and all-to-all.' },
   { slug: 'disaggregation', part: 'scale', title: 'Disaggregated Prefill / Decode', short: 'P/D disaggregation', blurb: 'Separate pools for each phase, with KV transfer in between.' },
 
   // VI — Production
   { slug: 'metrics', part: 'prod', title: 'Latency Metrics & Goodput', short: 'Metrics & goodput', blurb: 'TTFT, ITL, TPOT, E2E, p99, Little’s law and the goodput knee.' },
+  { slug: 'benchmarking', part: 'prod', title: 'Benchmarking', short: 'Benchmarking', blurb: 'Workload shapes, concurrency sweeps, the tools, and how benchmarks lie.' },
   { slug: 'routing-autoscaling', part: 'prod', title: 'Routing & Autoscaling', short: 'Routing & autoscaling', blurb: 'KV-aware routing, the right scaling signals, cold starts.' },
   { slug: 'serving-stack', part: 'prod', title: 'The Serving Stack', short: 'Serving stack', blurb: 'API → gateway → engine → GPU: the full request path, and the engines.' },
   { slug: 'capacity-planning', part: 'prod', title: 'Capacity & Cost', short: 'Capacity & cost', blurb: 'From model + SLO + traffic to GPU count and cost per million tokens.' },
+  { slug: 'quality-safety', part: 'prod', title: 'Quality & Safety', short: 'Quality & safety', blurb: 'Proving an optimisation kept accuracy, and guarding inputs, outputs and weights.' },
+
+  // VII — Beyond chat
+  { slug: 'reasoning-agents', part: 'beyond', title: 'Reasoning Models & Agents', short: 'Reasoning & agents', blurb: 'Thousands of hidden tokens, multi-turn loops and tool calls.' },
+  { slug: 'multimodal', part: 'beyond', title: 'Multimodal Serving', short: 'Multimodal', blurb: 'Images become tokens: encoder cost, token budgets and encoder caching.' },
+  { slug: 'embedding-serving', part: 'beyond', title: 'Embeddings & Rerankers', short: 'Embeddings & rerankers', blurb: 'Prefill-only models: pooling, batching and serving them cheaply.' },
+
+  // VIII — Running on Kubernetes
+  { slug: 'gpus-on-kubernetes', part: 'k8s', title: 'GPUs on Kubernetes', short: 'GPUs on Kubernetes', blurb: 'GPU Operator, device plugin, CDI, node labels and DRA claims.' },
+  { slug: 'gpu-sharing', part: 'k8s', title: 'Sharing a GPU', short: 'GPU sharing', blurb: 'Time-slicing, MPS, MIG and vGPU: isolation vs utilisation.' },
+  { slug: 'model-loading', part: 'k8s', title: 'Model Weights & Loading', short: 'Weights & loading', blurb: 'File formats, where weights live, and how fast they reach HBM.' },
+  { slug: 'observability', part: 'k8s', title: 'Observability & Troubleshooting', short: 'Observability', blurb: 'DCGM metrics, Xid errors and a symptom-first triage path.' },
 ];
 
 export const chapterIndex = (slug: string) => chapters.findIndex((c) => c.slug === slug);

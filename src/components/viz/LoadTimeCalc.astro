@@ -1,0 +1,170 @@
+---
+/* Weight load-time calculator: model + precision + source + TP + replicas starting at once
+   → time per stage (fetch to node, read into host RAM, host→GPU copy), bottleneck highlighted,
+   plus load time vs number of simultaneous replicas for every source (shared-bandwidth contention).
+   Bandwidths are illustrative round numbers, not measurements. */
+---
+<div data-viz="load-time"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, group, select, slider, stats, narration, legend, arrowDefs, uniq, C, fmt } from '../../lib/viz';
+  import { MODELS, getModel } from '../../data/hardware';
+
+  type Kind = 'fetch' | 'stream' | 'local';
+  interface Src { id: string; label: string; short: string; kind: Kind; per: number; shared: number; where: string; note: string; }
+  // per = GB/s one pod can pull on its own; shared = GB/s the backend/link can serve to everyone together
+  const SOURCES: Src[] = [
+    { id: 'hub', label: 'Hub over the internet', short: 'Hub', kind: 'fetch', per: 0.3, shared: 2.5, where: 'Model hub', note: 'Every pod downloads through the same egress link / NAT gateway, and the hub may throttle you.' },
+    { id: 's3', label: 'Object storage in-region (download, then load)', short: 'S3 → disk', kind: 'fetch', per: 1.5, shared: 40, where: 'Object store', note: 'Parallel ranged GETs scale well across pods; the pod first writes a local copy, then loads it.' },
+    { id: 'stream', label: 'Object storage streamed (runai_streamer)', short: 'S3 stream', kind: 'stream', per: 2.5, shared: 40, where: 'Object store', note: 'Tensors are read concurrently straight into host buffers and copied to the GPU while later ones are still arriving. No local copy.' },
+    { id: 'pvc', label: 'RWX PVC on an NFS filer', short: 'NFS PVC', kind: 'stream', per: 1.0, shared: 4, where: 'NFS filer', note: 'No download step, but every replica reads through the same filer heads, so a scale-out event saturates it.' },
+    { id: 'ocipull', label: 'OCI image / Modelcar, pulled at start', short: 'OCI pull', kind: 'fetch', per: 0.8, shared: 12, where: 'Registry', note: 'Layers are pulled and decompressed (often single-threaded per layer) before the container starts.' },
+    { id: 'oci', label: 'OCI image / image volume, already on the node', short: 'OCI cached', kind: 'local', per: 3, shared: Infinity, where: 'Node image store', note: 'The bytes are already on the node’s disk, unpacked by the container runtime. Nothing crosses the network.' },
+    { id: 'cache', label: 'Host page cache (restart on the same node)', short: 'Page cache', kind: 'local', per: 40, shared: Infinity, where: 'Page cache', note: 'The files were read recently, so they are still in the node\u2019s RAM. This is what a quick pod restart sees, and the closest thing to free.' },
+    { id: 'nvme', label: 'Node-local NVMe, pre-staged', short: 'Local NVMe', kind: 'local', per: 6, shared: Infinity, where: 'Node NVMe', note: 'A DaemonSet or a previous pod already put the files on the node’s NVMe. Each node reads its own disk.' },
+  ];
+  const DISK = 5;            // GB/s local NVMe read after a download
+  const H2D_PER_GPU = 20;    // GB/s effective pinned host→device copy per GPU (PCIe Gen5 x16 peak ~64)
+  const H2D_HOST = 80;       // GB/s the host side (memory, CPU threads) can feed all GPUs together
+  const PREC = [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }, { value: '0.5', label: 'INT4 / FP4' }];
+
+  const W = 920, H = 400;
+
+  function times(sizeGB: number, src: Src, tp: number, reps: number) {
+    const net = Math.min(src.per, src.shared / reps);
+    const fetch = src.kind === 'fetch' ? sizeGB / net : 0;
+    const readBW = src.kind === 'fetch' ? DISK : src.kind === 'stream' ? net : src.per;
+    const read = sizeGB / readBW;
+    const copyBW = Math.min(tp * H2D_PER_GPU, H2D_HOST);
+    const copy = sizeGB / copyBW;
+    const total = fetch + Math.max(read, copy);
+    const bott = fetch >= Math.max(read, copy) ? 'fetch' : read >= copy ? 'read' : 'copy';
+    return { net, fetch, read, copy, readBW, copyBW, total, bott };
+  }
+  const tfmt = (sec: number) => (sec >= 3600 ? `${(sec / 3600).toFixed(1)} h` : sec >= 90 ? `${(sec / 60).toFixed(1)} min` : `${sec.toFixed(sec < 10 ? 1 : 0)} s`);
+
+  mountAll('load-time', (root) => {
+    let model = getModel('llama3-70b');
+    let bytes = 2, src = SOURCES[0], tp = 4, reps = 1;
+
+    const b1 = ctrlBar(root);
+    const g1 = group(b1);
+    select(g1, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
+    select(g1, 'Precision', PREC, '2', (v) => { bytes = Number(v); render(); });
+    select(g1, 'GPUs / replica', [1, 2, 4, 8].map((n) => ({ value: String(n), label: `${n} (TP ${n})` })), '4', (v) => { tp = Number(v); render(); });
+    const b2 = ctrlBar(root);
+    select(b2, 'Weights from', SOURCES.map((x) => ({ value: x.id, label: x.label })), src.id, (v) => { src = SOURCES.find((x) => x.id === v)!; render(); });
+    slider(b2, { label: 'Replicas starting at once', min: 1, max: 32, value: reps, onInput: (v) => { reps = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Weight loading pipeline with per-stage times and load time versus simultaneous replicas' });
+    const arrowId = uniq('lt-a'), arrowHot = uniq('lt-h');
+    const st = stats(root, ['Checkpoint', 'Time to weights in HBM', 'Bottleneck', 'Pulled over the network']);
+    legend(root, [['Fetch to node', C.comm], ['Read into host RAM', C.mem], ['Host → GPU copy', C.weight], ['Bottleneck hop', C.waste]]);
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      const aN = arrowDefs(svg, arrowId, C.borderStrong);
+      const aH = arrowDefs(svg, arrowHot, C.waste);
+      const size = (model.params * bytes) / 1e9;
+      const r = times(size, src, tp, reps);
+
+      /* ---------- pipeline */
+      type Box = { name: string; sub: string };
+      type Hop = { label: string; bw: number; stage: 'fetch' | 'read' | 'copy' };
+      const boxes: Box[] = []; const hops: Hop[] = [];
+      if (src.kind === 'fetch') {
+        boxes.push({ name: src.where, sub: reps > 1 ? `shared by ${reps} pods` : 'remote' }, { name: 'Node disk', sub: 'local copy' });
+        hops.push({ label: 'fetch', bw: r.net, stage: 'fetch' }, { label: 'read', bw: DISK, stage: 'read' });
+      } else if (src.kind === 'stream') {
+        boxes.push({ name: src.where, sub: reps > 1 ? `shared by ${reps} pods` : 'remote' });
+        hops.push({ label: 'stream', bw: r.net, stage: 'read' });
+      } else {
+        boxes.push({ name: src.where, sub: 'on this node' });
+        hops.push({ label: 'read', bw: src.per, stage: 'read' });
+      }
+      boxes.push({ name: 'Host RAM', sub: 'page cache / pinned buffers' }, { name: `GPU HBM × ${tp}`, sub: `${fmt.num(size / tp, 1)} GB per GPU` });
+      hops.push({ label: `copy (${tp} × PCIe)`, bw: r.copyBW, stage: 'copy' });
+
+      const BW = 150, BH = 54, Y = 14;
+      const gap = (W - 40 - boxes.length * BW) / (boxes.length - 1);
+      boxes.forEach((b, i) => {
+        const x = 20 + i * (BW + gap);
+        const fill = i === boxes.length - 1 ? C.weightSoft : C.surface2;
+        rect(svg, x, Y, BW, BH, fill, { rx: 10, stroke: C.border });
+        text(svg, x + BW / 2, Y + 20, b.name, { 'text-anchor': 'middle', class: 't-bold t-small' });
+        text(svg, x + BW / 2, Y + 38, b.sub, { 'text-anchor': 'middle', class: 't-small t-faint' });
+        if (i < hops.length) {
+          const hp = hops[i]; const hot = hp.stage === r.bott;
+          const x1 = x + BW + 6, x2 = x + BW + gap - 6;
+          line(svg, x1, Y + BH / 2, x2, Y + BH / 2, hot ? C.waste : C.borderStrong, { 'stroke-width': hot ? 3 : 1.6, 'marker-end': hot ? aH : aN });
+          text(svg, (x1 + x2) / 2, Y + BH / 2 - 12, hp.label, { 'text-anchor': 'middle', class: 't-small', fill: hot ? C.waste : C.dim });
+          text(svg, (x1 + x2) / 2, Y + BH / 2 + 14, `${hp.bw < 1 ? hp.bw.toFixed(2) : fmt.num(hp.bw, 1)} GB/s`, { 'text-anchor': 'middle', class: 't-small t-mono t-bold', fill: hot ? C.waste : C.text });
+        }
+      });
+
+      /* ---------- gantt for one replica */
+      const GX = 150, GW = W - GX - 20, GY = 96;
+      const sx = (t: number) => GX + (t / r.total) * GW;
+      text(svg, 20, GY - 4, 'One replica, stage by stage', { class: 't-small t-bold' });
+      const rows: [string, number, number, string, 'fetch' | 'read' | 'copy'][] = [
+        ['Fetch to node', 0, r.fetch, C.comm, 'fetch'],
+        ['Read → host RAM', r.fetch, r.read, C.mem, 'read'],
+        ['Copy → HBM', r.fetch, r.copy, C.weight, 'copy'],
+      ];
+      rows.forEach(([name, t0, d, col, key], i) => {
+        const y = GY + 8 + i * 24;
+        text(svg, 20, y + 9, name, { class: 't-small t-dim' });
+        rect(svg, GX, y, GW, 18, C.surface2, { rx: 4 });
+        if (d <= 0) { text(svg, GX + 8, y + 9, key === 'fetch' ? 'none: no separate download step' : '', { class: 't-small t-faint' }); return; }
+        const w = Math.max(2, sx(t0 + d) - sx(t0));
+        const hot = key === r.bott;
+        rect(svg, sx(t0), y, w, 18, col, { rx: 4, stroke: hot ? C.text : 'none', 'stroke-width': 2, opacity: 0.9 });
+        const lbl = tfmt(d) + (hot ? '  ◀ bottleneck' : '');
+        if (w > 120) text(svg, sx(t0) + 6, y + 9.5, lbl, { class: 't-small t-mono t-bold', fill: 'var(--bg)' });
+        else if (sx(t0) + w + 120 < W) text(svg, sx(t0) + w + 6, y + 9.5, lbl, { class: 't-small t-mono' + (hot ? ' t-bold' : '') });
+        else text(svg, sx(t0) - 6, y + 9.5, tfmt(d) + (hot ? ' · bottleneck ▶' : ''), { 'text-anchor': 'end', class: 't-small t-mono' + (hot ? ' t-bold' : '') });
+      });
+      if (r.fetch > 0) line(svg, sx(r.fetch), GY + 2, sx(r.fetch), GY + 80, C.faint, { 'stroke-dasharray': '3 3', 'stroke-width': 1 });
+      text(svg, W - 20, GY - 4, `total ${tfmt(r.total)}  (read and copy overlap)`, { 'text-anchor': 'end', class: 't-small t-mono' });
+
+      /* ---------- load time vs replicas, all sources (log y) */
+      const CX = 70, CW = W - CX - 150, CY = 200, CH = 170;
+      const yMin = 2, yMax = 4 * 3600;
+      const ly = (sec: number) => CY + CH - ((Math.log10(Math.max(yMin, Math.min(yMax, sec))) - Math.log10(yMin)) / (Math.log10(yMax) - Math.log10(yMin))) * CH;
+      const lx = (n: number) => CX + ((n - 1) / 31) * CW;
+      text(svg, 20, CY - 14, 'Time to weights in HBM vs replicas starting at the same moment (log scale)', { class: 't-small t-bold' });
+      [[5, '5 s'], [30, '30 s'], [120, '2 min'], [600, '10 min'], [3600, '1 h'], [4 * 3600, '4 h']].forEach(([v, l]) => {
+        const y = ly(v as number);
+        line(svg, CX, y, CX + CW, y, C.border, { 'stroke-width': 1 });
+        text(svg, CX - 8, y, l as string, { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      });
+      [1, 8, 16, 24, 32].forEach((n) => text(svg, lx(n), CY + CH + 14, String(n), { 'text-anchor': 'middle', class: 't-small t-faint t-mono' }));
+      text(svg, CX + CW / 2, CY + CH + 28, 'replicas', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      const labels: { y: number; s: Src; v: number }[] = [];
+      SOURCES.forEach((sr) => {
+        const on = sr.id === src.id;
+        let d = '';
+        for (let n = 1; n <= 32; n++) d += `${n === 1 ? 'M' : 'L'}${lx(n).toFixed(1)},${ly(times(size, sr, tp, n).total).toFixed(1)} `;
+        s('path', { d, fill: 'none', stroke: on ? C.accent : C.faint, 'stroke-width': on ? 2.6 : 1.2, opacity: on ? 1 : 0.6 }, svg);
+        labels.push({ y: ly(times(size, sr, tp, 32).total), s: sr, v: times(size, sr, tp, 32).total });
+      });
+      labels.sort((a, b) => a.y - b.y);
+      for (let i = 1; i < labels.length; i++) if (labels[i].y - labels[i - 1].y < 12) labels[i].y = labels[i - 1].y + 12;
+      labels.forEach((l) => text(svg, CX + CW + 8, l.y, l.s.short, { class: 't-small' + (l.s.id === src.id ? ' t-bold' : ' t-faint'), fill: l.s.id === src.id ? C.accent : undefined }));
+      const mx = lx(reps), my = ly(r.total);
+      line(svg, mx, CY, mx, CY + CH, C.accent, { 'stroke-dasharray': '3 3', 'stroke-width': 1 });
+      s('circle', { cx: mx, cy: my, r: 5, fill: C.accent, stroke: 'var(--bg)', 'stroke-width': 2 }, svg);
+
+      /* ---------- stats + narration */
+      const bName = r.bott === 'fetch' ? 'fetch' : r.bott === 'read' ? (src.kind === 'local' ? 'local disk read' : src.kind === 'stream' ? 'network read' : 'disk read') : 'host → GPU copy';
+      st.set('Checkpoint', `${fmt.num(size, size < 10 ? 1 : 0)} GB`, `${fmt.num(model.params, 1)} params × ${bytes} B`);
+      st.set('Time to weights in HBM', tfmt(r.total), reps > 1 ? `each of ${reps} replicas` : 'one replica', r.total > 600 ? C.waste : r.total < 60 ? C.good : undefined);
+      st.set('Bottleneck', bName, `${(r.bott === 'fetch' ? r.net : r.bott === 'read' ? r.readBW : r.copyBW).toFixed(r.bott === 'copy' ? 0 : 2)} GB/s`, C.waste);
+      st.set('Pulled over the network', src.kind === 'local' ? '0 GB' : `${fmt.num(size * reps, 0)} GB`, src.kind === 'local' ? 'already on the node' : `${reps} × checkpoint`);
+      const contended = src.shared / reps < src.per;
+      say(`<b>${src.label}.</b> ${src.note} ${contended ? `With ${reps} replicas starting together each gets only <b>${r.net.toFixed(2)} GB/s</b> of the backend’s ${src.shared} GB/s.` : ''} ${r.bott === 'copy' ? 'The storage is fast enough that the PCIe copy into HBM now sets the pace. More GPUs per replica means more PCIe links in parallel.' : ''}`);
+    }
+    render();
+  });
+</script>

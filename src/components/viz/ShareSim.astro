@@ -1,0 +1,181 @@
+---
+/* Four tenants on one H100: time-slicing vs MPS vs MIG. A scrolling timeline shows which tenant uses
+   how much of the SMs each tick, tenant cards show latency inflation and memory, and three fault
+   buttons (memory hog, app fault, GPU-level Xid) show the blast radius in each mode.
+   Illustrative model: time-slicing hands the whole GPU to one context per slice (+10% switch cost);
+   MPS replicas=4 caps each client at 1/4 of SMs and memory; MIG uses 3g+2g+1g+1g on an H100. */
+---
+<div data-viz="share-sim"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, group, button, player, segmented, stats, narration, C, SERIES, rng, hatchDefs, uniq } from '../../lib/viz';
+
+  type Mode = 'ts' | 'mps' | 'mig';
+  interface Tenant { name: string; what: string; mem: number; mig: string; frac: number; migMem: number; demand: (t: number, r: () => number) => number; }
+  const TEN: Tenant[] = [
+    { name: 'A · chat 8B', what: 'steady decode', mem: 18, mig: '3g.40gb', frac: 3 / 7, migMem: 40, demand: (_t, r) => 0.45 + r() * 0.2 },
+    { name: 'B · embeddings', what: 'bursty', mem: 6, mig: '1g.10gb', frac: 1 / 7, migMem: 10, demand: (t, r) => ((t % 23) < 7 ? 0.4 + r() * 0.2 : 0.03) },
+    { name: 'C · notebook', what: 'mostly idle', mem: 8, mig: '1g.10gb', frac: 1 / 7, migMem: 10, demand: (t, r) => ((t % 41) > 33 ? 0.85 : r() < 0.06 ? 0.3 : 0) },
+    { name: 'D · batch eval', what: 'steady', mem: 14, mig: '2g.20gb', frac: 2 / 7, migMem: 20, demand: (_t, r) => 0.3 + r() * 0.1 },
+  ];
+  const N = TEN.length, COLS = 64, W = 940, H = 300, TX = 46, TY = 30, TW = 524, TH = 220;
+  interface Col { used: number[]; owner: number; down: boolean[]; }
+
+  mountAll('share-sim', (root) => {
+    let mode: Mode = 'ts';
+    let t = 0; let r = rng(7);
+    let hist: Col[] = [];
+    let down = Array(N).fill(0);        // ticks left in restart
+    let lat = Array(N).fill(1);         // EMA of latency multiplier
+    let memNow = TEN.map((x) => x.mem);
+    let hog = 0;                        // ticks of C's memory growth
+    let rr = 0; let stall = 0;
+    let event = '';
+
+    const bar = ctrlBar(root);
+    segmented(bar, [{ value: 'ts', label: 'Time-slicing' }, { value: 'mps', label: 'MPS' }, { value: 'mig', label: 'MIG' }], mode, (v) => { mode = v as Mode; p.reset(); });
+    const ev = ctrlBar(root);
+    const eg = group(ev);
+    button(eg, 'C leaks memory', () => { hog = 1; event = 'oom'; render(); });
+    button(eg, 'C hits a kernel fault', () => fault());
+    button(eg, 'GPU falls off the bus', () => xid79());
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Timeline of SM usage by four tenants on one GPU, with tenant status cards' });
+    const hatch = uniq('ssh');
+    const say = narration(root);
+    const st = stats(root, ['SM utilisation (window)', 'Worst tenant slowdown', 'Isolation']);
+
+    const memLimit = (i: number) => (mode === 'ts' ? 80 : mode === 'mps' ? 20 : TEN[i].migMem);
+
+    function crash(i: number, ticks: number) { down[i] = Math.max(down[i], ticks); if (i === 2) { hog = 0; memNow[2] = TEN[2].mem; } }
+    function fault() {
+      event = 'fault';
+      if (mode === 'mps') TEN.forEach((_, i) => crash(i, 14));
+      else { crash(2, 14); if (mode === 'ts') stall = 3; }
+      render();
+    }
+    function xid79() { event = 'xid79'; TEN.forEach((_, i) => crash(i, 40)); hog = 0; render(); }
+
+    function reset() { t = 0; r = rng(7); hist = []; down = Array(N).fill(0); lat = Array(N).fill(1); memNow = TEN.map((x) => x.mem); hog = 0; rr = 0; stall = 0; event = ''; for (let k = 0; k < 40; k++) step(); }
+
+    function step() {
+      t++;
+      const d = TEN.map((x, i) => (down[i] > 0 ? 0 : x.demand(t, r)));
+      // memory hog: C grows until it hits its limit
+      if (hog > 0 && down[2] === 0) {
+        memNow[2] += 3;
+        const others = memNow.reduce((a, b, i) => (i === 2 ? a : a + b), 0);
+        if (mode === 'ts') {
+          if (memNow[2] + others >= 80) { // the GPU is full: whoever allocates next fails
+            memNow[2] = 80 - others;
+            crash(1, 14); crash(2, 14); hog = 0;
+          }
+        } else if (memNow[2] >= memLimit(2)) { memNow[2] = memLimit(2); crash(2, 14); }
+      }
+      const used = Array(N).fill(0); let owner = -1;
+      const isDown = down.map((x) => x > 0);
+      if (stall > 0) { stall--; }
+      else if (mode === 'ts') {
+        const act = d.map((x, i) => (x > 0.02 ? i : -1)).filter((i) => i >= 0);
+        if (act.length) { owner = act[rr++ % act.length]; used[owner] = d[owner]; }
+        d.forEach((x, i) => { if (x > 0.02) { const m = act.length * 1.1; lat[i] = lat[i] * 0.85 + Math.max(1, m) * 0.15; } });
+      } else {
+        const act = d.filter((x) => x > 0.02).length;
+        d.forEach((x, i) => {
+          const cap = mode === 'mps' ? 0.25 : TEN[i].frac;
+          used[i] = Math.min(x, cap);
+          if (x > 0.02) {
+            const interf = mode === 'mps' ? 1 + 0.08 * Math.max(0, act - 1) : 1;
+            lat[i] = lat[i] * 0.85 + Math.max(1, x / cap) * interf * 0.15;
+          }
+        });
+      }
+      down = down.map((x) => Math.max(0, x - 1));
+      hist.push({ used, owner, down: isDown });
+      if (hist.length > COLS) hist.shift();
+      return true;
+    }
+
+    function render() {
+      clear(svg);
+      const hp = hatchDefs(svg, hatch, C.waste);
+      text(svg, TX, 14, 'SM occupancy over time (each column = one tick)', { class: 't-small t-bold' });
+      text(svg, TX + TW, 14, mode === 'ts' ? 'one context at a time' : mode === 'mps' ? 'concurrent, each capped at 1/4' : 'fixed partitions: 3g + 1g + 1g + 2g', { 'text-anchor': 'end', class: 't-small t-faint' });
+      rect(svg, TX, TY, TW, TH, C.surface2, { rx: 0, stroke: C.border });
+      const cw = TW / COLS;
+      hist.forEach((col, ci) => {
+        const x = TX + ci * cw;
+        if (mode === 'mig') {
+          let y = TY + TH;
+          TEN.forEach((tn, i) => {
+            const lh = tn.frac * TH;
+            const u = col.used[i] / tn.frac;
+            if (col.down[i]) rect(svg, x, y - lh, cw, lh, hp, { rx: 0 });
+            rect(svg, x, y - u * lh, cw - 0.5, u * lh, SERIES[i], { rx: 0, opacity: 0.85 });
+            y -= lh;
+          });
+        } else {
+          let y = TY + TH;
+          col.used.forEach((u, i) => { if (u > 0) { rect(svg, x, y - u * TH, cw - 0.5, u * TH, SERIES[i], { rx: 0, opacity: 0.85 }); y -= u * TH; } });
+          if (col.down.every(Boolean)) rect(svg, x, TY, cw, TH, hp, { rx: 0 });
+        }
+      });
+      if (mode === 'mig') {
+        let y = TY + TH;
+        TEN.forEach((tn, i) => { y -= tn.frac * TH; if (i < N - 1) line(svg, TX, y, TX + TW, y, C.borderStrong, { 'stroke-width': 1, 'stroke-dasharray': '4 3' }); text(svg, TX - 6, y + tn.frac * TH / 2, String.fromCharCode(65 + i), { 'text-anchor': 'end', class: 't-small t-bold', fill: SERIES[i] }); });
+      }
+      text(svg, TX - 6, TY + 6, '100%', { 'text-anchor': 'end', class: 't-small t-faint', dx: mode === 'mig' ? -10 : 0 });
+      text(svg, TX, TY + TH + 14, 'older', { class: 't-small t-faint' });
+      text(svg, TX + TW, TY + TH + 14, 'now', { 'text-anchor': 'end', class: 't-small t-faint' });
+
+      // tenant cards
+      const CX = 594, CW = 334, CH = 60;
+      TEN.forEach((tn, i) => {
+        const y = 6 + i * (CH + 6);
+        const dn = down[i] > 0;
+        rect(svg, CX, y, CW, CH, dn ? C.wasteSoft : C.surface2, { rx: 9, stroke: dn ? C.waste : C.border });
+        rect(svg, CX, y, 5, CH, SERIES[i], { rx: 2 });
+        text(svg, CX + 14, y + 14, tn.name, { class: 't-small t-bold' });
+        text(svg, CX + 14, y + 29, mode === 'mig' ? `MIG ${tn.mig}` : mode === 'mps' ? 'MPS client, 25% SMs' : 'time-sliced replica', { class: 't-small t-dim' });
+        const lim = memLimit(i);
+        const mx = CX + 14, mw = 170;
+        rect(svg, mx, y + 40, mw, 8, C.surface3, { rx: 3 });
+        rect(svg, mx, y + 40, Math.min(1, memNow[i] / 80) * mw, 8, i === 2 && hog ? C.waste : C.mem, { rx: 3 });
+        if (mode !== 'ts') line(svg, mx + (lim / 80) * mw, y + 36, mx + (lim / 80) * mw, y + 52, C.text, { 'stroke-width': 1.5 });
+        text(svg, mx + mw + 6, y + 44, `${Math.round(memNow[i])} / ${lim} GB`, { class: 't-small t-mono t-dim' });
+        text(svg, CX + CW - 10, y + 14, dn ? (event === 'xid79' ? 'GPU lost' : 'CrashLoop') : `${lat[i].toFixed(1)}× latency`, { 'text-anchor': 'end', class: 't-small t-bold', fill: dn ? C.waste : lat[i] > 2.5 ? C.prefill : C.good });
+      });
+      text(svg, CX, H - 18, 'Memory bar: GB used of the 80 GB GPU; tick = enforced limit', { class: 't-small t-faint' });
+
+      const util = hist.length ? hist.reduce((a, c) => a + c.used.reduce((x, y) => x + y, 0), 0) / hist.length : 0;
+      const worst = Math.max(...lat);
+      st.set('SM utilisation (window)', `${Math.round(util * 100)}%`, mode === 'ts' ? 'one tenant at a time leaves SMs idle' : mode === 'mig' ? 'idle slices cannot be borrowed' : 'concurrent kernels fill the GPU');
+      st.set('Worst tenant slowdown', `${worst.toFixed(1)}×`, 'vs a whole GPU to itself', worst > 3 ? C.waste : C.text);
+      st.set('Isolation', mode === 'ts' ? 'none' : mode === 'mps' ? 'memory cap only' : 'hardware', mode === 'ts' ? 'no memory or fault isolation' : mode === 'mps' ? 'fatal faults hit all clients' : 'SMs, L2, memory, bandwidth', mode === 'mig' ? C.good : mode === 'ts' ? C.waste : C.prefill);
+
+      const msgs: Record<Mode, Record<string, string>> = {
+        ts: {
+          '': '<b>Time-slicing</b>: contexts take turns owning the whole GPU. When the chat tenant gets a slice it uses about half the SMs; the rest sit idle. Every active tenant waits for everyone else\'s slices, so latency grows with the number of active tenants.',
+          oom: 'C grows into memory nobody fenced off. When the GPU is full, the <b>next tenant to allocate</b> fails: here the embeddings service OOMs and crash-loops along with C. Nothing enforced C\'s share.',
+          fault: 'C\'s context is torn down. The others are separate contexts and usually survive, after a stall. But there is <b>no fault isolation guarantee</b>: a hung kernel or a GPU-level error takes everyone with it.',
+          xid79: 'Xid 79: the GPU has fallen off the bus. Every tenant on it is gone until the GPU is reset or the node reboots.',
+        },
+        mps: {
+          '': '<b>MPS</b>: one server process runs all clients\' kernels concurrently, so the GPU fills up. With the device plugin\'s MPS sharing, each of 4 replicas is capped at 1/4 of SMs and 1/4 of memory.',
+          oom: 'C hits its 20 GB MPS memory limit and gets an out-of-memory error. The other clients are unaffected: the memory cap is enforced.',
+          fault: 'A fatal fault in one MPS client is reported to <b>every client</b> sharing that GPU through the server. All four tenants crash and restart: MPS shares compute well but isolates faults poorly.',
+          xid79: 'Xid 79: the GPU has fallen off the bus. Every tenant on it is gone until the GPU is reset or the node reboots.',
+        },
+        mig: {
+          '': '<b>MIG</b>: four hardware instances with their own SMs, L2 slices, memory and memory bandwidth. No tenant can slow another down, but the notebook\'s idle slice cannot be lent to the busy chat tenant.',
+          oom: 'C fills its 10 GB instance and gets an OOM inside it. Nothing outside the slice notices.',
+          fault: 'The fault is contained in C\'s GPU instance. A, B and D keep serving without a stall.',
+          xid79: 'Even MIG cannot help here: Xid 79 means the whole physical GPU is gone. Every instance on it, and every tenant, is lost until reset.',
+        },
+      };
+      const active = event && (down.some((x) => x > 0) || hog > 0) ? event : '';
+      say(msgs[mode][active]);
+    }
+
+    const p = player(bar, root, { step, reset, render, interval: 160, autoplay: true, speeds: [1, 2, 4] });
+  });
+</script>

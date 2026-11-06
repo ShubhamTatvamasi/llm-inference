@@ -1,0 +1,172 @@
+---
+/* Topology map: an HGX-style 8-GPU node with NVSwitch vs a PCIe server with two CPU sockets.
+   Click two devices to see the path, the `nvidia-smi topo -m` label and what it means for
+   bandwidth and NCCL's transport choice. Bandwidths illustrative. */
+---
+<div data-viz="net-topology"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, segmented, stats, narration, C } from '../../lib/viz';
+
+  type Kind = 'cpu' | 'sw' | 'gpu' | 'nic' | 'nvs';
+  interface Node { id: string; label: string; kind: Kind; x: number; y: number; w: number; h: number; parent?: string; hb?: string; }
+  type Box = 'hgx' | 'pcie';
+
+  const W = 940, H = 400, GY = 250, GW = 52;
+
+  function build(box: Box): Node[] {
+    const n: Node[] = [
+      { id: 'cpu0', label: 'CPU 0 · NUMA 0', kind: 'cpu', x: 30, y: 26, w: 210, h: 34 },
+      { id: 'cpu1', label: 'CPU 1 · NUMA 1', kind: 'cpu', x: 330, y: 26, w: 210, h: 34 },
+    ];
+    const gx = (i: number) => 30 + i * 65 + (i >= 4 ? 20 : 0);
+    if (box === 'hgx') {
+      for (let k = 0; k < 4; k++) n.push({ id: `s${k}`, label: 'PCIe switch', kind: 'sw', x: gx(2 * k) + 5, y: 110, w: 70, h: 26, parent: k < 2 ? 'cpu0' : 'cpu1', hb: `hb${k}` });
+      for (let i = 0; i < 8; i++) n.push({ id: `gpu${i}`, label: `GPU${i}`, kind: 'gpu', x: gx(i), y: GY, w: GW, h: 34, parent: `s${Math.floor(i / 2)}` });
+      for (let k = 0; k < 4; k++) n.push({ id: `nic${k}`, label: `NIC${k}`, kind: 'nic', x: gx(2 * k) + 82, y: 160, w: 48, h: 24, parent: `s${k}` });
+      n.push({ id: 'nvs', label: 'NVSwitch fabric: every GPU ↔ every GPU at full NVLink bandwidth', kind: 'nvs', x: 30, y: 330, w: 510, h: 34 });
+    } else {
+      n.push({ id: 'swa', label: 'PCIe switch (upper)', kind: 'sw', x: 70, y: 96, w: 150, h: 24, parent: 'cpu0', hb: 'hb0' });
+      n.push({ id: 'a1', label: 'leaf switch', kind: 'sw', x: 20, y: 160, w: 100, h: 24, parent: 'swa' });
+      n.push({ id: 'a2', label: 'leaf switch', kind: 'sw', x: 150, y: 160, w: 110, h: 24, parent: 'swa' });
+      n.push({ id: 'b1', label: 'PCIe switch', kind: 'sw', x: 330, y: 130, w: 100, h: 24, parent: 'cpu1', hb: 'hb1' });
+      n.push({ id: 'b2', label: 'PCIe switch', kind: 'sw', x: 445, y: 130, w: 100, h: 24, parent: 'cpu1', hb: 'hb2' });
+      const par = ['a1', 'a1', 'a2', 'a2', 'b1', 'b1', 'b2', 'b2'];
+      for (let i = 0; i < 8; i++) n.push({ id: `gpu${i}`, label: `GPU${i}`, kind: 'gpu', x: gx(i), y: GY, w: GW, h: 34, parent: par[i] });
+      n.push({ id: 'nic0', label: 'NIC0', kind: 'nic', x: 240, y: 198, w: 50, h: 24, parent: 'a2' });
+      n.push({ id: 'nic1', label: 'NIC1', kind: 'nic', x: 480, y: 72, w: 56, h: 24, parent: 'cpu1', hb: 'hb1' });
+    }
+    return n;
+  }
+
+  const BW: Record<string, [string, string]> = {
+    NV18: ['≈ 450 GB/s', 'per direction, NVLink 4'], PIX: ['≈ 50 GB/s', 'P2P through one switch'], PXB: ['≈ 45 GB/s', 'P2P through switch hops'],
+    PHB: ['≈ 35 GB/s', 'via the CPU host bridge'], NODE: ['≈ 30 GB/s', 'across root ports, one socket'], SYS: ['≈ 15 GB/s', 'across sockets'],
+  };
+  const MEANS: Record<string, string> = {
+    NV18: '<b>NV18</b>: a bonded set of 18 NVLinks. NCCL uses the <b>P2P</b> transport over NVLink (and NVLS in-switch reduction where available). Tensor parallelism belongs here.',
+    PIX: '<b>PIX</b>: at most one PCIe bridge between them. The best PCIe path: peer-to-peer works well, and a NIC here is the one NCCL should use for this GPU with GPUDirect RDMA.',
+    PXB: '<b>PXB</b>: several PCIe bridges, but no CPU host bridge. Still a direct peer-to-peer path, with an extra hop.',
+    PHB: '<b>PHB</b>: the path goes through the CPU’s PCIe host bridge. Peer-to-peer traffic now competes inside the root complex; GPUDirect RDMA may still be used but is slower.',
+    NODE: '<b>NODE</b>: crosses between PCIe host bridges inside one NUMA node (same socket). Expect lower and less predictable P2P bandwidth.',
+    SYS: '<b>SYS</b>: crosses the SMP interconnect between sockets (UPI / xGMI). P2P is often slow or disabled, so NCCL falls back to staging through host memory (<b>SHM</b>). Keep TP ranks off this path.',
+  };
+
+  mountAll('net-topology', (root) => {
+    let box: Box = 'pcie';
+    let nodes = build(box);
+    let sel: string[] = ['gpu0', 'gpu4'];
+    const bar = ctrlBar(root);
+    segmented(bar, [{ value: 'pcie', label: 'PCIe server, 2 sockets' }, { value: 'hgx', label: '8-GPU node with NVSwitch' }], box, (v) => { box = v; nodes = build(box); sel = ['gpu0', 'gpu4']; render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Server topology with selectable GPUs and NICs, and the nvidia-smi topo -m matrix' });
+    const st = stats(root, ['Selected', 'topo -m label', 'Bandwidth (illustrative)', 'NCCL transport']);
+    const say = narration(root);
+
+    const get = (id: string) => nodes.find((x) => x.id === id)!;
+    const ancestors = (id: string) => { const out: string[] = []; let c: string | undefined = id; while (c) { out.push(c); c = get(c).parent; } return out; };
+
+    function relation(a: string, b: string): { label: string; path: string[] } {
+      if (a === b) return { label: 'X', path: [a] };
+      const A = get(a), B = get(b);
+      if (box === 'hgx' && A.kind === 'gpu' && B.kind === 'gpu') return { label: 'NV18', path: [a, 'nvs', b] };
+      const pa = ancestors(a), pb = ancestors(b);
+      const lca = pa.find((x) => pb.includes(x));
+      if (!lca) return { label: 'SYS', path: [...pa, ...pb.slice().reverse()] };
+      const path = [...pa.slice(0, pa.indexOf(lca) + 1), ...pb.slice(0, pb.indexOf(lca)).reverse()];
+      const L = get(lca);
+      if (L.kind === 'cpu') {
+        const ca = get(pa[pa.indexOf(lca) - 1]), cb = get(pb[pb.indexOf(lca) - 1]);
+        return { label: ca.hb === cb.hb ? 'PHB' : 'NODE', path };
+      }
+      return { label: A.parent === lca && B.parent === lca ? 'PIX' : 'PXB', path };
+    }
+
+    const center = (nd: Node) => [nd.x + nd.w / 2, nd.y + nd.h / 2];
+
+    function click(id: string) {
+      if (sel.length >= 2) sel = [id]; else if (sel[0] !== id) sel = [...sel, id];
+      render();
+    }
+
+    function render() {
+      clear(svg);
+      const rel = sel.length === 2 ? relation(sel[0], sel[1]) : null;
+      const onPath = new Set(rel?.path ?? []);
+      const edgeOn = (a: string, b: string) => !!rel && onPath.has(a) && onPath.has(b);
+
+      // edges
+      const cpu0 = get('cpu0'), cpu1 = get('cpu1');
+      const upiOn = rel?.label === 'SYS';
+      line(svg, cpu0.x + cpu0.w, cpu0.y + cpu0.h / 2, cpu1.x, cpu1.y + cpu1.h / 2, upiOn ? C.accent : C.borderStrong, { 'stroke-width': upiOn ? 4 : 2.5 });
+      text(svg, (cpu0.x + cpu0.w + cpu1.x) / 2, cpu0.y + cpu0.h / 2 - 12, 'UPI / xGMI', { 'text-anchor': 'middle', class: 't-small t-faint' });
+      for (const nd of nodes) {
+        if (!nd.parent) continue;
+        const p = get(nd.parent);
+        const [x1, y1] = center(p), [x2, y2] = center(nd);
+        const on = edgeOn(nd.id, p.id);
+        line(svg, x1, y1 + p.h / 2, x2, y2 - nd.h / 2, on ? C.accent : C.border, { 'stroke-width': on ? 3.5 : 1.5 });
+      }
+      if (box === 'hgx') {
+        const nv = get('nvs');
+        for (const nd of nodes.filter((x) => x.kind === 'gpu')) {
+          const [x] = center(nd);
+          const on = rel?.label === 'NV18' && onPath.has(nd.id);
+          line(svg, x, nd.y + nd.h, x, nv.y, on ? C.accent : C.comm, { 'stroke-width': on ? 4 : 2.5, opacity: on ? 1 : 0.55 });
+        }
+      }
+      // nodes
+      for (const nd of nodes) {
+        const selected = sel.includes(nd.id);
+        const fill = nd.kind === 'cpu' ? C.surface3 : nd.kind === 'sw' ? C.surface2 : nd.kind === 'gpu' ? C.computeSoft : nd.kind === 'nic' ? C.decodeSoft : C.commSoft;
+        const stroke = selected ? C.accent : onPath.has(nd.id) ? C.accent : nd.kind === 'gpu' ? C.compute : nd.kind === 'nic' ? C.decode : nd.kind === 'nvs' ? C.comm : C.border;
+        const r = rect(svg, nd.x, nd.y, nd.w, nd.h, fill, { rx: 6, stroke, 'stroke-width': selected ? 3 : 1.3 });
+        const t = text(svg, nd.x + nd.w / 2, nd.y + nd.h / 2, nd.label, { 'text-anchor': 'middle', class: 't-small' + (nd.kind === 'gpu' || nd.kind === 'nic' || nd.kind === 'cpu' ? ' t-bold' : ' t-dim') });
+        if (nd.kind === 'gpu' || nd.kind === 'nic') {
+          for (const el of [r, t]) { el.style.cursor = 'pointer'; el.addEventListener('click', () => click(nd.id)); }
+        }
+      }
+      text(svg, 30, H - 8, 'Click any two GPUs or NICs.', { class: 't-small t-faint' });
+
+      // topo -m matrix
+      const devs = nodes.filter((x) => x.kind === 'gpu' || x.kind === 'nic');
+      const MX = 596, MY = 40, LW = 38;
+      const cw = Math.min(28, (W - 4 - MX - LW) / devs.length), ch = 20;
+      text(svg, MX, 14, '$ nvidia-smi topo -m', { class: 't-small t-mono t-bold' });
+      devs.forEach((d, i) => {
+        text(svg, MX + LW + i * cw + cw / 2, MY - 8, d.label, { 'text-anchor': 'middle', class: 't-mono t-faint', style: 'font-size:8.5px' });
+        text(svg, MX + LW - 4, MY + i * ch + ch / 2, d.label, { 'text-anchor': 'end', class: 't-mono t-faint', style: 'font-size:9px' });
+        devs.forEach((e, j) => {
+          const lab = relation(d.id, e.id).label;
+          const hit = rel && ((sel[0] === d.id && sel[1] === e.id) || (sel[1] === d.id && sel[0] === e.id));
+          const tint = lab === 'NV18' ? C.commSoft : lab === 'PIX' || lab === 'PXB' ? C.computeSoft : lab === 'SYS' ? C.wasteSoft : lab === 'X' ? 'transparent' : C.surface2;
+          const cell = rect(svg, MX + LW + j * cw + 0.5, MY + i * ch + 0.5, cw - 1, ch - 1, tint, { rx: 2, stroke: hit ? C.accent : 'none', 'stroke-width': hit ? 2 : 0 });
+          const ct = text(svg, MX + LW + j * cw + cw / 2, MY + i * ch + ch / 2, lab, { 'text-anchor': 'middle', class: 't-mono' + (hit ? ' t-bold' : ' t-dim'), style: 'font-size:8.5px' });
+          if (lab !== 'X') for (const el of [cell, ct]) { el.style.cursor = 'pointer'; el.addEventListener('click', () => { sel = [d.id, e.id]; render(); }); }
+        });
+      });
+      const ly = MY + devs.length * ch + 18;
+      const leg: [string, string][] = [['X', 'self'], ['NV#', 'bonded NVLinks'], ['PIX', '≤ 1 PCIe bridge'], ['PXB', 'multiple PCIe bridges'], ['PHB', 'via CPU host bridge'], ['NODE', 'across host bridges, one NUMA node'], ['SYS', 'across sockets (UPI / xGMI)']];
+      leg.forEach(([k, v], i) => {
+        text(svg, MX, ly + i * 14, k, { class: 't-small t-mono t-bold' });
+        text(svg, MX + 40, ly + i * 14, v, { class: 't-small t-dim' });
+      });
+
+      if (rel) {
+        const a = get(sel[0]), b = get(sel[1]);
+        const nic = a.kind === 'nic' || b.kind === 'nic';
+        const both = a.kind === 'nic' && b.kind === 'nic';
+        st.set('Selected', `${a.label} ↔ ${b.label}`, nic ? (both ? 'NIC ↔ NIC' : 'GPU ↔ NIC') : 'GPU ↔ GPU');
+        st.set('topo -m label', rel.label, `${rel.path.length - 2} hop${rel.path.length === 3 ? "" : "s"} in between`, rel.label === 'SYS' ? C.waste : rel.label === 'NV18' ? C.good : undefined);
+        const gdrOk = rel.label === 'PIX' || rel.label === 'PXB';
+        st.set('Bandwidth (illustrative)', nic ? (gdrOk ? '≈ 50 GB/s' : '< 50 GB/s') : BW[rel.label][0], nic ? (gdrOk ? 'NIC line rate, 400 Gb/s' : 'longer PCIe path to the NIC') : BW[rel.label][1]);
+        st.set('NCCL transport', nic ? 'NET/IB' : rel.label === 'NV18' ? 'P2P' : rel.label === 'SYS' ? 'SHM' : 'P2P', nic ? (gdrOk ? 'with GPUDirect RDMA' : 'GPUDirect RDMA less likely') : rel.label === 'NV18' ? 'over NVLink' : rel.label === 'SYS' ? 'staged via host memory' : 'over PCIe');
+        say(MEANS[rel.label] + (nic && !both ? ' For GPU ↔ NIC pairs this distance decides whether GPUDirect RDMA is worth it; NCCL tunes that threshold with <code>NCCL_NET_GDR_LEVEL</code>.' : ''));
+      } else {
+        st.set('Selected', `${get(sel[0]).label} ↔ ?`, 'pick a second device');
+        st.set('topo -m label', '–', ''); st.set('Bandwidth (illustrative)', '–', ''); st.set('NCCL transport', '–', '');
+        say('Pick a second GPU or NIC.');
+      }
+    }
+    render();
+  });
+</script>

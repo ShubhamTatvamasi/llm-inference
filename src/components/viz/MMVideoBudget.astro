@@ -1,0 +1,101 @@
+---
+/* Video token budget: duration × sampling fps × tokens per frame (optionally ÷2 for temporal merging of
+   frame pairs, as Qwen2.5-VL does), capped by a max-frames setting, plus optional audio tokens.
+   Compared with context windows, and converted to KV bytes and prefill time for a 7B VLM
+   (56 KiB/token, H100 at ~35% of BF16 peak). Tokens per frame use 28 px per token. Illustrative. */
+---
+<div data-viz="mm-video-budget"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, slider, segmented, select, checkbox, stats, narration, C, fmt } from '../../lib/viz';
+
+  const DUR = [5, 15, 30, 60, 120, 300, 600, 1800, 3600];
+  const RES = [
+    { id: '224', label: '224×224 (64 tok)', tok: 64 },
+    { id: '360', label: '640×360 (299 tok)', tok: 299 },
+    { id: '480', label: '854×480 (527 tok)', tok: 527 },
+    { id: '720', label: '1280×720 (1,196 tok)', tok: 1196 },
+  ];
+  const CAPS = [16, 32, 64, 128, 256, 768, Infinity];
+  const KV_TOK = 2 * 28 * 4 * 128 * 2, LLM = 7.6e9, EFF = 989e12 * 0.35, AUDIO_TPS = 25;
+  const W = 940, H = 270, X0 = 20, X1 = 920;
+
+  const durLabel = (s: number) => (s < 60 ? `${s} s` : `${s / 60} min`);
+
+  mountAll('mm-video-budget', (root) => {
+    let dI = 3, fps = '1', res = RES[1], merge = true, cI = 6, audio = false;
+    const b1 = ctrlBar(root);
+    slider(b1, { label: 'Video length', min: 0, max: DUR.length - 1, value: dI, format: (i) => durLabel(DUR[i]), onInput: (i) => { dI = i; render(); } });
+    segmented(b1, ['0.5', '1', '2', '4'].map((v) => ({ value: v, label: `${v} fps` })), fps, (v) => { fps = v; render(); });
+    const b2 = ctrlBar(root);
+    select(b2, 'Frame size', RES.map((r) => ({ value: r.id, label: r.label })), res.id, (v) => { res = RES.find((r) => r.id === v)!; render(); });
+    slider(b2, { label: 'Max frames', min: 0, max: CAPS.length - 1, value: cI, format: (i) => (CAPS[i] === Infinity ? 'no cap' : String(CAPS[i])), onInput: (i) => { cI = i; render(); } });
+    checkbox(b2, 'Merge frame pairs', merge, (v) => { merge = v; render(); });
+    checkbox(b2, 'Include audio track', audio, (v) => { audio = v; render(); });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Sampled video frames and the resulting token count against context windows' });
+    const say = narration(root);
+    const st = stats(root, ['Frames sampled', 'Video tokens', 'KV cache', 'Prefill (est.)']);
+
+    function render() {
+      clear(svg);
+      const dur = DUR[dI], f = Number(fps), cap = CAPS[cI];
+      const want = Math.max(1, Math.round(dur * f));
+      const frames = Math.min(want, cap);
+      const effFps = frames / dur;
+      const vidTok = Math.ceil(frames / (merge ? 2 : 1)) * res.tok;
+      const audTok = audio ? dur * AUDIO_TPS : 0;
+      const tok = vidTok + audTok;
+
+      // frame strip
+      text(svg, X0, 12, `${durLabel(dur)} of video, sampled at ${effFps >= 0.1 ? effFps.toFixed(2) : effFps.toFixed(3)} fps${frames < want ? ` (cap: ${cap} frames, not ${fmt.int(want)})` : ''}`, { class: 't-small t-bold', fill: frames < want ? C.waste : C.text });
+      rect(svg, X0, 22, X1 - X0, 36, C.surface2, { rx: 4, stroke: C.border });
+      const draw = Math.min(frames, 150);
+      const fw = Math.max(2, Math.min(28, (X1 - X0) / draw - 2));
+      for (let i = 0; i < draw; i++) {
+        const x = X0 + ((i + 0.5) / draw) * (X1 - X0) - fw / 2;
+        const pairStart = merge && i % 2 === 0;
+        rect(svg, x, 27, fw, 26, C.token, { rx: 1.5, opacity: merge && !pairStart ? 0.55 : 0.9 });
+      }
+      if (frames > draw) text(svg, X1, 68, `showing ${draw} of ${fmt.int(frames)} frames`, { 'text-anchor': 'end', class: 't-small t-faint' });
+      if (audio) {
+        rect(svg, X0, 62, X1 - X0, 6, C.comm, { rx: 3, opacity: 0.8 });
+        text(svg, X0, 78, `audio ≈ ${AUDIO_TPS} tokens/s → ${fmt.int(audTok)} tokens`, { class: 't-small', fill: C.comm });
+      }
+
+      // context bars
+      const ctxs = [32768, 131072, 1048576];
+      const by = 100;
+      text(svg, X0, by, 'Tokens vs context window', { class: 't-small t-bold' });
+      ctxs.forEach((cx, i) => {
+        const y = by + 16 + i * 34;
+        const frac = Math.min(1, tok / cx);
+        const over = tok > cx;
+        text(svg, X0, y + 9, cx >= 1048576 ? '1M' : `${cx / 1024}K`, { class: 't-small t-mono t-dim' });
+        rect(svg, X0 + 60, y, X1 - X0 - 60, 18, C.surface2, { stroke: C.border, rx: 3 });
+        const vw = (Math.min(vidTok, cx) / cx) * (X1 - X0 - 60);
+        rect(svg, X0 + 60, y, vw, 18, over ? C.waste : C.token, { rx: 3 });
+        if (audTok && !over) rect(svg, X0 + 60 + vw, y, (audTok / cx) * (X1 - X0 - 60), 18, C.comm, { rx: 0 });
+        text(svg, X1 - 6, y + 9, over ? `does not fit (${(tok / cx).toFixed(1)}×)` : fmt.pct(frac, 1), { 'text-anchor': 'end', class: 't-small t-mono t-bold', fill: over ? 'var(--bg)' : C.text });
+      });
+      const kv = tok * KV_TOK;
+      const pf = (2 * LLM * tok) / EFF + (2 * 0.67e9 * tok * 4) / (989e12 * 0.3);
+      text(svg, X0, H - 30, `= ⌈${fmt.int(frames)} frames ${merge ? '÷ 2 (pairs merged)' : ''}⌉ × ${res.tok} tokens/frame${audio ? ` + ${fmt.int(audTok)} audio` : ''} = ${fmt.int(tok)} tokens`, { class: 't-small t-mono' });
+      text(svg, X0, H - 10, 'Attention cost over the prompt grows with tokens², so the last doubling hurts more than the first.', { class: 't-small t-dim' });
+      line(svg, X0, H - 44, X1, H - 44, C.border, { 'stroke-width': 1 });
+
+      st.set('Frames sampled', fmt.int(frames), frames < want ? `capped (wanted ${fmt.int(want)})` : `${f} fps × ${durLabel(dur)}`, frames < want ? C.waste : undefined);
+      st.set('Video tokens', fmt.num(tok, 1), `${fmt.int(res.tok)} per ${merge ? 'frame pair' : 'frame'}`, tok > 131072 ? C.waste : undefined);
+      st.set('KV cache', fmt.bytes(kv), '7B VLM, BF16 KV');
+      st.set('Prefill (est.)', fmt.ms(pf * 1000), 'linear part only, H100', pf > 5 ? C.waste : undefined);
+
+      let msg: string;
+      if (tok > 1048576) msg = '<b>Over a million tokens.</b> Even a 1M-context model cannot take this. Sample fewer frames, shrink them, or cut the video into clips and summarise each one.';
+      else if (tok > 131072) msg = `<b>${fmt.num(tok, 1)} tokens</b> for ${durLabel(dur)} of video: more than a 128k context and ${fmt.bytes(kv)} of KV for one request. This is why VLM processors cap frames and pixels per video by default.`;
+      else if (frames < want) msg = `The frame cap keeps the request bounded, but the sampling rate drops to ${effFps.toFixed(2)} fps: short events between sampled frames are invisible to the model.`;
+      else msg = `A short clip is manageable: ${fmt.int(tok)} tokens is like a long document. Now drag the length to 10 minutes or switch to 720p frames.`;
+      say(msg);
+    }
+    render();
+  });
+</script>

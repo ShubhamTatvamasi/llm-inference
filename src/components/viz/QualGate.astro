@@ -1,0 +1,99 @@
+---
+/* Accuracy gate for a precision change. Pick a change (FP8 W8A8, FP8 KV cache, W4A16, NVFP4)
+   and see per-task score deltas vs the BF16 baseline with 95% confidence intervals that depend
+   on eval-set size. Each task gets pass / inconclusive / fail against a regression threshold.
+   The average delta is shown to make the point that averages hide task-specific regressions.
+   All deltas are illustrative, not measurements of a particular model. */
+---
+<div data-viz="qual-gate"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, select, slider, checkbox, stats, legend, narration, C } from '../../lib/viz';
+
+  const TASKS = [
+    { name: 'Chat / instruction following', base: 0.82 },
+    { name: 'Maths (multi-step)', base: 0.78 },
+    { name: 'Code generation', base: 0.62 },
+    { name: 'Long-context retrieval', base: 0.88 },
+    { name: 'Multilingual', base: 0.70 },
+    { name: 'Tool calls / JSON', base: 0.91 },
+  ];
+  // illustrative score deltas in accuracy points (negative = regression)
+  const CHANGES: Record<string, { label: string; d: number[]; note: string }> = {
+    w8a8: { label: 'FP8 W8A8 (weights + activations)', d: [-0.1, -0.4, -0.3, -0.2, -0.4, -0.1], note: 'FP8 with per-channel or per-tensor scales is usually close to lossless on large models. Small regressions spread evenly.' },
+    kv: { label: 'FP8 KV cache', d: [0.0, -0.3, -0.1, -1.9, -0.2, 0.0], note: 'Rounding K and V hurts most where attention must pick out one token among very many: long-context retrieval. Short-prompt tasks barely move.' },
+    w4: { label: 'W4A16 (INT4 weight-only, group 128)', d: [0.2, -3.0, -1.6, -0.3, -2.8, -0.2], note: 'Weight-only 4-bit loses most on multi-step reasoning, code and lower-resource languages. Chat looks fine, so a chat-only eval would pass it.' },
+    fp4: { label: 'NVFP4 W4A4', d: [-0.6, -2.1, -1.6, -1.2, -1.8, -0.9], note: '4-bit floats with micro-block scales keep more range than INT4 but quantize activations too. Recovery depends heavily on calibration and model size.' },
+  };
+
+  const W = 940, H = 310;
+
+  mountAll('qual-gate', (root) => {
+    let ch = 'w4', stackKV = false, nEx = 2000, thr = 1.5;
+    const bar = ctrlBar(root);
+    select(bar, 'Change', Object.entries(CHANGES).map(([k, v]) => ({ value: k, label: v.label })), ch, (v) => { ch = v; render(); });
+    checkbox(bar, 'Also enable FP8 KV cache', stackKV, (v) => { stackKV = v; render(); });
+    const bar2 = ctrlBar(root);
+    slider(bar2, { label: 'Examples per task', min: 100, max: 5000, step: 100, value: nEx, format: (v) => v.toLocaleString('en-US'), onInput: (v) => { nEx = v; render(); } });
+    slider(bar2, { label: 'Max regression per task', min: 0.5, max: 3, step: 0.1, value: thr, format: (v) => `${v.toFixed(1)} pts`, onInput: (v) => { thr = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Per-task accuracy change versus baseline with confidence intervals and a regression threshold' });
+    const st = stats(root, ['Average delta', 'Worst task', 'Gate result']);
+    legend(root, [['Within threshold', C.good], ['Inconclusive: interval crosses threshold', C.token], ['Regression beyond threshold', C.waste], ['95% confidence interval', C.faint]]);
+    const say = narration(root);
+
+    function render() {
+      clear(svg);
+      const c = CHANGES[ch];
+      const deltas = c.d.map((d, i) => d + (stackKV && ch !== 'kv' ? CHANGES.kv.d[i] * 0.9 : 0));
+      // 95% CI of a paired accuracy difference ≈ 1.96·sqrt(f/n), where f is the fraction of items whose
+      // correctness flips between the two models (~4–8%, more on harder tasks)
+      const ci = TASKS.map((t) => 100 * 1.96 * Math.sqrt((0.04 + 0.1 * (1 - t.base)) / nEx));
+
+      const X0 = 250, X1 = 900, DMIN = -5, DMAX = 1.5;
+      const px = (d: number) => X0 + ((Math.max(DMIN, Math.min(DMAX, d)) - DMIN) / (DMAX - DMIN)) * (X1 - X0);
+      const Y0 = 30, rowH = 36;
+      text(svg, X0, 12, 'Score change vs BF16 baseline (accuracy points)', { class: 't-bold' });
+      for (let v = -5; v <= 1; v++) {
+        line(svg, px(v), Y0 - 6, px(v), Y0 + rowH * TASKS.length + 4, v === 0 ? C.borderStrong : C.border, { 'stroke-width': v === 0 ? 1.4 : 1 });
+        text(svg, px(v), Y0 + rowH * TASKS.length + 16, (v > 0 ? '+' : '') + v, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      }
+      // threshold zone
+      rect(svg, px(DMIN), Y0 - 6, px(-thr) - px(DMIN), rowH * TASKS.length + 10, C.wasteSoft, { rx: 0, opacity: 0.55 });
+      line(svg, px(-thr), Y0 - 6, px(-thr), Y0 + rowH * TASKS.length + 4, C.waste, { 'stroke-dasharray': '5 3', 'stroke-width': 1.4 });
+      text(svg, px(-thr) - 4, Y0 + rowH * TASKS.length + 30, `−${thr.toFixed(1)} pt threshold`, { 'text-anchor': 'end', class: 't-small t-bold', fill: C.waste });
+
+      let fails = 0, unsure = 0, worst = 0;
+      TASKS.forEach((t, i) => {
+        const y = Y0 + i * rowH + rowH / 2;
+        const d = deltas[i], e = ci[i];
+        const status = d - e > -thr ? 'pass' : d + e < -thr ? 'fail' : 'unsure';
+        if (status === 'fail') fails++; if (status === 'unsure') unsure++;
+        if (d < deltas[worst]) worst = i;
+        const col = status === 'pass' ? C.good : status === 'fail' ? C.waste : C.token;
+        text(svg, 20, y, t.name, { class: 't-small' });
+        text(svg, 20, y + 12, `baseline ${(t.base * 100).toFixed(0)}%`, { class: 't-small t-faint t-mono' });
+        rect(svg, Math.min(px(0), px(d)), y - 7, Math.abs(px(d) - px(0)), 14, col, { rx: 2, opacity: 0.3 });
+        line(svg, px(d - e), y, px(d + e), y, C.faint, { 'stroke-width': 2 });
+        line(svg, px(d - e), y - 5, px(d - e), y + 5, C.faint, { 'stroke-width': 1.5 });
+        line(svg, px(d + e), y - 5, px(d + e), y + 5, C.faint, { 'stroke-width': 1.5 });
+        s('circle', { cx: px(d), cy: y, r: 5, fill: col }, svg);
+        text(svg, X1 + 6, y, status === 'pass' ? '✓' : status === 'fail' ? '✗' : '?', { class: 't-bold', fill: col });
+      });
+      // average marker
+      const avg = deltas.reduce((a, b) => a + b, 0) / deltas.length;
+      const ay = Y0 + rowH * TASKS.length + 46;
+      text(svg, 20, ay, 'Average of all tasks', { class: 't-small t-bold' });
+      s('path', { d: `M${px(avg)},${ay - 7} l6,7 l-6,7 l-6,-7 z`, fill: C.accent }, svg);
+      text(svg, px(avg) + 10, ay, `${avg.toFixed(2)} pts: ${avg > -thr ? 'looks fine' : 'fails'}`, { class: 't-small t-mono t-bold', fill: C.accent });
+
+      const result = fails ? 'FAIL' : unsure ? 'INCONCLUSIVE' : 'PASS';
+      st.set('Average delta', `${avg.toFixed(2)} pts`, avg > -thr ? 'would pass an average-only gate' : 'fails even on average', C.accent);
+      st.set('Worst task', `${deltas[worst].toFixed(1)} pts`, TASKS[worst].name, deltas[worst] < -thr ? C.waste : C.good);
+      st.set('Gate result', result, fails ? `${fails} task${fails > 1 ? 's' : ''} beyond −${thr.toFixed(1)} pts` : unsure ? `${unsure} task${unsure > 1 ? 's' : ''} need more examples` : 'every task within threshold', fails ? C.waste : unsure ? C.token : C.good);
+      const ciNote = ci[2] > thr ? ` With ${nEx} examples the interval on code is ±${ci[2].toFixed(1)} pts, wider than the threshold itself: this eval cannot tell a ${thr.toFixed(1)}-pt regression from noise.` : '';
+      say(`<b>${c.label}${stackKV && ch !== 'kv' ? ' + FP8 KV' : ''}.</b> ${c.note}${avg > -thr && fails ? ' The <b>average</b> passes while individual tasks fail: gate per task.' : ''}${ciNote}`);
+    }
+    render();
+  });
+</script>

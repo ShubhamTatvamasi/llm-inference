@@ -1,0 +1,88 @@
+---
+/* The bandwidth ladder: HBM ≫ NVLink ≫ PCIe ≫ network, on a log scale, with the time
+   to move a chosen inference payload across each link (α + bytes/β). */
+---
+<div data-viz="net-links"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, select, stats, legend, narration, C, fmt } from '../../lib/viz';
+
+  interface Link { id: string; name: string; sub: string; gbs: number; alphaUs: number; color: string; tier: string; }
+  // GB/s PER DIRECTION (NVLink is marketed as both directions summed). α is illustrative software + hop latency.
+  const LINKS: Link[] = [
+    { id: 'hbm-b200', name: 'HBM3e (B200)', sub: 'GPU ↔ its own memory', gbs: 8000, alphaUs: 0, color: C.mem, tier: 'on-package' },
+    { id: 'hbm-h100', name: 'HBM3 (H100)', sub: 'GPU ↔ its own memory', gbs: 3350, alphaUs: 0, color: C.mem, tier: 'on-package' },
+    { id: 'nvl5', name: 'NVLink 5 (B200)', sub: '1.8 TB/s marketed, both directions', gbs: 900, alphaUs: 2, color: C.comm, tier: 'scale-up' },
+    { id: 'nvl4', name: 'NVLink 4 (H100)', sub: '900 GB/s marketed, both directions', gbs: 450, alphaUs: 2, color: C.comm, tier: 'scale-up' },
+    { id: 'nvl3', name: 'NVLink 3 (A100)', sub: '600 GB/s marketed, both directions', gbs: 300, alphaUs: 2, color: C.comm, tier: 'scale-up' },
+    { id: 'xdr', name: 'InfiniBand XDR 800 Gb/s', sub: 'ConnectX-8, one NIC', gbs: 100, alphaUs: 5, color: C.decode, tier: 'scale-out' },
+    { id: 'pcie5', name: 'PCIe Gen5 x16', sub: 'GPU ↔ CPU / NIC / NVMe', gbs: 64, alphaUs: 3, color: C.prefill, tier: 'host' },
+    { id: 'ndr', name: 'InfiniBand NDR 400 Gb/s', sub: 'ConnectX-7, one NIC (RoCE similar)', gbs: 50, alphaUs: 5, color: C.decode, tier: 'scale-out' },
+    { id: 'pcie4', name: 'PCIe Gen4 x16', sub: 'GPU ↔ CPU / NIC / NVMe', gbs: 32, alphaUs: 3, color: C.prefill, tier: 'host' },
+    { id: 'eth100', name: 'Ethernet 100 Gb/s (TCP)', sub: 'no RDMA, kernel network stack', gbs: 12.5, alphaUs: 30, color: C.waste, tier: 'scale-out' },
+  ];
+
+  const PAYLOADS = [
+    { id: 'ar', label: 'TP all-reduce, decode (512 KiB)', bytes: 32 * 8192 * 2, what: 'one decode-step all-reduce for a 70B model at batch 32: batch × hidden × 2 bytes' },
+    { id: 'pf', label: 'TP all-reduce, prefill chunk (32 MiB)', bytes: 2048 * 8192 * 2, what: 'one all-reduce for a 2,048-token prefill chunk of a 70B model' },
+    { id: 'kv', label: 'KV cache, 8K-token prompt, 70B (2.5 GiB)', bytes: 8192 * 327680, what: 'the KV cache a prefill worker ships to a decode worker in P/D disaggregation' },
+    { id: 'w', label: '70B weights in BF16 (141 GB)', bytes: 141e9, what: 'loading or moving a full copy of Llama 3.1 70B' },
+  ];
+
+  const W = 940, ROW = 30, TOP = 34, LX = 220, RX = 760;
+
+  mountAll('net-links', (root) => {
+    let pay = PAYLOADS[0];
+    const bar = ctrlBar(root);
+    select(bar, 'Move', PAYLOADS.map((p) => ({ value: p.id, label: p.label })), pay.id, (v) => { pay = PAYLOADS.find((p) => p.id === v)!; render(); });
+
+    const H = TOP + LINKS.length * ROW + 30;
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Log-scale bandwidth of HBM, NVLink, PCIe and network links with transfer times' });
+    const st = stats(root, ['HBM ÷ NVLink', 'NVLink ÷ 400G NIC', 'NVLink ÷ PCIe Gen5', 'Payload']);
+    legend(root, [['On-package memory', C.mem], ['NVLink (scale-up)', C.comm], ['PCIe (host)', C.prefill], ['RDMA network (scale-out)', C.decode], ['TCP network', C.waste]]);
+    const say = narration(root);
+
+    const lo = Math.log10(5), hi = Math.log10(10000);
+    const sx = (g: number) => LX + ((Math.log10(g) - lo) / (hi - lo)) * (RX - LX);
+
+    function render() {
+      clear(svg);
+      text(svg, 6, 12, 'Link', { class: 't-small t-bold t-dim' });
+      text(svg, LX, 12, 'GB/s per direction (log scale)', { class: 't-small t-bold t-dim' });
+      text(svg, W - 6, 12, `time to move ${fmt.bytes(pay.bytes)}`, { 'text-anchor': 'end', class: 't-small t-bold t-dim' });
+      for (const g of [10, 100, 1000, 10000]) {
+        const x = sx(g);
+        line(svg, x, TOP - 8, x, TOP + LINKS.length * ROW - 4, C.border, { 'stroke-dasharray': '2 4', 'stroke-width': 1 });
+        text(svg, x, TOP + LINKS.length * ROW + 10, g >= 1000 ? `${g / 1000} TB/s` : `${g} GB/s`, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      }
+      const times = LINKS.map((l) => l.alphaUs * 1e-6 + pay.bytes / (l.gbs * 1e9));
+      const tMin = Math.min(...times.slice(2));
+      LINKS.forEach((l, i) => {
+        const y = TOP + i * ROW;
+        text(svg, 6, y + 6, l.name, { class: 't-small t-bold' });
+        text(svg, 6, y + 19, l.sub, { class: 't-small t-faint' });
+        rect(svg, LX, y + 2, RX - LX, ROW - 8, C.surface2, { rx: 4 });
+        rect(svg, LX, y + 2, sx(l.gbs) - LX, ROW - 8, l.color, { rx: 4, opacity: 0.9 });
+        text(svg, sx(l.gbs) + 6, y + 13, fmt.num(l.gbs, l.gbs < 100 ? 1 : 0), { class: 't-small t-mono t-bold' });
+        const t = times[i];
+        const ms = t * 1e3;
+        const label = ms < 1 ? `${(ms * 1000).toFixed(ms < 0.01 ? 1 : 0)} µs` : fmt.ms(ms);
+        const isHbm = l.tier === 'on-package';
+        text(svg, W - 6, y + 13, isHbm ? `${label} (local read)` : label, { 'text-anchor': 'end', class: 't-small t-mono' + (isHbm ? ' t-faint' : ' t-bold'), fill: !isHbm && t > tMin * 20 ? C.waste : undefined });
+      });
+
+      const nv = 450, ib = 50, p5 = 64;
+      st.set('HBM ÷ NVLink', `${(3350 / nv).toFixed(1)}×`, 'H100: memory vs one GPU’s NVLink');
+      st.set('NVLink ÷ 400G NIC', `${(nv / ib).toFixed(0)}×`, 'per GPU, per direction');
+      st.set('NVLink ÷ PCIe Gen5', `${(nv / p5).toFixed(1)}×`, 'why TP over PCIe hurts');
+      st.set('Payload', fmt.bytes(pay.bytes), pay.id === 'ar' ? 'latency-bound' : pay.id === 'w' ? 'bandwidth-bound' : 'mostly bandwidth-bound');
+
+      const tNv = times[3], tNdr = times[7];
+      if (pay.id === 'ar') say(`A decode all-reduce is tiny: ${pay.what}. On NVLink 4 the wire time is about <b>${(pay.bytes / 450e9 * 1e6).toFixed(1)} µs</b>, so the fixed latency α is a large share. It is paid <b>160 times per token</b> for an 80-layer model, which is why per-collective latency, not bandwidth, decides whether TP pays off.`);
+      else if (pay.id === 'pf') say(`A prefill all-reduce is ${fmt.bytes(pay.bytes)}: ${pay.what}. Now bandwidth dominates: <b>${fmt.ms(tNv * 1e3)}</b> on NVLink 4 versus <b>${fmt.ms(tNdr * 1e3)}</b> on a 400 Gb/s NIC, per collective, twice per layer.`);
+      else if (pay.id === 'kv') say(`${pay.what}. RDMA at 400 Gb/s takes <b>${fmt.ms(tNdr * 1e3)}</b>, within an NVLink domain <b>${fmt.ms(tNv * 1e3)}</b>. Over 100 Gb/s TCP it is ${fmt.ms(times[9] * 1e3)}, longer than the prefill it was meant to save.`);
+      else say(`${pay.what}. Even NVLink needs about <b>${fmt.ms(tNv * 1e3)}</b>; over PCIe Gen4 it is ${fmt.ms(times[8] * 1e3)}. Weight loading is a cold-start cost (see the loading chapter), not a per-token cost, but the same ladder decides it.`);
+    }
+    render();
+  });
+</script>

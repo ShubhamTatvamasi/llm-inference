@@ -1,0 +1,138 @@
+---
+/* One agent task = N model calls separated by tool calls. Each call re-sends the whole transcript.
+   Toggles: prefix caching, session-affine routing (vs round-robin over 4 replicas), a stable prompt
+   prefix (vs a timestamp at the top), server load (busy servers evict idle KV after ~2 s) and KV offload
+   to CPU for idle sessions. Illustrative: prefill 8k tok/s, decode 80 tok/s, KV 128 KiB/token,
+   reload from CPU 20 GB/s, 40 ms fixed per call. */
+---
+<div data-viz="agent-loop"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, group, slider, checkbox, segmented, stats, legend, narration, player, C, fmt } from '../../lib/viz';
+
+  const SYS = 6000, TASK = 300, REPLICAS = 4;
+  const PREFILL_TPS = 8000, DECODE_TPS = 80, KV_TOK = 131072, RELOAD_BPS = 20e9, OVERHEAD = 0.04, EVICT_AFTER = 2;
+  const W = 940, H = 300, LX = 10, BX = 118, BW = 120, GX0 = 262, GX1 = 920;
+
+  interface Turn { i: number; ctx: number; reused: number; reloaded: number; computed: number; start: number; ttft: number; dec: number; tool: number; rep: number; note: string; }
+
+  mountAll('agent-loop', (root) => {
+    let turns = 10, toolS = 1.5, resultTok = 1500, outTok = 100;
+    let caching = true, affine = true, stable = true, offload = false;
+    let load: 'quiet' | 'busy' = 'quiet';
+    let shown = 0;
+
+    const bar1 = ctrlBar(root);
+    slider(bar1, { label: 'Turns', min: 2, max: 16, value: turns, onInput: (v) => { turns = v; shown = turns; render(); } });
+    slider(bar1, { label: 'Tool time', min: 0, max: 10, step: 0.25, value: toolS, format: (v) => `${v.toFixed(2)} s`, onInput: (v) => { toolS = v; shown = turns; render(); } });
+    slider(bar1, { label: 'Tool result', min: 100, max: 8000, step: 100, value: resultTok, format: (v) => `${fmt.num(v, 1)} tok`, onInput: (v) => { resultTok = v; shown = turns; render(); } });
+    slider(bar1, { label: 'Model output / turn', min: 50, max: 2000, step: 50, value: outTok, format: (v) => `${v} tok`, onInput: (v) => { outTok = v; shown = turns; render(); } });
+    const bar2 = ctrlBar(root);
+    checkbox(bar2, 'Prefix caching', caching, (v) => { caching = v; shown = turns; render(); });
+    checkbox(bar2, 'Session-affine routing', affine, (v) => { affine = v; shown = turns; render(); });
+    checkbox(bar2, 'Stable prefix first', stable, (v) => { stable = v; shown = turns; render(); });
+    checkbox(bar2, 'Offload idle KV to CPU', offload, (v) => { offload = v; shown = turns; render(); });
+    segmented(bar2, [{ value: 'quiet', label: 'Quiet server' }, { value: 'busy', label: 'Busy server' }], load, (v) => { load = v as 'quiet' | 'busy'; shown = turns; render(); });
+    const bar3 = ctrlBar(root);
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Gantt chart of an agent task: model calls, prefill reuse and tool time per turn' });
+    const say = narration(root);
+    const st = stats(root, ['Task latency', 'Waiting on the model', 'Prefill tokens computed', 'Prefill tokens reused']);
+    legend(root, [['Prefix reused from GPU cache', C.kv], ['Reloaded from CPU', C.mem], ['Prefill recomputed', C.prefill], ['Decode (tool call / answer)', C.decode], ['Tool running', C.comm]]);
+
+    function simulate(): Turn[] {
+      const out: Turn[] = [];
+      let ctx = SYS + TASK, now = 0;
+      const lastOnRep: Record<number, { cachedLen: number; endAt: number }> = {};
+      for (let i = 0; i < turns; i++) {
+        const rep = affine ? 0 : i % REPLICAS;
+        let reused = 0, reloaded = 0, note = '';
+        if (!caching) note = 'caching off';
+        else if (!stable) note = 'timestamp at top: no match';
+        else {
+          reused = SYS; // shared system prompt + tool schemas are warm on every replica
+          const prev = lastOnRep[rep];
+          if (prev) {
+            const idle = now - prev.endAt;
+            if (load === 'busy' && idle > EVICT_AFTER) {
+              if (offload) { reloaded = prev.cachedLen - SYS; note = `idle ${idle.toFixed(1)} s → reloaded`; }
+              else note = `idle ${idle.toFixed(1)} s → evicted`;
+            } else { reused = prev.cachedLen; note = affine ? 'same replica' : `replica ${rep + 1} again`; }
+          } else if (i > 0) note = `new replica ${rep + 1}`;
+        }
+        reused = Math.min(reused, ctx);
+        reloaded = Math.max(0, Math.min(reloaded, ctx - reused));
+        const computed = ctx - reused - reloaded;
+        const ttft = OVERHEAD + computed / PREFILL_TPS + (reloaded * KV_TOK) / RELOAD_BPS;
+        const dec = outTok / DECODE_TPS;
+        const last = i === turns - 1;
+        const tool = last ? 0 : toolS;
+        out.push({ i, ctx, reused, reloaded, computed, start: now, ttft, dec, tool, rep, note });
+        const endModel = now + ttft + dec;
+        lastOnRep[rep] = { cachedLen: ctx + outTok, endAt: endModel };
+        now = endModel + tool;
+        ctx += outTok + resultTok;
+      }
+      return out;
+    }
+
+    function reset() { shown = 0; }
+    function step() { if (shown >= turns) shown = 0; shown++; return shown < turns; }
+
+    function render() {
+      clear(svg);
+      const T = simulate();
+      const total = T.reduce((a, x) => a + x.ttft + x.dec + x.tool, 0);
+      const maxCtx = T[T.length - 1].ctx;
+      const top = 30, rowH = Math.min(26, (H - top - 12) / turns), barH = Math.max(8, rowH - 7);
+      const sx = (sec: number) => GX0 + (sec / total) * (GX1 - GX0);
+      text(svg, LX, 12, 'Turn', { class: 't-small t-faint' });
+      text(svg, BX, 12, 'Prompt sent (context)', { class: 't-small t-faint' });
+      text(svg, GX0, 12, 'Wall-clock time →', { class: 't-small t-faint' });
+      text(svg, GX1, 12, `${total.toFixed(1)} s`, { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+      line(svg, GX0, top - 6, GX1, top - 6, C.border, { 'stroke-width': 1 });
+
+      T.slice(0, shown).forEach((x, k) => {
+        const y = top + k * rowH;
+        text(svg, LX, y + barH / 2, `${k + 1}`, { class: 't-small t-mono t-bold' });
+        text(svg, LX + 22, y + barH / 2, `${fmt.num(x.ctx, 1)}`, { class: 't-small t-mono t-dim' });
+        // context composition bar
+        const cw = (n: number) => (n / maxCtx) * BW;
+        let cx = BX;
+        rect(svg, cx, y, cw(x.reused), barH, C.kv, { rx: 0 }); cx += cw(x.reused);
+        rect(svg, cx, y, cw(x.reloaded), barH, C.mem, { rx: 0 }); cx += cw(x.reloaded);
+        rect(svg, cx, y, cw(x.computed), barH, C.prefill, { rx: 0 });
+        // gantt
+        const a = x.start, b = a + x.ttft, c = b + x.dec, d = c + x.tool;
+        line(svg, GX0, y + barH / 2, sx(a), y + barH / 2, C.border, { 'stroke-width': 1, 'stroke-dasharray': '2 3' });
+        const pre = x.computed > 0 ? C.prefill : x.reloaded > 0 ? C.mem : C.kv;
+        rect(svg, sx(a), y, Math.max(2, sx(b) - sx(a)), barH, pre, { rx: 2 });
+        rect(svg, sx(b), y, Math.max(1, sx(c) - sx(b)), barH, C.decode, { rx: 2 });
+        if (x.tool > 0) rect(svg, sx(c), y + 2, sx(d) - sx(c), barH - 4, C.commSoft, { rx: 2, stroke: C.comm });
+        const lbl = `TTFT ${fmt.ms(x.ttft * 1000)}${x.note ? ' · ' + x.note : ''}`;
+        const room = GX1 - sx(d);
+        if (room > lbl.length * 5.6) text(svg, sx(d) + 6, y + barH / 2, lbl, { class: 't-small', fill: x.computed > 4000 ? C.waste : C.dim });
+        else if (sx(a) - GX0 > lbl.length * 5.6) text(svg, sx(a) - 6, y + barH / 2, lbl, { class: 't-small', 'text-anchor': 'end', fill: x.computed > 4000 ? C.waste : C.dim });
+      });
+
+      const sumTTFT = T.reduce((a, x) => a + x.ttft, 0), sumDec = T.reduce((a, x) => a + x.dec, 0), sumTool = T.reduce((a, x) => a + x.tool, 0);
+      const comp = T.reduce((a, x) => a + x.computed, 0), reu = T.reduce((a, x) => a + x.reused + x.reloaded, 0);
+      st.set('Task latency', `${total.toFixed(1)} s`, `tools ${sumTool.toFixed(1)} s · model ${(sumTTFT + sumDec).toFixed(1)} s`);
+      st.set('Waiting on the model', `${sumTTFT.toFixed(1)} s TTFT`, `+ ${sumDec.toFixed(1)} s decode over ${turns} calls`, sumTTFT > sumTool ? C.waste : undefined);
+      st.set('Prefill tokens computed', fmt.num(comp, 1), `${fmt.pct(comp / (comp + reu))} of all prompt tokens`, comp / (comp + reu) > 0.5 ? C.waste : C.good);
+      st.set('Prefill tokens reused', fmt.num(reu, 1), 'from GPU cache or CPU tier');
+
+      let msg: string;
+      if (!caching) msg = '<b>No prefix caching:</b> every call re-prefills the whole transcript, so TTFT grows with every turn and total prefill work grows quadratically with the number of turns.';
+      else if (!stable) msg = '<b>Timestamp at the top:</b> the first block differs on every call, so the chained hashes never match. Caching is on and does nothing.';
+      else if (!affine) msg = `<b>Round-robin:</b> consecutive turns land on different replicas. Each replica only knows the transcript up to the last time <i>it</i> saw this session, so most of the growth is recomputed. Turn on session-affine routing.`;
+      else if (load === 'busy' && toolS > EVICT_AFTER && !offload) msg = `<b>Busy server, slow tools:</b> while the agent waits ${toolS.toFixed(1)} s for a tool, its idle cached blocks are the first thing the allocator evicts, so the next turn recomputes everything. Try offloading idle KV to CPU, or shorter tools.`;
+      else if (load === 'busy' && toolS > EVICT_AFTER && offload) msg = '<b>Offload:</b> evicted blocks went to CPU memory instead of disappearing. Reloading them over PCIe takes a fraction of the time recomputing would.';
+      else msg = '<b>Stable prefix + caching + affinity:</b> each call only prefills what was appended since the last one (the tool result). TTFT stays flat even as the context grows.';
+      say(msg);
+    }
+
+    player(bar3, root, { step, reset, render, interval: 450, autoplay: false });
+    shown = turns; render();
+  });
+</script>

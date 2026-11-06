@@ -1,0 +1,116 @@
+---
+/* Time-slicing replicas: the device-plugin config (replicas, renameByDefault, failRequestsGreaterThanOne)
+   on a 2-GPU node. The reader adds pods asking for 1 or 2 replicas and sees how many are advertised,
+   which physical GPU each pod lands on, its rough time share, and why asking for 2 replicas does not
+   buy twice the GPU. Allocation order is illustrative (fills replicas of GPU 0 first). */
+---
+<div data-viz="share-replicas"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, clear, ctrlBar, group, button, slider, checkbox, stats, narration, C, SERIES } from '../../lib/viz';
+
+  interface Pod { id: number; want: number; slots: [number, number][]; rejected: boolean; }
+  const NG = 2, W = 940, H = 280, GX = 380;
+
+  mountAll('share-replicas', (root) => {
+    let replicas = 4, rename = false, failGt1 = false;
+    let pods: Pod[] = []; let nextId = 1; let last = '';
+
+    const b1 = ctrlBar(root);
+    slider(b1, { label: 'replicas per GPU', min: 1, max: 8, value: replicas, onInput: (v) => { replicas = v; reflow(); render(); } });
+    checkbox(b1, 'renameByDefault', rename, (v) => { rename = v; render(); });
+    checkbox(b1, 'failRequestsGreaterThanOne', failGt1, (v) => { failGt1 = v; reflow(); render(); });
+    const b2 = ctrlBar(root);
+    const g2 = group(b2);
+    button(g2, '+ pod asking for 1', () => { add(1); }, { primary: true });
+    button(g2, '+ pod asking for 2', () => { add(2); });
+    button(g2, 'Clear pods', () => { pods = []; last = ''; render(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Time-slicing config and replicas on two GPUs' });
+    const say = narration(root);
+    const st = stats(root, ['Advertised', 'Pods running', 'Pending / rejected']);
+
+    function place(p: Pod, used: Set<string>) {
+      p.slots = []; p.rejected = false;
+      if (failGt1 && p.want > 1) { p.rejected = true; return; }
+      for (let g = 0; g < NG && p.slots.length < p.want; g++)
+        for (let r = 0; r < replicas && p.slots.length < p.want; r++) {
+          const k = `${g}:${r}`; if (!used.has(k)) { used.add(k); p.slots.push([g, r]); }
+        }
+      if (p.slots.length < p.want) { p.slots.forEach(([g, r]) => used.delete(`${g}:${r}`)); p.slots = []; }
+    }
+    function reflow() { const used = new Set<string>(); pods.forEach((p) => place(p, used)); }
+    function add(n: number) {
+      if (pods.length >= 12) return;
+      const p: Pod = { id: nextId++, want: n, slots: [], rejected: false };
+      pods.push(p); reflow();
+      last = p.rejected ? 'reject' : !p.slots.length ? 'pending' : n > 1 && p.slots.every(([g]) => g === p.slots[0][0]) ? 'same' : '';
+      render();
+    }
+
+    function render() {
+      clear(svg);
+      const res = rename ? 'nvidia.com/gpu.shared' : 'nvidia.com/gpu';
+      // ConfigMap
+      rect(svg, 8, 4, GX - 30, H - 8, C.surface2, { rx: 10, stroke: C.border });
+      const ylines: [string, boolean?][] = [
+        ['kind: ConfigMap   # device-plugin config'], ['data:'], ['  any: |-'], ['    version: v1'], ['    sharing:'], ['      timeSlicing:'],
+        [`        renameByDefault: ${rename}`, true], [`        failRequestsGreaterThanOne: ${failGt1}`, true], ['        resources:'], ['        - name: nvidia.com/gpu'], [`          replicas: ${replicas}`, true],
+        [''], ['# ClusterPolicy: spec.devicePlugin.config'], ['#   name: <this ConfigMap>, default: any'],
+      ];
+      ylines.forEach(([l, hl], i) => text(svg, 22, 22 + i * 16, l, { style: 'white-space:pre', class: 't-small t-mono', fill: hl ? C.accent : l.startsWith('#') ? C.faint : C.text }));
+
+      // node
+      text(svg, GX, 16, 'Node: 2 × L40S, time-sliced', { class: 't-small t-bold' });
+      const labs = [`${res}: ${NG * replicas}  (allocatable)`, `nvidia.com/gpu.replicas=${replicas}`, `nvidia.com/gpu.product=NVIDIA-L40S${rename ? '' : '-SHARED'}`];
+      labs.forEach((l, i) => text(svg, GX, 36 + i * 15, l, { class: 't-small t-mono', fill: i === 0 ? C.text : C.dim }));
+      const GW = (W - GX - 16) / NG - 10;
+      for (let g = 0; g < NG; g++) {
+        const x = GX + g * (GW + 10), y = 88;
+        rect(svg, x, y, GW, 118, C.surface2, { rx: 10, stroke: C.border });
+        text(svg, x + 12, y + 16, `physical GPU ${g}`, { class: 't-small t-bold' });
+        const on = pods.filter((p) => p.slots.some(([gg]) => gg === g));
+        text(svg, x + GW - 10, y + 16, on.length ? `${on.length} pod${on.length > 1 ? 's' : ''} take turns` : 'idle', { 'text-anchor': 'end', class: 't-small t-faint' });
+        const sw = Math.min(56, (GW - 24) / replicas - 4);
+        for (let r = 0; r < replicas; r++) {
+          const sx = x + 12 + r * (sw + 4), sy = y + 32;
+          const p = pods.find((pp) => pp.slots.some(([gg, rr]) => gg === g && rr === r));
+          rect(svg, sx, sy, sw, 40, p ? SERIES[(p.id - 1) % SERIES.length] : 'transparent', { rx: 5, opacity: p ? 0.85 : 1, stroke: p ? 'none' : C.border, 'stroke-dasharray': p ? null : '3 3' });
+          if (p && sw > 22) text(svg, sx + sw / 2, sy + 20, `p${p.id}`, { 'text-anchor': 'middle', class: 't-small t-bold', fill: 'var(--bg)' });
+        }
+        // time share bar
+        const ty = y + 86;
+        text(svg, x + 12, ty, 'time share', { class: 't-small t-faint' });
+        on.forEach((p, k) => {
+          const w = (GW - 90) / on.length;
+          rect(svg, x + 78 + k * w, ty - 7, w - 2, 14, SERIES[(p.id - 1) % SERIES.length], { rx: 3, opacity: 0.85 });
+        });
+        text(svg, x + 12, ty + 18, on.length ? `each pod ≈ ${Math.round(100 / on.length)}% of the time; 48 GB shared` : '', { class: 't-small t-dim' });
+      }
+      // pod list
+      const py = 222;
+      text(svg, GX, py, 'Pods', { class: 't-small t-faint t-bold' });
+      pods.forEach((p, i) => {
+        const x = GX + 40 + (i % 6) * 84, y = py - 8 + Math.floor(i / 6) * 22;
+        const state = p.rejected ? 'Rejected' : p.slots.length ? 'Running' : 'Pending';
+        rect(svg, x, y, 78, 18, 'transparent', { rx: 5, stroke: state === 'Running' ? SERIES[(p.id - 1) % SERIES.length] : C.waste });
+        text(svg, x + 39, y + 9, `p${p.id}×${p.want} ${state === 'Running' ? '' : state === 'Rejected' ? '✗' : '…'}`, { 'text-anchor': 'middle', class: 't-small t-mono', fill: state === 'Running' ? C.text : C.waste });
+      });
+      if (!pods.length) text(svg, GX + 40, py, 'add pods with the buttons above', { class: 't-small t-faint' });
+
+      const running = pods.filter((p) => p.slots.length).length;
+      st.set('Advertised', `${NG * replicas}`, `${res} from ${NG} physical GPUs`);
+      st.set('Pods running', String(running), running > NG ? `${running} pods on ${NG} GPUs` : 'one GPU each or less', C.text);
+      const bad = pods.filter((p) => !p.slots.length).length;
+      st.set('Pending / rejected', String(bad), failGt1 ? 'requests for >1 fail at admission' : 'no free replicas', bad ? C.waste : C.text);
+
+      const msg: Record<string, string> = {
+        '': `The node now advertises <b>${NG * replicas}</b> <code>${res}</code> although it has ${NG} GPUs. Each replica is just a ticket to the same device: pods on one GPU take turns, with <b>no memory or fault isolation</b>. ${rename ? 'With renameByDefault the resource is renamed, so pods must opt in to a shared GPU explicitly.' : 'Without renameByDefault, a pod asking for <code>nvidia.com/gpu: 1</code> cannot tell it got a shared one, except from the <code>-SHARED</code> product label.'}`,
+        same: '<b>The trap.</b> This pod asked for 2 replicas and got two tickets to the <b>same</b> GPU. It gets no more compute than a pod asking for 1, and its two CUDA processes now compete with each other. Set <code>failRequestsGreaterThanOne: true</code> so such requests fail loudly instead.',
+        reject: 'With <code>failRequestsGreaterThanOne: true</code>, a request for more than one shared replica fails with <code>UnexpectedAdmissionError</code>. That is the honest answer: replicas cannot add up to more GPU.',
+        pending: 'No free replicas left: the pod stays Pending. Raising <code>replicas</code> "fixes" it, but only by splitting the same GPU time more ways.',
+      };
+      say(msg[last] ?? msg['']);
+    }
+    render();
+  });
+</script>

@@ -1,0 +1,184 @@
+---
+layout: ../layouts/Chapter.astro
+title: Interconnects & Collectives
+description: Every multi-GPU layout is a bet on a link. The bandwidth and latency of PCIe, NVLink, NVSwitch and the network, the collectives that run over them, and how NCCL and the topology decide what you actually get.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Q from '../components/Q.astro';
+import NetLinks from '../components/viz/NetLinks.astro';
+import NetAlphaBeta from '../components/viz/NetAlphaBeta.astro';
+import NetCollectives from '../components/viz/NetCollectives.astro';
+import NetTopology from '../components/viz/NetTopology.astro';
+
+Once a model spans more than one GPU, some data has to leave the GPU it was computed on. Every chapter in this part is built on that fact:
+
+- [Tensor parallelism](../parallelism/) sums partial results with an **all-reduce**, twice per layer, for every token.
+- [Expert parallelism](../moe/) moves tokens to their experts and back with an **all-to-all**, twice per MoE layer.
+- [Pipeline parallelism](../parallelism/) and [disaggregated prefill/decode](../disaggregation/) send activations or KV caches **point-to-point**.
+
+Whether these cost microseconds or dominate the step depends on which wire the bytes cross. This chapter is about those wires, the collective operations that run over them, and the software (mostly **NCCL**) that picks the path.
+
+## The link hierarchy
+
+A GPU sits at the centre of a set of links that differ by **orders of magnitude**. From fastest to slowest:
+
+| Link | Connects | Bandwidth per GPU | Notes |
+|---|---|---|---|
+| **HBM** | GPU ↔ its own memory | 3.35 TB/s (H100), 8 TB/s (B200) | the [roofline](../roofline/) for decode |
+| **NVLink 5** | GPU ↔ GPU | 1.8 TB/s (both directions) | B200; 72 GPUs in one domain on GB200 NVL72 |
+| **NVLink 4** | GPU ↔ GPU | 900 GB/s (both directions) | H100 / H200 |
+| **NVLink 3** | GPU ↔ GPU | 600 GB/s (both directions) | A100 |
+| **PCIe Gen5 x16** | GPU ↔ CPU, NIC, NVMe | ~64 GB/s per direction | also the GPU ↔ GPU path on cards without NVLink |
+| **PCIe Gen4 x16** | same | ~32 GB/s per direction | L4, A10 and older servers |
+| **InfiniBand XDR / NDR** | node ↔ node | 800 / 400 Gb/s per NIC = ~100 / ~50 GB/s | ConnectX-8 / ConnectX-7; RoCE is RDMA over Ethernet at similar rates |
+| **TCP Ethernet** | node ↔ node | 100 Gb/s ≈ 12.5 GB/s | no RDMA, kernel network stack, high latency |
+
+Two traps in that table. NVLink is marketed as the **sum of both directions**, while PCIe and NICs are usually quoted **per direction**. Network links are quoted in **bits**: 400 Gb/s is 50 GB/s. Normalise before comparing.
+
+An **NVSwitch** turns NVLink from point-to-point cables into a crossbar: in an 8-GPU HGX node every GPU reaches every other GPU at full NVLink bandwidth at the same time. The set of GPUs that can talk over NVLink is the **NVLink domain** (the scale-up domain). Classically that is one 8-GPU server. **GB200 NVL72** extends it to a whole rack: 72 GPUs and 36 Grace CPUs in one NVLink domain with roughly 130 TB/s of aggregate bandwidth. Everything outside the domain is **scale-out**: NICs and a network fabric.
+
+<Viz title="The bandwidth ladder" label="Calculator">
+  <NetLinks />
+  <Fragment slot="caption">
+    <p>All bandwidths are per direction on a log scale, so each gridline is 10×. Pick a payload and compare the time on each link: <b>time = α + bytes ÷ β</b>, with α an illustrative per-transfer latency. The decode all-reduce barely notices bandwidth; the KV cache and the weights notice nothing else. HBM is shown for scale: it is what each GPU reads locally every step.</p>
+  </Fragment>
+</Viz>
+
+<Callout type="key" title="The ratio that shapes every layout">
+On an H100, HBM is about **7×** faster than one GPU's NVLink, NVLink is about **9×** faster than a 400 Gb/s NIC, and about **7×** faster than PCIe Gen5. A layout that puts frequent communication on the slow end of that ladder will spend its time waiting, however fast the GPUs are.
+</Callout>
+
+## Latency vs bandwidth: the α–β model
+
+The simplest useful model of any transfer is
+
+$$
+T(S) = \alpha + \frac{S}{\beta}
+$$
+
+where $S$ is the message size, $\beta$ the link bandwidth, and $\alpha$ a fixed **latency** per message: kernel launch, synchronisation between GPUs, protocol handshakes and wire delay. α is a few microseconds on NVLink and somewhat more over RDMA; over TCP it is tens of microseconds. Messages much smaller than $\alpha \cdot \beta$ are **latency-bound**: doubling the bandwidth does almost nothing. Messages much larger are **bandwidth-bound**.
+
+A collective is a sequence of such transfers. A **ring all-reduce** over $N$ GPUs takes $2(N-1)$ steps, each moving $S/N$:
+
+$$
+T_\text{ring} = 2(N-1)\,\alpha + \frac{2(N-1)}{N}\cdot\frac{S}{\beta}
+$$
+
+The bandwidth term is nearly independent of $N$: each GPU sends just under $2S$ however many GPUs there are. That is why ring is the standard algorithm for large messages. The latency term, though, **grows linearly with $N$**. A **tree** algorithm reaches every GPU in about $2\log_2 N$ steps, so it wins for small messages and large $N$, at the cost of slightly less bandwidth efficiency.
+
+<Viz title="α–β: when latency wins and when bandwidth wins" label="Calculator">
+  <NetAlphaBeta />
+  <Fragment slot="caption">
+    <p>Slide the message size across the three marked inference messages. A decode all-reduce of a 70B model (512 KiB) sits in the shaded <b>latency-bound</b> region on NVLink. Switch to 64 GPUs and watch the ring's latency floor climb while the tree's barely moves. Switch to TCP Ethernet and even small messages cost hundreds of microseconds. α values and the tree model are simplified and illustrative.</p>
+  </Fragment>
+</Viz>
+
+This explains a fact from the [parallelism](../parallelism/) chapter in one line: a 70B model at TP = 8 runs 160 all-reduces per decode step, each about 14 ring steps. With α around 1.5 µs that is already ~3 ms of pure latency per token, before a byte of bandwidth is counted. Over a network with 5–30 µs per step, it would be the whole step budget.
+
+## The collectives inference uses
+
+A **collective** is a communication pattern that every GPU in a group joins at once. Five of them cover nearly everything an inference engine does:
+
+<Viz title="Five collectives on four GPUs" label="Interactive">
+  <NetCollectives />
+  <Fragment slot="caption">
+    <p>Choose a collective and press <b>Step</b>: before, traffic, after. Note how all-reduce = reduce-scatter + all-gather, and how all-to-all <i>transposes</i> data instead of summing it. Tick <b>skewed expert routing</b> with all-to-all to see one GPU receive several times its share: the same straggler effect the <a href="../moe/">MoE</a> chapter describes, now as network traffic.</p>
+  </Fragment>
+</Viz>
+
+| Collective | Bytes sent per GPU | Where inference uses it |
+|---|---|---|
+| **All-reduce** | 2(N−1)/N × S (ring) | TP: after attention and after the MLP in every layer |
+| **Reduce-scatter** | (N−1)/N × S | first half of all-reduce; sequence-parallel layouts |
+| **All-gather** | (N−1)/N × S | second half of all-reduce; gathering sharded logits or activations |
+| **All-to-all** | ≈ (N−1)/N × S if balanced | EP dispatch and combine, twice per MoE layer |
+| **Send / recv** | S, one pair | PP stage hand-offs; KV transfer for P/D disaggregation |
+
+The [tensor-parallel diagram](../parallelism/) animates a ring all-reduce chunk by chunk. All-to-all is the awkward one: message sizes depend on the router's choices, so they change every step and are rarely balanced, and every GPU talks to every other GPU, which stresses the whole fabric rather than neighbour links.
+
+<Callout type="note" title="Algorithm bandwidth vs bus bandwidth">
+The standard benchmark, **nccl-tests** (`all_reduce_perf`), reports two numbers. **algbw** is S ÷ time. **busbw** multiplies algbw by the algorithm's traffic factor, 2(N−1)/N for all-reduce, so it can be compared directly with the link's hardware bandwidth. A healthy 8-GPU NVSwitch node reaches a busbw close to the NVLink figure for large messages. Run it after any driver, firmware or cabling change.
+</Callout>
+
+## Topology: what is wired to what
+
+"Eight GPUs in a box" can mean very different things. In an HGX-style node every GPU pair is joined through NVSwitch. In a PCIe server, GPUs hang off PCIe switches under two CPU sockets, and a GPU-to-GPU copy may cross switches, a CPU host bridge or even the link between sockets. `nvidia-smi topo -m` prints a matrix that labels each pair:
+
+<Viz title="Click two devices: path, topo -m label, bandwidth" label="Interactive">
+  <NetTopology />
+  <Fragment slot="caption">
+    <p>Start with the PCIe server: GPU0 ↔ GPU1 is <code>PIX</code>, GPU0 ↔ GPU2 is <code>PXB</code>, GPU4 ↔ GPU6 is <code>NODE</code>, and GPU0 ↔ GPU4 is <code>SYS</code>: the bytes cross the CPU interconnect. Then switch to the NVSwitch node, where every GPU pair is <code>NV18</code>. Click GPU ↔ NIC pairs to see which NIC is "local" to each GPU. Bandwidths are illustrative.</p>
+  </Fragment>
+</Viz>
+
+What to take from the matrix:
+
+- **TP groups must be NV# pairs**, or at worst `PIX`. A TP = 4 group spread across `SYS` pairs on a PCIe box is the classic way to make a model slower on more GPUs.
+- **Each GPU should use its nearest NIC** (`PIX`), so RDMA traffic goes NIC ↔ GPU memory through one PCIe switch. Large nodes typically have one 400 Gb/s NIC per GPU, cabled so that GPU *i* of every node shares a network "rail".
+- **NUMA matters for the CPU side too.** The matrix also prints each GPU's CPU and NUMA affinity. Engine processes, tokenisers and pinned host buffers for a GPU should live on that GPU's socket, otherwise every host ↔ device copy crosses the socket link.
+
+## NCCL: the software that picks the path
+
+Almost every engine (vLLM, SGLang, TensorRT-LLM) uses **NCCL** (on AMD, RCCL) for collectives. At start-up NCCL discovers the topology, then picks a **transport** for each pair of ranks and an **algorithm** and **protocol** for each collective:
+
+- **P2P**: direct GPU-to-GPU copies over NVLink or PCIe.
+- **SHM**: staging through host shared memory, used when P2P is unavailable or slow (often across `SYS`).
+- **NET**: to other nodes, through the **IB** plugin (InfiniBand or RoCE, with RDMA) or plain **Socket** (TCP).
+- Algorithms such as **Ring**, **Tree** and **NVLS** (in-switch reduction on NVSwitch systems), and protocols **LL**, **LL128** and **Simple**, which trade latency against bandwidth.
+
+When performance is mysteriously bad, the first move is `NCCL_DEBUG=INFO`. The log shows the detected topology and, for each channel, which transport each connection uses: a line ending in `via NET/Socket` where you expected `via NET/IB`, or `via SHM` where you expected P2P, explains a 5–10× slowdown on its own. Useful knobs exist (`NCCL_SOCKET_IFNAME`, `NCCL_IB_HCA`, `NCCL_P2P_LEVEL`, `NCCL_NET_GDR_LEVEL`, `NCCL_ALGO`, `NCCL_PROTO`), but they are for diagnosis first and tuning second.
+
+Two hardware paths decide whether inter-node traffic touches the CPU at all:
+
+- **GPUDirect RDMA**: the NIC reads and writes GPU memory directly, with no bounce through host RAM. It needs the right kernel support (the `nvidia-peermem` module or DMA-BUF) and a NIC close to the GPU. KV transfer libraries such as NIXL and Mooncake rely on it.
+- **GPUDirect Storage (GDS)**: NVMe ↔ GPU memory directly through the cuFile API, which speeds up [weight loading](../model-loading/) when the storage stack supports it.
+
+<Callout type="tip" title="Small all-reduces skip NCCL">
+For the latency-bound decode all-reduce, engines often bypass NCCL inside a node. vLLM, for example, ships a **custom all-reduce** kernel that writes directly into peer GPUs' memory over NVLink in one or two steps, and falls back to NCCL for large messages or unsupported topologies (`--disable-custom-all-reduce` turns it off when debugging). The [CUDA graphs](../kernels/) that capture decode steps must capture these collectives too.
+</Callout>
+
+## Placing parallelism on the hierarchy
+
+Match each parallelism strategy's traffic to the link that can carry it:
+
+| Strategy | Traffic per decode step | Message size | Belongs on |
+|---|---|---|---|
+| **TP** | 2 all-reduces × layers | small (KB–MB), latency-bound | one NVLink domain |
+| **EP** | 2 all-to-alls × MoE layers | medium, unbalanced | NVLink domain if possible; RDMA for wide EP |
+| **PP** | 1 send per stage boundary | small | can cross nodes; tolerates a slower network |
+| **P/D KV transfer** | once per request | large (GBs), bandwidth-bound | RDMA, layer by layer |
+| **DP** | none | — | anywhere |
+
+The NVLink domain is the boundary that matters. Inside an 8-GPU node, TP up to 8. Across nodes, add PP or DP, or with an NVL72 rack, keep TP and wide EP inside one rack-scale domain (on Kubernetes that domain is requested explicitly; see [GPUs on Kubernetes](../gpus-on-kubernetes/)).
+
+The final lever is **overlap**: hide communication behind computation that does not depend on it.
+
+- **Layer-by-layer KV transfer**: send layer *k*'s KV while layer *k + 1* is still computing ([disaggregation](../disaggregation/)).
+- **Two micro-batches ping-ponging**: one runs its all-to-all while the other computes its experts, as large MoE deployments do.
+- **Pipeline stages** overlap naturally once several micro-batches are in flight.
+- **Fused GEMM + collective kernels** start sending the first tiles of a matmul while later tiles are computing.
+
+Overlap only helps when there is independent work and spare link and SM capacity. In decode at small batch there is little of either, which is why the raw α of the link still matters.
+
+<Interview>
+  <Q q="Why is the per-GPU traffic of a ring all-reduce nearly independent of the number of GPUs?" level="core">
+    The buffer is split into N chunks. In the reduce-scatter phase each GPU sends N−1 chunks of size S/N, and the all-gather phase sends another N−1. Total 2(N−1)/N × S, which approaches 2S as N grows. What does grow with N is the number of steps, 2(N−1), so the **latency** term scales linearly. Large messages favour ring; small messages on many GPUs favour tree or in-switch reduction.
+  </Q>
+  <Q q="Map the collectives to inference parallelism strategies." level="core">
+    TP uses all-reduce (sometimes split into reduce-scatter and all-gather with sequence parallelism). EP uses all-to-all for dispatch and combine. PP uses point-to-point send/recv between stages. P/D disaggregation uses point-to-point (usually RDMA) to move KV caches. All-gather also appears when logits or activations are sharded. DP needs no collectives during inference.
+  </Q>
+  <Q q="Why does TP stay within one NVLink domain while PP can cross nodes?" level="mid">
+    TP does 2 all-reduces per layer per step, so an 80-layer model performs 160 small, latency-bound collectives per token. NVLink gives roughly 9× the bandwidth of a 400 Gb/s NIC per GPU and lower latency per step. PP sends one activation per stage boundary per step, a handful of messages, so a slower network adds little. The NVLink domain is usually one node; with NVL72 it is a rack.
+  </Q>
+  <Q q="What do PIX, PXB, PHB, NODE and SYS mean in nvidia-smi topo -m, and why do you care?" level="mid">
+    They describe the PCIe path between two devices: PIX at most one PCIe bridge, PXB several bridges without the CPU, PHB through the CPU's host bridge, NODE across host bridges within one NUMA node, SYS across the socket interconnect. NV# means a bonded set of NVLinks. They predict P2P bandwidth and whether GPUDirect RDMA is worthwhile, so you use them to choose TP groups, pair GPUs with NICs and pin processes to the right NUMA node.
+  </Q>
+  <Q q="A 2-node TP = 16 deployment of a 70B model is slower than a single node at TP = 8. Explain and fix." level="senior">
+    TP = 16 puts half of every all-reduce on the inter-node network. Each of the 160 per-token collectives now has 30 ring steps, several crossing a NIC with a higher α and roughly a ninth of NVLink's bandwidth, so communication swamps the smaller per-GPU weight reads. Also, Llama 3.1 70B has 8 KV heads, so TP = 16 replicates KV. Fix: TP = 8 within each node and either PP = 2 across nodes (if memory needs it) or simply two DP replicas, which doubles throughput with no inter-node traffic.
+  </Q>
+  <Q q="After a cluster maintenance window, a multi-node deployment's throughput dropped 5× with no errors. What do you check?" level="senior">
+    Communication fell back to a slower path. Run with `NCCL_DEBUG=INFO` and look at the transport lines: `NET/Socket` instead of `NET/IB` means RDMA is not being used (NIC driver, `nvidia-peermem`, RDMA device plugin, wrong `NCCL_IB_HCA` or interface). Check that GPUDirect RDMA is active, that `nvidia-smi topo -m` is unchanged, and NVLink health (`nvidia-smi nvlink` status, Xid 74 in the kernel log). Then run nccl-tests between the nodes and compare busbw with the last known good baseline.
+  </Q>
+</Interview>

@@ -1,0 +1,132 @@
+---
+/* α–β cost model: time vs message size (log–log) for ring all-reduce, tree all-reduce and
+   a plain point-to-point send, on a chosen link and GPU count. Shows the latency-bound
+   and bandwidth-bound regimes and where common inference messages fall. */
+---
+<div data-viz="net-alpha-beta"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, group, select, slider, stats, legend, narration, C, fmt } from '../../lib/viz';
+
+  // β per direction (GB/s); α per hop (µs), illustrative: launch + sync + wire + protocol.
+  const LINKS = [
+    { id: 'nvl4', label: 'NVLink 4 / NVSwitch (H100)', gbs: 450, alphaUs: 1.5 },
+    { id: 'nvl5', label: 'NVLink 5 / NVSwitch (B200)', gbs: 900, alphaUs: 1.5 },
+    { id: 'pcie5', label: 'PCIe Gen5 x16', gbs: 50, alphaUs: 3 },
+    { id: 'ndr', label: 'InfiniBand NDR 400 Gb/s (RDMA)', gbs: 50, alphaUs: 5 },
+    { id: 'eth', label: 'Ethernet 100 Gb/s (TCP sockets)', gbs: 12.5, alphaUs: 25 },
+  ];
+  const MARKS = [
+    { b: 32 * 8192 * 2, label: 'decode AR' },
+    { b: 2048 * 8192 * 2, label: 'prefill AR' },
+    { b: 8192 * 327680, label: 'KV 8K (p2p)' },
+  ];
+
+  const W = 940, H = 330, PL = 70, PR = 20, PT = 18, PB = 40;
+  const XMIN = 3, XMAX = 10; // log10 bytes: 1 KB … 10 GB
+  const YMIN = -6, YMAX = 0.5; // log10 seconds: 1 µs … ~3 s
+
+  mountAll('net-alpha-beta', (root) => {
+    let link = LINKS[0];
+    let n = 8;
+    let sizeLog = Math.log10(32 * 8192 * 2);
+
+    const b1 = ctrlBar(root);
+    const g1 = group(b1);
+    select(g1, 'Link', LINKS.map((l) => ({ value: l.id, label: l.label })), link.id, (v) => { link = LINKS.find((l) => l.id === v)!; render(); });
+    select(g1, 'GPUs', [2, 4, 8, 16, 32, 64].map((x) => ({ value: String(x), label: String(x) })), String(n), (v) => { n = Number(v); render(); });
+    const b2 = ctrlBar(root);
+    slider(b2, { label: 'Message size', min: XMIN, max: 9.5, step: 0.05, value: sizeLog, format: (v) => fmt.bytes(10 ** v), onInput: (v) => { sizeLog = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Log-log plot of collective time against message size' });
+    const st = stats(root, ['Ring all-reduce', 'Tree all-reduce', 'Point-to-point', 'Regime (ring)']);
+    legend(root, [['Ring all-reduce', C.comm], ['Tree all-reduce (pipelined)', C.decode], ['Point-to-point send', C.prefill], ['Latency term α', C.faint]]);
+    const say = narration(root);
+
+    const sx = (lb: number) => PL + ((lb - XMIN) / (XMAX - XMIN)) * (W - PL - PR);
+    const sy = (ls: number) => PT + ((YMAX - ls) / (YMAX - YMIN)) * (H - PT - PB);
+
+    const a = () => link.alphaUs * 1e-6;
+    const beta = () => link.gbs * 1e9;
+    const ring = (S: number) => 2 * (n - 1) * a() + (2 * (n - 1) / n) * S / beta();
+    // pipelined binary tree: reduce up + broadcast down, depth log2 n, k chunks; pick best k.
+    // Each pipeline step moves a chunk from/to two children, hence 2·S/k per step (simplified).
+    const tree = (S: number) => {
+      const d = Math.ceil(Math.log2(n));
+      let best = Infinity;
+      for (let k = 1; k <= 4096; k *= 2) best = Math.min(best, (2 * d + k - 1) * (a() + (2 * S) / k / beta()));
+      return best;
+    };
+    const p2p = (S: number) => a() + S / beta();
+
+    function curve(fn: (S: number) => number, color: string, dash?: string) {
+      let d = '';
+      for (let lb = XMIN; lb <= XMAX + 1e-9; lb += 0.05) {
+        const t = Math.log10(fn(10 ** lb));
+        const y = Math.max(PT - 4, Math.min(H - PB, sy(t)));
+        d += (d ? 'L' : 'M') + sx(lb).toFixed(1) + ',' + y.toFixed(1);
+      }
+      s('path', { d, fill: 'none', stroke: color, 'stroke-width': 2.2, 'stroke-dasharray': dash ?? null }, svg);
+    }
+
+    function render() {
+      clear(svg);
+      // grid
+      for (let lb = XMIN; lb <= XMAX; lb++) {
+        line(svg, sx(lb), PT, sx(lb), H - PB, C.border, { 'stroke-width': 1, 'stroke-dasharray': '2 4' });
+        text(svg, sx(lb), H - PB + 14, ['1 KB', '10 KB', '100 KB', '1 MB', '10 MB', '100 MB', '1 GB', '10 GB'][lb - XMIN], { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      }
+      const yl: [number, string][] = [[-6, '1 µs'], [-5, '10 µs'], [-4, '100 µs'], [-3, '1 ms'], [-2, '10 ms'], [-1, '100 ms'], [0, '1 s']];
+      for (const [ls, lab] of yl) {
+        line(svg, PL, sy(ls), W - PR, sy(ls), C.border, { 'stroke-width': 1, 'stroke-dasharray': '2 4' });
+        text(svg, PL - 8, sy(ls), lab, { 'text-anchor': 'end', class: 't-small t-faint t-mono' });
+      }
+      text(svg, (PL + W - PR) / 2, H - 8, 'message size (bytes per GPU)', { 'text-anchor': 'middle', class: 't-small t-dim' });
+
+      // latency floor of ring: 2(n-1)α
+      const floor = Math.log10(2 * (n - 1) * a());
+      line(svg, PL, sy(floor), W - PR, sy(floor), C.faint, { 'stroke-dasharray': '6 4', 'stroke-width': 1.2 });
+      text(svg, W - PR - 4, sy(floor) - 8, `ring latency floor 2(N−1)·α = ${(2 * (n - 1) * link.alphaUs).toFixed(0)} µs`, { 'text-anchor': 'end', class: 't-small t-dim' });
+
+      // knee where α term == β term for ring
+      const knee = (2 * (n - 1) * a()) * beta() / (2 * (n - 1) / n);
+      const kx = sx(Math.log10(knee));
+      if (kx > PL && kx < W - PR) {
+        rect(svg, PL, PT, kx - PL, H - PT - PB, C.accentSoft, { rx: 0, opacity: 0.5 });
+        text(svg, PL + 8, PT + 12, 'latency-bound', { class: 't-small t-bold', fill: C.accent });
+        text(svg, kx + 8, PT + 12, 'bandwidth-bound', { class: 't-small t-bold t-dim' });
+      }
+
+      curve(p2p, C.prefill, '5 4');
+      curve(tree, C.decode);
+      curve(ring, C.comm);
+
+      for (const m of MARKS) {
+        const x = sx(Math.log10(m.b));
+        line(svg, x, PT + 22, x, H - PB, C.borderStrong, { 'stroke-width': 1 });
+        text(svg, x + 4, PT + 30, m.label, { class: 't-small t-dim' });
+      }
+
+      // cursor
+      const S = 10 ** sizeLog;
+      const cx = sx(sizeLog);
+      line(svg, cx, PT, cx, H - PB, C.accent, { 'stroke-width': 1.5 });
+      for (const [fn, col] of [[ring, C.comm], [tree, C.decode], [p2p, C.prefill]] as [(S: number) => number, string][]) {
+        s('circle', { cx, cy: sy(Math.log10(fn(S))), r: 4.5, fill: col, stroke: 'var(--bg)', 'stroke-width': 1.5 }, svg);
+      }
+
+      const tr = ring(S), tt = tree(S), tp = p2p(S);
+      const aShare = (2 * (n - 1) * a()) / tr;
+      const us = (t: number) => (t < 1e-3 ? `${(t * 1e6).toFixed(1)} µs` : fmt.ms(t * 1e3));
+      const busbw = ((2 * (n - 1) / n) * S) / tr / 1e9;
+      st.set('Ring all-reduce', us(tr), `${2 * (n - 1)} steps · bus BW ${fmt.num(busbw, 1)} GB/s`, tr <= tt ? C.good : undefined);
+      st.set('Tree all-reduce', us(tt), `depth ${Math.ceil(Math.log2(n))}, pipelined`, tt < tr ? C.good : undefined);
+      st.set('Point-to-point', us(tp), 'one send, α + S/β');
+      st.set('Regime (ring)', aShare > 0.5 ? 'latency-bound' : 'bandwidth-bound', `α is ${fmt.pct(aShare)} of the time`, aShare > 0.5 ? C.accent : undefined);
+
+      if (aShare > 0.5) say(`At ${fmt.bytes(S)} the ring spends <b>${fmt.pct(aShare)}</b> of its time on per-step latency: ${2 * (n - 1)} hops × ${link.alphaUs} µs. More bandwidth would barely help. Fewer hops would: a tree needs only ~2·log₂N steps, and in-switch reduction (NVLink SHARP) needs fewer still. This is where decode all-reduces live.`);
+      else say(`At ${fmt.bytes(S)} the wire time dominates. Each GPU sends <b>2(N−1)/N = ${((2 * (n - 1)) / n).toFixed(2)}×</b> the message, nearly independent of N, so ring achieves close to full link bandwidth. Prefill all-reduces and KV transfers live here, and the link’s β is what matters.`);
+    }
+    render();
+  });
+</script>

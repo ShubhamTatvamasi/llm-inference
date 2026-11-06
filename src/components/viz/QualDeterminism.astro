@@ -1,0 +1,125 @@
+---
+/* Why temperature-0 output changes between runs. The same hidden state is multiplied by two
+   vocabulary rows (a near-tie between two tokens). The matmul kernel picks a split-K strategy
+   from the batch size, so the fp32 partial sums are added in a different order; the logits
+   differ in the last bits and the greedy winner can flip. Batch-invariant mode fixes the
+   reduction strategy regardless of batch. The arithmetic here is real fp32 (Math.fround);
+   the kernel heuristic is a simplified stand-in. */
+---
+<div data-viz="qual-determinism"></div>
+
+<script>
+  import { mountAll, svgRoot, rect, text, line, clear, ctrlBar, segmented, checkbox, button, stats, narration, C, rng } from '../../lib/viz';
+
+  const D = 4096;
+  const BATCHES = [1, 4, 16, 64, 256];
+  const SPLIT: Record<number, number> = { 1: 16, 4: 8, 16: 4, 64: 2, 256: 1 }; // more split-K when the batch is too small to fill the GPU
+  const f = Math.fround;
+
+  function vecs() {
+    const r = rng(7);
+    const g = () => { let u = 0; while (u === 0) u = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * r()); };
+    const hv = Array.from({ length: D }, () => f(g()));
+    const a = Array.from({ length: D }, () => f(0.02 * g()));
+    const b = a.map((x) => f(x + 0.004 * g())); // a close competitor
+    return { hv, a, b };
+  }
+  function dot(hv: number[], w: number[], splits: number) {
+    const len = D / splits; const parts: number[] = [];
+    for (let s = 0; s < splits; s++) { let acc = 0; for (let i = s * len; i < (s + 1) * len; i++) acc = f(acc + f(hv[i] * w[i])); parts.push(acc); }
+    let tot = 0; for (const p of parts) tot = f(tot + p);
+    return tot;
+  }
+
+  const W = 940, H = 250;
+
+  mountAll('qual-determinism', (root) => {
+    const { hv, a, b } = vecs();
+    const raw: Record<number, [number, number]> = {};
+    for (const s of [1, 2, 4, 8, 16]) raw[s] = [dot(hv, a, s), dot(hv, b, s)];
+    // pick a bias for token B so that the reduction order decides the winner (a genuine near-tie)
+    const diffs = [1, 2, 4, 8, 16].map((s) => raw[s][0] - raw[s][1]).sort((x, y) => x - y);
+    const bias = (diffs[1] + diffs[2]) / 2;
+    const logits = (s: number) => [raw[s][0], f(raw[s][1] + bias)] as [number, number];
+
+    let batch = 1, inv = false; let runs: number[] = [];
+    const TOK = [' to', ' by'];
+    const CONT = [' to immerse yourself in it every day.', ' by speaking it with native speakers.'];
+
+    const bar = ctrlBar(root);
+    segmented(bar, BATCHES.map((x) => ({ value: String(x), label: `batch ${x}` })), '1', (v) => { batch = Number(v); render(); });
+    checkbox(bar, 'Batch-invariant kernels', inv, (v) => { inv = v; runs = []; render(); });
+    button(bar, 'Replay 12× under live traffic', () => {
+      const r = rng(Date.now() & 0xffff);
+      runs = Array.from({ length: 12 }, () => BATCHES[Math.floor(r() * BATCHES.length)]);
+      render();
+    }, { primary: true, icon: 'play' });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Same prompt in different batch sizes leads to different reduction order and a flipped greedy token' });
+    const st = stats(root, ['Split-K used', 'Logit gap', 'Greedy token', 'Throughput cost']);
+    const say = narration(root);
+
+    const splitOf = (bs: number) => (inv ? 1 : SPLIT[bs]);
+    const winner = (bs: number) => { const [la, lb] = logits(splitOf(bs)); return la >= lb ? 0 : 1; };
+
+    function render() {
+      clear(svg);
+      const S = splitOf(batch);
+      const [la, lb] = logits(S); const win = la >= lb ? 0 : 1;
+
+      // batch grid
+      text(svg, 20, 14, `Engine step: your request + ${batch - 1} others`, { class: 't-small t-bold' });
+      const shown = Math.min(batch, 64);
+      for (let i = 0; i < shown; i++) {
+        const cx = 20 + (i % 16) * 13, cy = 28 + Math.floor(i / 16) * 13;
+        rect(svg, cx, cy, 10, 10, i === 0 ? C.accent : C.decodeSoft, { rx: 2, stroke: i === 0 ? C.accent : C.decode, 'stroke-width': 0.6 });
+      }
+      if (batch > 64) text(svg, 20, 92, `+${batch - 64} more`, { class: 't-small t-faint t-mono' });
+
+      // reduction: K dimension split
+      const RX0 = 250, RX1 = 600;
+      text(svg, RX0, 14, `Dot product over ${D} dims, split into ${S} partial sum${S > 1 ? 's' : ''}`, { class: 't-small t-bold' });
+      const pw = (RX1 - RX0) / S;
+      for (let s = 0; s < S; s++) rect(svg, RX0 + s * pw + 1, 28, pw - 2, 20, C.compute, { rx: 2, opacity: s % 2 ? 0.5 : 0.85 });
+      for (let s = 0; s < S; s++) line(svg, RX0 + s * pw + pw / 2, 48, (RX0 + RX1) / 2, 76, C.faint, { 'stroke-width': 1 });
+      rect(svg, (RX0 + RX1) / 2 - 46, 76, 92, 22, C.surface2, { rx: 6, stroke: C.border });
+      text(svg, (RX0 + RX1) / 2, 87, 'fp32 Σ partials', { 'text-anchor': 'middle', class: 't-small t-mono' });
+      text(svg, RX0, 112, '(a + b) + c ≠ a + (b + c) in floating point: a different split is a different sum.', { class: 't-small t-dim' });
+
+      // logits
+      const LX = 640;
+      text(svg, LX, 14, 'Prompt: "The best way to learn a language is"', { class: 't-small t-bold' });
+      [la, lb].forEach((v, i) => {
+        const y = 34 + i * 30;
+        rect(svg, LX, y, 280, 24, i === win ? C.kv : C.surface2, { rx: 6, 'fill-opacity': i === win ? 0.22 : 1, stroke: i === win ? C.kv : C.border });
+        text(svg, LX + 10, y + 12, `"${TOK[i]}"`, { class: 't-mono t-bold' });
+        text(svg, LX + 270, y + 12, v.toFixed(9), { 'text-anchor': 'end', class: 't-mono t-small' });
+      });
+      text(svg, LX, 106, `gap ${(la - lb).toExponential(2)} → greedy picks "${TOK[win]}"`, { class: 't-small t-bold', fill: C.accent });
+
+      // continuation
+      text(svg, 20, 140, 'Temperature 0 output:', { class: 't-small t-dim' });
+      text(svg, 160, 140, `The best way to learn a language is${CONT[win]}`, { class: 't-mono t-small' });
+
+      // runs
+      text(svg, 20, 172, inv ? '12 replays, batch-invariant kernels' : '12 replays, batch size set by whatever else is running', { class: 't-small t-bold' });
+      if (!runs.length) text(svg, 20, 200, 'Press "Replay 12× under live traffic".', { class: 't-small t-faint' });
+      runs.forEach((bs, i) => {
+        const w2 = winner(bs); const x = 20 + i * 75;
+        rect(svg, x, 186, 70, 44, w2 === 0 ? C.decodeSoft : C.prefillSoft, { rx: 6, stroke: w2 === 0 ? C.decode : C.prefill });
+        text(svg, x + 35, 200, `"${TOK[w2]}"`, { 'text-anchor': 'middle', class: 't-mono t-bold t-small' });
+        text(svg, x + 35, 218, `batch ${bs}`, { 'text-anchor': 'middle', class: 't-small t-faint' });
+      });
+
+      const flips = new Set(runs.map(winner)).size > 1;
+      st.set('Split-K used', `${S}`, inv ? 'fixed for every batch size' : `chosen for batch ${batch}`);
+      st.set('Logit gap', (la - lb).toExponential(1), 'a few fp32 ulps: a near-tie');
+      st.set('Greedy token', `"${TOK[win]}"`, undefined, win === 0 ? C.decode : C.prefill);
+      st.set('Throughput cost', inv ? 'slower' : 'none', inv ? 'fixed kernels give up shape-tuned splits' : 'but output depends on load', inv ? C.waste : undefined);
+      if (inv) say('<b>Batch-invariant mode</b> uses the same reduction strategy whatever the batch size, so every replay gives the same bits and the same token. In vLLM this is <code>VLLM_BATCH_INVARIANT=1</code> (beta, slower).');
+      else if (runs.length && flips) say('<b>Same prompt, same weights, temperature 0, different answers.</b> Nothing is random: the result depends on how many other requests shared the engine step, which picked the kernel split, which changed the order of the floating-point additions.');
+      else say('Change the batch size and watch the partial sums regroup. The logits move in the 7th–8th significant digit, which only matters when two tokens are nearly tied. In long generations, some step eventually is, and the outputs diverge from there.');
+    }
+    render();
+  });
+</script>

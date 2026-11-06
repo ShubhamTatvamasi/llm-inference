@@ -1,0 +1,174 @@
+---
+/* GPU node bring-up, operand by operand: a fresh 8-GPU node goes from "GPUs on the PCIe bus but
+   unusable" to "schedulable". Node labels and allocatable nvidia.com/gpu appear as each GPU Operator
+   DaemonSet finishes. Toggles: driver delivery (operator-built / precompiled / host) and a just-patched
+   kernel, which shows the kernel-upgrade trap. Durations are illustrative. */
+---
+<div data-viz="k8s-bringup"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, player, segmented, checkbox, stats, narration, C } from '../../lib/viz';
+
+  type Drv = 'built' | 'pre' | 'host';
+  type State = 'wait' | 'run' | 'ok' | 'fail' | 'skip';
+  interface Op { key: string; ds: string; does: string; labels: string[]; color: string; }
+
+  const OPS: Op[] = [
+    { key: 'nfd', ds: 'node-feature-discovery-worker', does: 'Scans PCI devices and labels the node with vendor 10de (NVIDIA)', labels: ['feature.node.kubernetes.io/pci-10de.present=true', 'nvidia.com/gpu.present=true'], color: C.mem },
+    { key: 'driver', ds: 'nvidia-driver-daemonset', does: 'Loads the kernel module; creates /dev/nvidia*', labels: [], color: C.weight },
+    { key: 'toolkit', ds: 'nvidia-container-toolkit-daemonset', does: 'Configures containerd and writes the CDI spec', labels: [], color: C.comm },
+    { key: 'plugin', ds: 'nvidia-device-plugin-daemonset', does: 'Registers with kubelet; advertises nvidia.com/gpu', labels: [], color: C.kv },
+    { key: 'gfd', ds: 'gpu-feature-discovery', does: 'Queries NVML; labels product, memory, count, CC', labels: ['nvidia.com/gpu.product=NVIDIA-H100-80GB-HBM3', 'nvidia.com/gpu.memory=81559', 'nvidia.com/gpu.count=8', 'nvidia.com/gpu.compute.major=9', 'nvidia.com/mig.capable=true', 'nvidia.com/cuda.driver-version.major=580'], color: C.token },
+    { key: 'mig', ds: 'nvidia-mig-manager', does: 'Watches nvidia.com/mig.config; idle until set', labels: [], color: C.decode },
+    { key: 'dcgm', ds: 'nvidia-dcgm-exporter', does: 'Exports per-GPU health and utilisation metrics', labels: [], color: C.compute },
+    { key: 'valid', ds: 'nvidia-operator-validator', does: 'driver → toolkit → cuda → plugin validation', labels: [], color: C.good },
+  ];
+
+  const W = 940, H = 400, LX = 16, LW = 520, RX = 556, RW = 368, Y0 = 34, ROW = 34;
+
+  mountAll('k8s-bringup', (root) => {
+    let drv: Drv = 'built';
+    let patched = false;
+    let k = -1; // index of the last operand processed
+
+    const bar = ctrlBar(root);
+    const opts = ctrlBar(root);
+    segmented(opts, [{ value: 'built', label: 'Driver: operator-built' }, { value: 'pre', label: 'Driver: precompiled' }, { value: 'host', label: 'Driver: on the host image' }], drv, (v) => { drv = v as Drv; p.reset(); });
+    checkbox(opts, 'Kernel was just patched', patched, (v) => { patched = v; p.reset(); });
+    const svg = svgRoot(root, W, H, { 'aria-label': 'GPU Operator operands coming up on a node, with node labels and allocatable GPUs' });
+    const say = narration(root);
+    const st = stats(root, ['Elapsed (illustrative)', 'Allocatable nvidia.com/gpu', 'GPU pods schedulable?']);
+
+    // seconds per operand for this config; -1 = fails
+    function dur(i: number): number {
+      const key = OPS[i].key;
+      if (key === 'driver') {
+        if (drv === 'host') return 0;
+        if (drv === 'pre') return patched ? -1 : 45;
+        return patched ? 330 : 300;
+      }
+      return ({ nfd: 10, toolkit: 20, plugin: 10, gfd: 8, mig: 5, dcgm: 15, valid: 30 } as Record<string, number>)[key];
+    }
+    const failAt = () => OPS.findIndex((_, i) => dur(i) < 0);
+
+    function stateOf(i: number): State {
+      const f = failAt();
+      if (f >= 0 && i > f) return 'wait';
+      if (i <= k) {
+        if (dur(i) < 0) return 'fail';
+        if (OPS[i].key === 'driver' && drv === 'host') return 'skip';
+        return 'ok';
+      }
+      if (i === k + 1 && k >= 0 && (f < 0 || i <= f)) return 'run';
+      return 'wait';
+    }
+
+    function reset() { k = -1; }
+    function step() {
+      const f = failAt();
+      if (f >= 0 && k >= f) return false;
+      k++;
+      if (f >= 0 && k >= f) return false;
+      return k < OPS.length - 1;
+    }
+
+    function render() {
+      clear(svg);
+      const f = failAt();
+      const failed = f >= 0 && k >= f;
+      const finished = !failed && k >= OPS.length - 1;
+
+      // left: operands
+      text(svg, LX, 14, 'GPU Operator operands (DaemonSets), in dependency order', { class: 't-small t-bold' });
+      text(svg, LX + LW, 14, 'ClusterPolicy: cluster-policy', { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+      let elapsed = 0;
+      OPS.forEach((op, i) => {
+        const y = Y0 + i * ROW;
+        const stt = stateOf(i);
+        const d = dur(i);
+        if (stt === 'ok' || stt === 'skip') elapsed += Math.max(0, d);
+        const stroke = stt === 'fail' ? C.waste : stt === 'run' ? C.accent : C.border;
+        rect(svg, LX, y, LW, ROW - 6, stt === 'ok' || stt === 'skip' ? C.surface2 : 'transparent', { rx: 7, stroke, 'stroke-dasharray': stt === 'wait' ? '3 3' : null });
+        rect(svg, LX, y, 5, ROW - 6, stt === 'wait' ? C.border : op.color, { rx: 2 });
+        text(svg, LX + 14, y + 10, op.ds, { class: 't-small t-mono t-bold', fill: stt === 'wait' ? C.faint : C.text });
+        text(svg, LX + 14, y + 22, op.key === 'driver' && drv === 'host' ? 'Skipped: driver already in the node image (validator still checks it)' : op.does, { class: 't-small t-dim' });
+        const label = stt === 'ok' ? (d > 0 ? `✓ ${d}s` : '✓') : stt === 'skip' ? 'skipped' : stt === 'fail' ? '✗ ImagePullBackOff' : stt === 'run' ? 'starting…' : 'Pending';
+        text(svg, LX + LW - 10, y + 14, label, { 'text-anchor': 'end', class: 't-small t-bold', fill: stt === 'fail' ? C.waste : stt === 'ok' ? C.good : stt === 'run' ? C.accent : C.faint });
+      });
+
+      // timeline bar
+      const TY = Y0 + OPS.length * ROW + 8;
+      const total = OPS.reduce((a, _, i) => a + Math.max(0, dur(i)), 0) || 1;
+      const scale = (LW - 90) / 470; // fixed scale: 470 s fills the bar, so faster configs look shorter
+      text(svg, LX, TY + 8, 'time', { class: 't-small t-faint' });
+      let x = LX + 40;
+      const fa = failAt();
+      OPS.forEach((op, i) => {
+        if (fa >= 0 && i >= fa) return;
+        const d = Math.max(0, dur(i));
+        const stt = stateOf(i);
+        if (d > 0) rect(svg, x, TY, d * scale, 16, op.color, { rx: 0, opacity: stt === 'ok' ? 0.9 : 0.18 });
+        x += d * scale;
+      });
+      if (failed) { rect(svg, x, TY, 40, 16, C.wasteSoft, { rx: 0, stroke: C.waste }); text(svg, x + 46, TY + 8, 'stuck', { class: 't-small t-bold', fill: C.waste }); }
+      else text(svg, x + 6, TY + 8, `${Math.round(total / 6) / 10} min`, { class: 't-small t-mono t-dim' });
+
+      // right: the Node object
+      rect(svg, RX, 4, RW, H - 8, C.surface2, { rx: 12, stroke: C.border });
+      text(svg, RX + 14, 22, 'kind: Node  ·  gpu-node-7', { class: 't-small t-mono t-bold' });
+      text(svg, RX + 14, 42, 'metadata.labels (GPU-related)', { class: 't-small t-faint' });
+      const labs: string[] = [];
+      OPS.forEach((op, i) => { const stt = stateOf(i); if (stt === 'ok') labs.push(...op.labels); });
+      if (k >= 0) labs.push(...['nvidia.com/gpu.deploy.driver=true', 'nvidia.com/gpu.deploy.device-plugin=true'].filter(() => stateOf(0) === 'ok'));
+      if (!labs.length) text(svg, RX + 14, 60, '(none yet: only kubernetes.io/* labels)', { class: 't-small t-mono t-faint' });
+      labs.slice(0, 11).forEach((l, i) => {
+        const [kk, vv] = l.split('=');
+        text(svg, RX + 14, 60 + i * 16, kk.length > 44 ? kk.slice(0, 43) + '…' : kk, { class: 't-small t-mono', fill: C.dim });
+        text(svg, RX + RW - 12, 60 + i * 16, vv, { 'text-anchor': 'end', class: 't-small t-mono t-bold' });
+      });
+
+      const AY = 252;
+      line(svg, RX + 12, AY - 10, RX + RW - 12, AY - 10, C.border, { 'stroke-width': 1 });
+      text(svg, RX + 14, AY + 4, 'status.allocatable', { class: 't-small t-faint' });
+      const alloc = stateOf(3) === 'ok' ? 8 : 0;
+      text(svg, RX + 14, AY + 24, 'cpu: 192   memory: 2Ti', { class: 't-small t-mono t-dim' });
+      text(svg, RX + 14, AY + 42, 'nvidia.com/gpu:', { class: 't-mono t-bold' });
+      text(svg, RX + 140, AY + 42, alloc ? String(alloc) : '(absent)', { class: 't-mono t-bold', fill: alloc ? C.good : C.faint });
+      for (let g = 0; g < 8; g++) {
+        const gx = RX + 14 + g * 43, gy = AY + 60;
+        const drvOk = stateOf(1) === 'ok' || stateOf(1) === 'skip';
+        rect(svg, gx, gy, 37, 26, alloc ? C.kvSoft : drvOk ? C.surface3 : 'transparent', { rx: 5, stroke: alloc ? C.kv : C.borderStrong, 'stroke-dasharray': drvOk ? null : '3 2' });
+        text(svg, gx + 18.5, gy + 13, `GPU${g}`, { 'text-anchor': 'middle', class: 't-small t-mono', fill: alloc ? C.kv : C.faint });
+      }
+      const verdict = failed ? '✗ Node stuck: GPU pods stay Pending' : finished ? '✓ Validated: GPU pods can land here' : alloc ? 'Advertised, validation still running' : 'Not schedulable for GPU pods';
+      text(svg, RX + 14, H - 22, verdict, { class: 't-small t-bold', fill: failed ? C.waste : finished ? C.good : C.faint });
+
+      st.set('Elapsed (illustrative)', failed ? 'stuck' : `${elapsed} s`, drv === 'built' ? 'driver compiled on the node' : drv === 'pre' ? 'precompiled driver image' : 'host driver', failed ? C.waste : C.text);
+      st.set('Allocatable nvidia.com/gpu', alloc ? '8' : '0', alloc ? 'kubelet reports 8 devices' : 'no device plugin registered yet', alloc ? C.good : C.text);
+      st.set('GPU pods schedulable?', finished ? 'yes' : failed ? 'no' : '…', finished ? 'all validations passed' : failed ? 'driver never came up' : 'waiting on operands', finished ? C.good : failed ? C.waste : C.text);
+
+      if (k < 0) {
+        say('A new node has joined. <code>lspci</code> shows eight NVIDIA devices, but there is no kernel module, no <code>/dev/nvidia*</code>, no container runtime hook and no <code>nvidia.com/gpu</code> resource. To the scheduler this is a CPU node. Press <b>Play</b> or <b>Step</b>.');
+        return;
+      }
+      if (failed) {
+        say(`<b>Kernel-upgrade trap.</b> Precompiled images are tagged <code>&lt;driver-branch&gt;-&lt;kernel-version&gt;-&lt;os&gt;</code>. The node rebooted into a patched kernel that has no matching image, so <code>nvidia-driver-daemonset</code> sits in ImagePullBackOff. Everything downstream waits on it. Fix: pin node kernels to versions with a published image (or build your own), or switch to the operator-built driver, which compiles against the running kernel.`);
+        return;
+      }
+      const op = OPS[Math.min(k, OPS.length - 1)];
+      const notes: Record<string, string> = {
+        nfd: 'NFD labels the node with the PCI vendor ID <code>10de</code>. The operator uses this label to decide where to run every other operand.',
+        driver: drv === 'host' ? 'The driver comes with the node image (common on managed node pools), so the operator skips the driver DaemonSet. Kernel and driver now upgrade together with the image.' : drv === 'pre' ? 'A precompiled driver image matching this exact kernel just loads the module: under a minute instead of a compile.' : `The driver container installs the userspace libraries and <b>builds the kernel module for the running kernel</b>${patched ? ' (it rebuilds after the patch, which needs matching kernel headers from the package mirror)' : ''}. This is the slow step: minutes, not seconds.`,
+        toolkit: 'The container toolkit configures containerd and writes a <b>CDI spec</b> listing the device nodes and libraries. Since GPU Operator v25.10, CDI is on by default, so ordinary pods do not need a <code>runtimeClassName</code>.',
+        plugin: 'The device plugin registers with kubelet and reports 8 healthy devices. <code>nvidia.com/gpu: 8</code> appears in allocatable. The scheduler can now count GPUs on this node.',
+        gfd: 'GPU Feature Discovery adds the labels you schedule on: product, memory (MiB), count, compute capability, MIG capability.',
+        mig: 'The MIG manager stays idle until someone sets <code>nvidia.com/mig.config</code> on the node. See <a href="../gpu-sharing/">sharing a GPU</a>.',
+        dcgm: 'DCGM exporter starts publishing per-GPU metrics (utilisation, memory, temperature, Xid and ECC errors) for Prometheus.',
+        valid: 'The validator runs a sequence of init containers: driver, toolkit, a real CUDA workload, then a pod that requests a GPU through the plugin. Only now is the node known-good.',
+      };
+      say(`<b>${op.ds}</b>. ${notes[op.key]}`);
+    }
+
+    const p = player(bar, root, { step, reset, render, interval: 1100, autoplay: false });
+  });
+</script>
