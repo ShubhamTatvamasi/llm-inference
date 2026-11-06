@@ -28,7 +28,7 @@
   const H2D_HOST = 80;       // GB/s the host side (memory, CPU threads) can feed all GPUs together
   const PREC = [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }, { value: '0.5', label: 'INT4 / FP4' }];
 
-  const W = 920, H = 400;
+  const W = 920, H = 412;
 
   function times(sizeGB: number, src: Src, tp: number, reps: number) {
     const net = Math.min(src.per, src.shared / reps);

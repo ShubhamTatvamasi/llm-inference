@@ -122,7 +122,7 @@
 
     const bar = ctrlBar(root);
     const bar2 = ctrlBar(root);
-    segmented(bar2, Object.entries(SCHEMAS).map(([k, v]) => ({ value: k, label: v.name })), key, (v) => { key = v as keyof typeof SCHEMAS; reset(); render(); });
+    segmented(bar2, Object.entries(SCHEMAS).map(([k, v]) => ({ value: k, label: v.name })), key, (v) => { key = v as keyof typeof SCHEMAS; pl.reset(); });
     const svg = svgRoot(root, W, H, { 'aria-label': 'Candidate tokens, the grammar mask, and the automaton state' });
     const say = narration(root);
     const st = stats(root, ['Step', 'Tokens masked', 'Model’s #1 allowed?', 'Output valid so far']);
@@ -230,6 +230,6 @@
       else say(chosen.tok === '<eos>' ? '<b>End of sequence</b> is only allowed once the automaton reaches ACCEPT.' : `Sample from the renormalized distribution → ${tokTxt}. The automaton advances. Note that tokens can span grammar boundaries (e.g. <code>",</code> closes the string <i>and</i> starts the next literal), so masks are computed at the <b>character</b> level.`);
     }
 
-    player(bar, root, { step, reset, render, interval: 1300, autoplay: true });
+    const pl = player(bar, root, { step, reset, render, interval: 1300, autoplay: true });
   });
 </script>

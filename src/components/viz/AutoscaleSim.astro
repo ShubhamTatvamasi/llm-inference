@@ -110,7 +110,7 @@
         kv: '<b>KV-cache usage</b> (with a 70% target) rises <i>before</i> requests start queueing, so it buys a head start equal to the headroom. It is usually the best single engine signal. Combine it with queue depth for safety.',
       };
       let extra = '';
-      if (minR === 0) extra = ' <b>Scale-to-zero</b>: the first morning users wait a full cold start. Fine for batch jobs, painful for a known daily rush.';
+      if (minR === 0) extra = ' <b>Scale-to-zero</b>: the day starts with no replica, so the first users wait a full cold start (the red block at 00:00). Fine for batch jobs, painful for a known daily rush.';
       else if (sched) extra = ' The <b>scheduled floor</b> pre-warms capacity before the 09:00 ramp, so violations drop at the cost of some idle GPU time.';
       say(msg[signal] + extra);
     }

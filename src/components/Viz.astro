@@ -2,6 +2,8 @@
 /**
  * Frame for every interactive diagram.
  * <Viz label="Live" title="KV cache growth"> <MyDiagram /> <Fragment slot="caption">…</Fragment></Viz>
+ * The ⤢ button opens the diagram full-screen (Esc to close): handy on phones (rotate to landscape)
+ * and for dense diagrams on laptops.
  */
 interface Props { label?: string; title: string; live?: boolean }
 const { label = 'Interactive', title, live = true } = Astro.props;
@@ -10,7 +12,20 @@ const { label = 'Interactive', title, live = true } = Astro.props;
   <div class="viz-head">
     <span class="viz-label">{live && <span class="live" />}{label}</span>
     <span class="viz-title">{title}</span>
+    <button class="viz-full-btn" type="button" data-viz-full aria-label={`Expand “${title}” to full screen`} title="Full screen (Esc to close)">
+      <svg class="ic-open" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10"/></svg>
+      <svg class="ic-close" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10h3.5M2.5 10H6v3.5"/></svg>
+    </button>
   </div>
   <div class="viz-body"><slot /></div>
   {Astro.slots.has('caption') && <figcaption class="viz-caption"><slot name="caption" /></figcaption>}
 </figure>
+<script>
+  const close = (f: Element) => { f.classList.remove('viz-full'); document.body.classList.remove('viz-full-open'); f.querySelector<HTMLElement>('[data-viz-full]')?.focus(); };
+  document.querySelectorAll<HTMLButtonElement>('[data-viz-full]').forEach((b) => b.addEventListener('click', () => {
+    const f = b.closest('.viz')!;
+    if (f.classList.contains('viz-full')) return close(f);
+    f.classList.add('viz-full'); document.body.classList.add('viz-full-open');
+  }));
+  addEventListener('keydown', (e) => { if (e.key === 'Escape') document.querySelectorAll('.viz.viz-full').forEach(close); });
+</script>

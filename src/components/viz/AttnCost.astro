@@ -16,7 +16,7 @@
     let lg = Math.log2(8192);
     const bar = ctrlBar(root);
     select(bar, 'Model', MODELS.filter((m) => m.attn !== 'MLA').map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
-    slider(bar, { label: 'Prompt length', min: LMIN, max: LMAX, step: 0.25, value: lg, format: (v) => fmt.num(Math.round(2 ** v), 0), onInput: (v) => { lg = v; render(); } });
+    slider(bar, { label: 'Prompt length', min: LMIN, max: LMAX, step: 0.25, value: lg, format: (v) => fmt.int(2 ** v), onInput: (v) => { lg = v; render(); } });
     const svg = svgRoot(root, W, H, { 'aria-label': 'Share of prefill FLOPs spent in attention versus prompt length' });
     legend(root, [['Linear layers (weights): grows like n', C.weight], ['Attention scores & mixing: grows like n²', C.compute]]);
     const st = stats(root, ['Prefill FLOPs', 'Attention share', 'Naive score matrix', 'Ideal prefill time (H100)']);
@@ -64,7 +64,7 @@
 
       const total = lin + att;
       const gpu = getGPU('h100');
-      st.set('Prefill FLOPs', fmt.num(total, 1), `${fmt.num(n, 0)} tokens, ${model.name}`);
+      st.set('Prefill FLOPs', fmt.num(total, 1), `${fmt.int(n)} tokens, ${model.name}`);
       st.set('Attention share', fmt.pct(share, 1), 'the rest is weight matmuls', C.compute);
       st.set('Naive score matrix', fmt.bytes(n * n * model.heads * 2), 'per layer, BF16, if materialised');
       st.set('Ideal prefill time (H100)', fmt.ms((total / (gpu.bf16TF * 1e12 * 0.6)) * 1000), 'at 60% of peak BF16');

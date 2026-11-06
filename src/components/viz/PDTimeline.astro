@@ -8,9 +8,10 @@
   import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, segmented, stats, narration, legend, C, fmt } from '../../lib/viz';
   import { getGPU, getModel } from '../../data/hardware';
 
-  const W = 940, H = 400, DECODE = 14;
+  const W = 940, H = 400;
   const fillStyle = (c: string) => ({ style: `fill:${c}` });
   const OUT = ['Paris', ' is', ' the', ' capital', ' of', ' France', '.', ' It', ' sits', ' on', ' the', ' Seine', '.', '⏎'];
+  const DECODE = OUT.length - 1; // prefill emits token 0, each decode pass one more
 
   mountAll('pd-timeline', (root) => {
     const model = getModel('llama3-8b');
@@ -82,7 +83,7 @@
 
       // user stream
       rect(svg, X0, SY, TW, 30, C.surface2, { rx: 8, stroke: C.border });
-      for (let i = 0; i < Math.min(DECODE, Math.max(0, shown - 1) + (shown >= 1 ? 1 : 0)); i++) {
+      for (let i = 0; i < Math.min(OUT.length, shown); i++) {
         // token i is emitted at end of pass i (prefill emits token 0)
         const x = tx(times[i]);
         s('circle', { cx: x, cy: SY + 15, r: 4.5, fill: C.token }, svg);

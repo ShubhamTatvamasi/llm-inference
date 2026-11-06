@@ -2,7 +2,9 @@
 import Base from './Base.astro';
 import Sidebar from '../components/Sidebar.astro';
 import { chapters, parts, chapterIndex } from '../data/chapters';
-import { chapterUrl } from '../lib/url';
+import { chapterUrl, u } from '../lib/url';
+import { connections } from '../data/graph';
+import { glossary } from '../data/glossary';
 
 interface Props {
   frontmatter?: { title?: string; description?: string };
@@ -19,6 +21,9 @@ const prev = chapters[idx - 1];
 const next = chapters[idx + 1];
 const num = String(idx + 1).padStart(2, '0');
 const toc = headings.filter((h) => h.depth === 2);
+const conn = connections(slug);
+// glossary terms for in-prose hover definitions; skip the ones this chapter itself teaches
+const gl = glossary.filter((g) => g.ch !== slug && g.hover !== false).map((g) => ({ t: g.term, a: g.aliases ?? [], d: g.def, h: chapterUrl(g.ch), c: chapters[chapterIndex(g.ch)]?.short ?? '' }));
 ---
 <Base title={frontmatter.title ?? ch.title} description={frontmatter.description ?? ch.blurb}>
   <div class="shell">
@@ -35,6 +40,24 @@ const toc = headings.filter((h) => h.depth === 2);
         </header>
         <slot />
       </article>
+
+      {(conn.before.length > 0 || conn.after.length > 0) && (
+        <section class="conn" aria-label="How this chapter connects">
+          {conn.before.length > 0 && (
+            <div class="conn-col">
+              <span class="conn-h pre">Builds on</span>
+              {conn.before.map((s) => <a href={chapterUrl(s)}><span class="cn">{String(chapterIndex(s) + 1).padStart(2, '0')}</span>{chapters[chapterIndex(s)].short}</a>)}
+            </div>
+          )}
+          {conn.after.length > 0 && (
+            <div class="conn-col">
+              <span class="conn-h post">Comes up again in</span>
+              {conn.after.map((s) => <a href={chapterUrl(s)}><span class="cn">{String(chapterIndex(s) + 1).padStart(2, '0')}</span>{chapters[chapterIndex(s)].short}</a>)}
+            </div>
+          )}
+          <a class="conn-map" href={u('map/')}>See it on the concept map →</a>
+        </section>
+      )}
 
       <nav class="pager" aria-label="Chapter navigation">
         {prev ? (
@@ -53,6 +76,74 @@ const toc = headings.filter((h) => h.depth === 2);
       </aside>
     )}
   </div>
+  <script is:inline type="application/json" id="gl-data" set:html={JSON.stringify(gl)} />
+  <div class="gl-pop" role="tooltip" id="gl-pop" hidden></div>
+  <script>
+    // Glossary: wrap the first mention of each term in the prose with a hover/tap definition.
+    type G = { t: string; a: string[]; d: string; h: string; c: string };
+    const terms: G[] = JSON.parse(document.getElementById('gl-data')?.textContent || '[]');
+    const prose = document.querySelector<HTMLElement>('.prose');
+    if (prose && terms.length) {
+      const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const forms: { re: RegExp; g: G }[] = [];
+      for (const g of terms) for (const f of [g.t, ...g.a]) {
+        const caps = f === f.toUpperCase() && /[A-Z]/.test(f);
+        forms.push({ re: new RegExp(`(^|[^\\w-])(${esc(f)})(?![\\w-])`, caps ? '' : 'i'), g });
+      }
+      forms.sort((x, y) => y.re.source.length - x.re.source.length); // prefer longer phrases
+      const SKIP = 'h1,h2,h3,h4,a,code,pre,kbd,.katex,.viz,.interview,summary,.chip,.gl,.conn,.ch-head,table th';
+      const done = new Set<G>();
+      const walker = document.createTreeWalker(prose, NodeFilter.SHOW_TEXT, {
+        acceptNode: (n) => (n.parentElement?.closest(SKIP) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+      });
+      const nodes: Text[] = [];
+      while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+      for (const node of nodes) {
+        let cur: Text | null = node;
+        while (cur && done.size < terms.length) {
+          let best: { i: number; len: number; g: G } | null = null;
+          for (const f of forms) {
+            if (done.has(f.g)) continue;
+            const m = f.re.exec(cur.data);
+            if (m) { const i = m.index + m[1].length; if (!best || i < best.i) best = { i, len: m[2].length, g: f.g }; }
+          }
+          if (!best) break;
+          const mid = cur.splitText(best.i); const rest = mid.splitText(best.len);
+          const el = document.createElement('span');
+          el.className = 'gl'; el.tabIndex = 0; el.dataset.gl = String(terms.indexOf(best.g));
+          el.setAttribute('aria-describedby', 'gl-pop');
+          el.textContent = mid.data; mid.replaceWith(el);
+          done.add(best.g); cur = rest;
+        }
+      }
+      const pop = document.getElementById('gl-pop')!;
+      let hideT = 0;
+      const show = (el: HTMLElement) => {
+        clearTimeout(hideT);
+        const g = terms[Number(el.dataset.gl)];
+        pop.innerHTML = `<b></b><p></p><a></a>`;
+        pop.querySelector('b')!.textContent = g.t;
+        pop.querySelector('p')!.textContent = g.d;
+        const a = pop.querySelector('a')!; a.href = g.h; a.textContent = `Learn more: ${g.c} →`;
+        pop.hidden = false;
+        const r = el.getBoundingClientRect(); const pw = Math.min(320, innerWidth - 24);
+        pop.style.width = pw + 'px';
+        pop.style.left = Math.max(12, Math.min(innerWidth - pw - 12, r.left + r.width / 2 - pw / 2)) + 'px';
+        const below = r.bottom + 8 + pop.offsetHeight < innerHeight;
+        pop.style.top = (below ? r.bottom + 8 : r.top - pop.offsetHeight - 8) + 'px';
+      };
+      const hide = () => { hideT = window.setTimeout(() => { pop.hidden = true; }, 160); };
+      prose.addEventListener('mouseover', (e) => { const el = (e.target as HTMLElement).closest<HTMLElement>('.gl'); if (el) show(el); });
+      prose.addEventListener('mouseout', (e) => { if ((e.target as HTMLElement).closest('.gl')) hide(); });
+      prose.addEventListener('focusin', (e) => { const el = (e.target as HTMLElement).closest<HTMLElement>('.gl'); if (el) show(el); });
+      prose.addEventListener('focusout', hide);
+      prose.addEventListener('click', (e) => { const el = (e.target as HTMLElement).closest<HTMLElement>('.gl'); if (el) { e.preventDefault(); show(el); } });
+      pop.addEventListener('mouseenter', () => clearTimeout(hideT));
+      pop.addEventListener('mouseleave', hide);
+      addEventListener('scroll', () => { pop.hidden = true; }, { passive: true });
+      addEventListener('keydown', (e) => { if (e.key === 'Escape') pop.hidden = true; });
+    }
+  </script>
   <script>
     // mark visited + highlight current heading in TOC
     const main = document.querySelector<HTMLElement>('[data-chapter]');
@@ -89,6 +180,20 @@ const toc = headings.filter((h) => h.depth === 2);
     .ch-part { color: var(--accent); font-weight: 600; padding: 3px 10px; border-radius: 999px; background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); }
     .ch-num { color: var(--text-faint); font-family: var(--font-mono); font-size: 0.72rem; }
     .ch-lede { font-size: 1.16rem; color: var(--text-dim) !important; line-height: 1.6; margin: 0 !important; max-width: 640px; }
+    :global(.gl) { text-decoration: underline dotted color-mix(in srgb, var(--accent) 70%, transparent); text-underline-offset: 3px; text-decoration-thickness: 1.5px; cursor: help; border-radius: 3px; }
+    :global(.gl:hover), :global(.gl:focus-visible) { background: var(--accent-soft); outline: none; }
+    .gl-pop { position: fixed; z-index: 80; padding: 11px 13px; border-radius: 12px; background: var(--surface-solid); border: 1px solid var(--border-strong); box-shadow: 0 18px 40px -12px rgba(0,0,0,0.45); font-size: 0.86rem; line-height: 1.5; }
+    .gl-pop :global(b) { display: block; color: var(--accent); font-size: 0.9rem; margin-bottom: 2px; }
+    .gl-pop :global(p) { margin: 0 0 6px; color: var(--text-dim); }
+    .gl-pop :global(a) { font-size: 0.8rem; }
+    .conn { max-width: var(--prose-w); margin: 3rem 0 0; display: flex; flex-wrap: wrap; gap: 14px 28px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); }
+    .conn-col { display: flex; flex-direction: column; gap: 3px; min-width: 200px; flex: 1; }
+    .conn-h { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.09em; font-weight: 650; margin-bottom: 4px; }
+    .conn-h.pre { color: var(--c-prefill); } .conn-h.post { color: var(--c-decode); }
+    .conn-col a { font-size: 0.9rem; color: var(--text-dim); display: flex; gap: 8px; align-items: baseline; }
+    .conn-col a:hover { color: var(--text); }
+    .conn .cn { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
+    .conn-map { flex-basis: 100%; font-size: 0.82rem; }
     .pager { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; max-width: var(--prose-w); margin: 3.5rem 0 0; }
     .pg { display: flex; flex-direction: column; gap: 4px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); transition: border-color 0.2s, transform 0.2s; }
     .pg:hover { border-color: var(--accent); transform: translateY(-2px); background-size: 0 0; }

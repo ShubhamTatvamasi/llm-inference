@@ -182,7 +182,7 @@
       }
     }
 
-    player(bar, root, { step, reset, render, interval: 1300, autoplay: true });
-    segmented(bar, [{ value: 'flash', label: 'FlashAttention' }, { value: 'naive', label: 'Naive' }], mode, (v) => { mode = v as typeof mode; reset(); render(); });
+    const p = player(bar, root, { step, reset, render, interval: 1300, autoplay: true });
+    segmented(bar, [{ value: 'flash', label: 'FlashAttention' }, { value: 'naive', label: 'Naive' }], mode, (v) => { mode = v as typeof mode; p.reset(); });
   });
 </script>

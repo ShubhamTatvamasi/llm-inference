@@ -1,0 +1,193 @@
+---
+import Page from '../layouts/Page.astro';
+import { chapters, parts } from '../data/chapters';
+import { edges } from '../data/graph';
+import { chapterUrl } from '../lib/url';
+
+const data = {
+  parts: parts.map((p) => ({ id: p.id, num: p.num, title: p.title })),
+  nodes: chapters.map((c, i) => ({ slug: c.slug, part: c.part, short: c.short, title: c.title, blurb: c.blurb, n: i + 1, href: chapterUrl(c.slug) })),
+  edges,
+};
+---
+<Page
+  title="Concept Map"
+  current="map"
+  eyebrow="How the ideas connect"
+  description="An interactive map of every chapter and the concepts each one builds on, derived from the cross-references between chapters."
+  lede="Every line is a real cross-reference between two chapters. Click a chapter to see what it builds on and what builds on it, or press <b>Path to here</b> to get the shortest reading list for that topic."
+>
+  <div class="cmap" data-cmap>
+    <div class="cm-bar">
+      <div class="cm-legend">
+        <span><i style="background:var(--c-prefill)"></i>builds on (earlier)</span>
+        <span><i style="background:var(--c-decode)"></i>used later by</span>
+        <span><i class="ring"></i>you have read it</span>
+      </div>
+      <span class="cm-hint">Tip: hover to preview, click to pin.</span>
+    </div>
+    <aside class="cm-card" data-cm-card aria-live="polite"></aside>
+    <div class="cm-scroll"><svg class="cm-svg" data-cm-svg role="img" aria-label="Concept map of chapters"></svg></div>
+  </div>
+  <script is:inline type="application/json" id="cmap-data" set:html={JSON.stringify(data)} />
+
+  <script>
+    import { s, h, clear } from '../lib/viz';
+    type N = { slug: string; part: string; short: string; title: string; blurb: string; n: number; href: string };
+    const D = JSON.parse(document.getElementById('cmap-data')!.textContent!) as { parts: { id: string; num: string; title: string }[]; nodes: N[]; edges: { from: string; to: string; weight: number }[] };
+    const svg = document.querySelector<SVGSVGElement>('[data-cm-svg]')!;
+    const card = document.querySelector<HTMLElement>('[data-cm-card]')!;
+
+    const COLW = 152, NW = 132, NH = 46, GAP = 18, TOP = 56, LEFT = 10;
+    const maxRows = Math.max(...D.parts.map((p) => D.nodes.filter((n) => n.part === p.id).length));
+    const W = LEFT * 2 + COLW * D.parts.length - (COLW - NW), H = TOP + maxRows * (NH + GAP) + 10;
+    svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+    const pos = new Map<string, { x: number; y: number }>();
+    D.parts.forEach((p, ci) => D.nodes.filter((n) => n.part === p.id).forEach((n, ri) => pos.set(n.slug, { x: LEFT + ci * COLW, y: TOP + ri * (NH + GAP) })));
+    const idx = new Map(D.nodes.map((n) => [n.slug, n.n]));
+    const neigh = new Map<string, Set<string>>();
+    for (const e of D.edges) { (neigh.get(e.from) ?? neigh.set(e.from, new Set()).get(e.from)!).add(e.to); (neigh.get(e.to) ?? neigh.set(e.to, new Set()).get(e.to)!).add(e.from); }
+    let seen = new Set<string>();
+    try { seen = new Set(JSON.parse(localStorage.getItem('tbt-visited') || '[]')); } catch {}
+
+    // A chapter linking BACK to an earlier one is an explicit prerequisite; a forward reference
+    // ("covered later in…") is not. The reading path follows only backward links, two hops deep.
+    const backRefs = new Map<string, string[]>();
+    for (const e of D.edges) if (idx.get(e.to)! < idx.get(e.from)!) (backRefs.get(e.from) ?? backRefs.set(e.from, []).get(e.from)!).push(e.to);
+    function pathTo(slug: string) {
+      const out = new Set<string>(backRefs.get(slug) ?? []);
+      for (const p of [...out]) for (const q of backRefs.get(p) ?? []) out.add(q);
+      return [...out].sort((a, b) => idx.get(a)! - idx.get(b)!);
+    }
+
+    let pinned: string | null = null; let pathMode = false;
+
+    function edgePath(a: string, b: string) {
+      const p = pos.get(a)!, q = pos.get(b)!;
+      const ay = p.y + NH / 2, by = q.y + NH / 2;
+      if (p.x === q.x) { // same column: bow out to the right
+        const x = p.x + NW; const bow = 26 + Math.abs(ay - by) * 0.15;
+        return `M${x},${ay} C${x + bow},${ay} ${x + bow},${by} ${x},${by}`;
+      }
+      const [l, r] = p.x < q.x ? [{ x: p.x + NW, y: ay }, { x: q.x, y: by }] : [{ x: q.x + NW, y: by }, { x: p.x, y: ay }];
+      const dx = (r.x - l.x) * 0.5;
+      return `M${l.x},${l.y} C${l.x + dx},${l.y} ${r.x - dx},${r.y} ${r.x},${r.y}`;
+    }
+
+    // Build the DOM once; hover/click only toggle classes (rebuilding under the cursor flickers).
+    clear(svg);
+    D.parts.forEach((p, ci) => {
+      const x = LEFT + ci * COLW;
+      s('text', { x, y: 18, text: `PART ${p.num}`, class: 'cm-pn' }, svg);
+      s('text', { x, y: 36, text: p.title.length > 22 ? p.title.slice(0, 21) + '…' : p.title, class: 'cm-pt' }, svg);
+    });
+    const eg = s('g', {}, svg);
+    const edgeEls = D.edges.map((e) => ({ e, el: s('path', { d: edgePath(e.from, e.to), class: 'cm-e', 'stroke-width': Math.min(3.2, 0.8 + e.weight * 0.45) }, eg) }));
+    const nodeEls = D.nodes.map((n) => {
+      const p = pos.get(n.slug)!;
+      const g = s('g', { class: 'cm-n', tabindex: 0, role: 'button', 'aria-label': `${n.n}. ${n.title}` }, svg);
+      s('rect', { x: p.x, y: p.y, width: NW, height: NH, rx: 10 }, g);
+      s('text', { x: p.x + 10, y: p.y + 17, text: String(n.n).padStart(2, '0'), class: 'cm-num' }, g);
+      s('text', { x: p.x + 10, y: p.y + 34, text: n.short.length > 19 ? n.short.slice(0, 18) + '…' : n.short, class: 'cm-label' }, g);
+      const step = s('text', { x: p.x + NW - 10, y: p.y + 17, class: 'cm-step', 'text-anchor': 'end' }, g);
+      if (seen.has(n.slug)) s('circle', { cx: p.x + NW - 9, cy: p.y + NH - 10, r: 3.5, class: 'cm-seen' }, g);
+      g.addEventListener('mouseenter', () => { if (!pinned) { render(n.slug); showCard(n.slug); } });
+      g.addEventListener('mouseleave', () => { if (!pinned) { render(null); showCard(null); } });
+      g.addEventListener('click', () => { pinned = pinned === n.slug ? null : n.slug; pathMode = false; render(pinned); showCard(pinned); });
+      g.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); g.dispatchEvent(new Event('click')); } });
+      return { n, g, step };
+    });
+
+    function render(focus: string | null) {
+      const pathList = focus && pathMode ? pathTo(focus) : null;
+      const path = pathList ? new Set(pathList) : null;
+      for (const { e, el } of edgeEls) {
+        const touches = !!focus && (e.from === focus || e.to === focus);
+        const other = e.from === focus ? e.to : e.from;
+        const earlier = touches && idx.get(other)! < idx.get(focus!)!;
+        const inPath = path && (path.has(e.from) || e.from === focus) && (path.has(e.to) || e.to === focus);
+        el.setAttribute('class', path ? (inPath ? 'cm-e on pre' : 'cm-e dim') : focus ? (touches ? `cm-e on ${earlier ? 'pre' : 'post'}` : 'cm-e dim') : 'cm-e');
+      }
+      for (const { n, g, step } of nodeEls) {
+        const near = focus ? neigh.get(focus)?.has(n.slug) : false;
+        const state = !focus ? '' : n.slug === focus ? 'focus' : path ? (path.has(n.slug) ? 'pre' : 'dim') : near ? (idx.get(n.slug)! < idx.get(focus)! ? 'pre' : 'post') : 'dim';
+        g.setAttribute('class', `cm-n ${state}`);
+        step.textContent = pathList && path!.has(n.slug) ? `#${pathList.indexOf(n.slug) + 1}` : '';
+      }
+    }
+
+    function showCard(slug: string | null) {
+      card.innerHTML = '';
+      if (!slug) { h('p', { class: 'cm-empty', html: 'Hover or click a chapter. Lines to <b style="color:var(--c-prefill)">earlier</b> chapters show what it builds on; lines to <b style="color:var(--c-decode)">later</b> ones show where it comes up again.' }, card); return; }
+      const n = D.nodes.find((x) => x.slug === slug)!;
+      const nb = [...(neigh.get(slug) ?? [])].sort((a, b) => idx.get(a)! - idx.get(b)!);
+      const before = nb.filter((x) => idx.get(x)! < n.n), after = nb.filter((x) => idx.get(x)! > n.n);
+      const intro = h('div', { class: 'cm-intro' }, card);
+      h('div', { class: 'cm-cn', text: `Chapter ${String(n.n).padStart(2, '0')}` }, intro);
+      h('h3', { text: n.title }, intro);
+      h('p', { text: n.blurb }, intro);
+      const list = (label: string, xs: string[], cls: string) => {
+        if (!xs.length) return;
+        const d = h('div', { class: 'cm-list' }, card);
+        h('b', { class: cls, text: label }, d);
+        xs.forEach((x) => { const m = D.nodes.find((y) => y.slug === x)!; h('a', { href: m.href, text: `${String(m.n).padStart(2, '0')} ${m.short}` }, d); });
+      };
+      const path = pathMode ? pathTo(slug) : [];
+      if (pathMode) list(`Read first (${path.length}):`, path, 'pre');
+      else { list('Builds on', before, 'pre'); list('Comes up again in', after, 'post'); }
+      const act = h('div', { class: 'cm-act' }, intro);
+      h('a', { class: 'btn primary', href: n.href, text: 'Open chapter →' }, act);
+      if (pinned === slug) {
+        const b = h('button', { class: 'btn', type: 'button', text: pathMode ? 'Show direct links' : 'Path to here' }, act);
+        b.addEventListener('click', () => { pathMode = !pathMode; render(slug); showCard(slug); });
+      }
+    }
+
+    render(null); showCard(null);
+    addEventListener('keydown', (e) => { if (e.key === 'Escape' && pinned) { pinned = null; pathMode = false; render(null); showCard(null); } });
+  </script>
+
+  <style>
+    .cmap { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+    .cm-bar { grid-column: 1 / -1; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; font-size: 0.8rem; color: var(--text-dim); }
+    .cm-legend { display: flex; gap: 16px; flex-wrap: wrap; }
+    .cm-legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .cm-legend i { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+    .cm-legend i.ring { width: 8px; height: 8px; border-radius: 50%; background: var(--c-kv); }
+    .cm-hint { color: var(--text-faint); }
+    .cm-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); padding: 14px; }
+    .cm-svg { display: block; width: 100%; min-width: 900px; height: auto; font-family: var(--font-sans); overflow: visible; }
+    .cm-svg :global(.cm-pn) { font-family: var(--font-mono); font-size: 10px; fill: var(--accent); letter-spacing: 0.1em; }
+    .cm-svg :global(.cm-pt) { font-size: 11px; font-weight: 650; fill: var(--text-dim); }
+    .cm-svg :global(.cm-e) { fill: none; stroke: var(--border-strong); transition: stroke 0.2s, opacity 0.2s; }
+    .cm-svg :global(.cm-e.dim) { opacity: 0.12; }
+    .cm-svg :global(.cm-e.on.pre) { stroke: var(--c-prefill); opacity: 0.95; }
+    .cm-svg :global(.cm-e.on.post) { stroke: var(--c-decode); opacity: 0.95; }
+    .cm-svg :global(.cm-n) { cursor: pointer; outline: none; }
+    .cm-svg :global(.cm-n rect) { fill: var(--surface-2); stroke: var(--border-strong); transition: all 0.2s; }
+    .cm-svg :global(.cm-n:hover rect), .cm-svg :global(.cm-n:focus-visible rect) { stroke: var(--accent); }
+    .cm-svg :global(.cm-n.focus rect) { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+    .cm-svg :global(.cm-n.pre rect) { stroke: var(--c-prefill); fill: var(--c-prefill-soft); }
+    .cm-svg :global(.cm-n.post rect) { stroke: var(--c-decode); fill: var(--c-decode-soft); }
+    .cm-svg :global(.cm-n.dim) { opacity: 0.35; }
+    .cm-svg :global(.cm-num) { font-family: var(--font-mono); font-size: 10px; fill: var(--text-faint); }
+    .cm-svg :global(.cm-label) { font-size: 12.5px; font-weight: 600; fill: var(--text); }
+    .cm-svg :global(.cm-step) { font-family: var(--font-mono); font-size: 10px; font-weight: 700; fill: var(--c-prefill); }
+    .cm-svg :global(.cm-seen) { fill: var(--c-kv); }
+    .cm-card { border: 1px solid var(--border); border-radius: 16px; background: var(--surface); padding: 14px 16px; font-size: 0.9rem; height: 186px; overflow-y: auto; /* fixed: the map must not shift under the cursor */ display: flex; flex-wrap: wrap; gap: 6px 28px; align-items: flex-start; }
+    .cm-card :global(.cm-intro) { flex: 1 1 280px; min-width: 0; }
+    .cm-card :global(h3) { margin: 2px 0 6px; font-size: 1.1rem; letter-spacing: -0.015em; }
+    .cm-card :global(p) { margin: 0 0 10px; color: var(--text-dim); line-height: 1.5; }
+    .cm-card :global(.cm-cn) { font-family: var(--font-mono); font-size: 0.72rem; color: var(--accent); }
+    .cm-card :global(.cm-list) { display: flex; flex-direction: column; gap: 2px; margin: 2px 0; flex: 0 1 220px; }
+    .cm-card :global(.cm-list b) { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 2px; }
+    .cm-card :global(.cm-list b.pre) { color: var(--c-prefill); }
+    .cm-card :global(.cm-list b.post) { color: var(--c-decode); }
+    .cm-card :global(.cm-list a) { font-size: 0.86rem; }
+    .cm-card :global(.cm-act) { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .cm-card :global(a.btn) { background-size: auto; }
+    .cm-card :global(a.btn.primary) { color: #fff; }
+    .cm-card :global(.cm-empty) { color: var(--text-faint); }
+  </style>
+</Page>

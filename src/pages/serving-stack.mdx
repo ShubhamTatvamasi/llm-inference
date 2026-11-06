@@ -76,7 +76,9 @@ metadata:
   name: llama-70b
 spec:
   replicas: 2
+  selector: { matchLabels: { app: llama-70b } }
   template:
+    metadata: { labels: { app: llama-70b } }
     spec:
       nodeSelector: { nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3 }
       containers:
@@ -94,6 +96,9 @@ spec:
           startupProbe:   { httpGet: { path: /health, port: 8000 }, periodSeconds: 10, failureThreshold: 90 }
           readinessProbe: { httpGet: { path: /health, port: 8000 }, periodSeconds: 5 }
           livenessProbe:  { httpGet: { path: /health, port: 8000 }, periodSeconds: 15, failureThreshold: 6 }
+      volumes:
+        - { name: weights, persistentVolumeClaim: { claimName: llama-70b-weights } }
+        - { name: shm, emptyDir: { medium: Memory, sizeLimit: 16Gi } }
 ```
 
 What makes cold starts slow, and what makes them fast:

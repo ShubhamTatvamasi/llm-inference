@@ -92,7 +92,7 @@
       st.set('Extra memory', '≈ +1%', 'vs 3 extra full model copies', C.good);
 
       const msgs = [
-        'Six requests from different tenants share one batch. Four of them want a fine-tuned <b>adapter</b> (A, B or C), and one wants the plain base model.',
+        'Six requests from different tenants share one batch. Five of them want a fine-tuned <b>adapter</b> (A, B or C), and one wants the plain base model.',
         '<b>Base GEMM:</b> every row multiplies the same frozen <b>W</b>. This is the expensive part, and it is shared, so batching works as usual.',
         '<b>Shrink:</b> one batched kernel gathers each row’s own <b>Aᵢ</b> (d → r, tiny) by adapter index. Rows with the same adapter are grouped into segments.',
         '<b>Expand:</b> a second gather kernel applies each row’s <b>Bᵢ</b> (r → d), producing a per-row delta Δy.',

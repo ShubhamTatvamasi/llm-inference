@@ -123,7 +123,7 @@
       else say(mode === 'graph' ? `Done in <b>${sc.end.toFixed(0)} µs</b>, about ${(schedule('eager').end / sc.end).toFixed(1)}× faster than eager, with the same kernels doing the same math.` : `Done in <b>${sc.end.toFixed(0)} µs</b>. The GPU was busy only <b>${fmt.pct(sc.busy / sc.end)}</b> of the time.`);
     }
 
-    player(bar, root, { step, reset, render, interval: 220, autoplay: true });
-    segmented(bar, [{ value: 'eager', label: 'Eager' }, { value: 'fused', label: 'Fused' }, { value: 'graph', label: 'CUDA graph' }], mode, (v) => { mode = v as typeof mode; reset(); render(); });
+    const p = player(bar, root, { step, reset, render, interval: 220, autoplay: true });
+    segmented(bar, [{ value: 'eager', label: 'Eager' }, { value: 'fused', label: 'Fused' }, { value: 'graph', label: 'CUDA graph' }], mode, (v) => { mode = v as typeof mode; p.reset(); });
   });
 </script>

@@ -89,7 +89,7 @@
 
       const at = attain(dAI);
       st.set('Ridge point', `${fmt.int(ridge())} FLOP/B`, `${fmt.int(peak())} TFLOPS ÷ ${gpu.bwTBs} TB/s`);
-      st.set('Decode GEMM intensity', `${dAI.toFixed(dAI < 10 ? 1 : 0)} FLOP/B`, `batch ${b}, ${prec === 'fp8' ? 'FP8' : 'BF16'} weights`, C.decode);
+      st.set('Decode GEMM intensity', `${dAI.toFixed(dAI < 10 ? 1 : 0)} FLOP/B`, `batch ${b}, ${bpp() === 1 ? 'FP8' : 'BF16'} weights`, C.decode);
       st.set('Attainable', `${fmt.num(at, at < 10 ? 1 : 0)} TFLOPS`, `${fmt.pct(at / peak(), at / peak() < 0.1 ? 1 : 0)} of peak`);
       st.set('Bound by', dAI < ridge() ? 'memory' : 'compute', dAI < ridge() ? `need batch ≈ ${fmt.int(ridge() * bpp() / 2)} to reach the ridge` : 'tensor cores saturated', dAI < ridge() ? C.weight : C.compute);
     }

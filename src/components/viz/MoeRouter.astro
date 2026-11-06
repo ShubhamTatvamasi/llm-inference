@@ -111,8 +111,7 @@
       st.set('Busiest / idlest expert', idx >= 0 ? `${sorted[0]} / ${sorted[E - 1]}` : '–', 'tokens so far', sorted[0] > 2 * (sorted[E - 1] + 1) ? C.waste : undefined);
       if (idx < 0) say('Press <b>Play</b>. Each token is scored by a tiny <b>router</b> (one linear layer), which picks the top-k experts for it.');
       else {
-        const [a, b] = chosen;
-        say(`“<b>${TOKENS[idx]}</b>” → E${a}${b !== undefined ? ` and E${b}` : ''}. Their outputs are mixed with the renormalised gate weights${b !== undefined ? ` (${(p[a] / sel).toFixed(2)} / ${(p[b] / sel).toFixed(2)})` : ''}. The other ${E - k} experts do <b>no work</b> for this token, but their weights still sit in GPU memory.`);
+        say(`“<b>${TOKENS[idx]}</b>” → ${chosen.map((e) => `E${e}`).join(', ')}. ${k > 1 ? `Their outputs are mixed with the renormalised gate weights (${chosen.map((e) => (p[e] / sel).toFixed(2)).join(' / ')}).` : 'With top-1 the single expert gets weight 1.00.'} The other ${E - k} experts do <b>no work</b> for this token, but their weights still sit in GPU memory.`);
       }
     }
 

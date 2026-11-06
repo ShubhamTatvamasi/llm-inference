@@ -80,7 +80,8 @@
         const ox = Math.min(bx, x);
         const ow = Math.min(sx(over), X + BW - ox + 0);
         rect(svg, ox, Y + BH + 30, Math.max(ow, 4), 14, hatch, { stroke: C.waste, rx: 3 });
-        text(svg, ox + Math.max(ow, 4) + 8, Y + BH + 37, !fitsWeights ? `weights don't fit: short by ${fmt.num(over / 1e9, 1)} GB` : `over by ${fmt.num(over / 1e9, 1)} GB → requests queue or get preempted`, { class: 't-small t-bold', fill: C.waste });
+        const flip = ox + Math.max(ow, 4) + 8 > X + BW - 300; // keep the warning inside the viewBox
+        text(svg, flip ? ox - 8 : ox + Math.max(ow, 4) + 8, Y + BH + 37, !fitsWeights ? `weights don't fit: short by ${fmt.num(over / 1e9, 1)} GB` : `over by ${fmt.num(over / 1e9, 1)} GB → requests queue or get preempted`, { class: 't-small t-bold', fill: C.waste, 'text-anchor': flip ? 'end' : 'start' });
       } else {
         text(svg, X, Y + BH + 37, `✓ fits — ${fmt.pct(kvUsed / Math.max(kvAvail, 1))} of KV capacity in use`, { class: 't-small t-bold', fill: C.good });
       }

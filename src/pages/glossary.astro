@@ -1,0 +1,69 @@
+---
+import Page from '../layouts/Page.astro';
+import { glossary, termId } from '../data/glossary';
+import { chapters, parts, chapterIndex } from '../data/chapters';
+import { chapterUrl } from '../lib/url';
+const groups = parts.map((p) => ({
+  p,
+  terms: glossary
+    .filter((g) => chapters[chapterIndex(g.ch)]?.part === p.id)
+    .sort((a, b) => chapterIndex(a.ch) - chapterIndex(b.ch)),
+})).filter((g) => g.terms.length);
+---
+<Page
+  title="Glossary"
+  current="glossary"
+  eyebrow={`${glossary.length} terms`}
+  description="Short, precise definitions of the terms used across LLM inference and serving, each linked to the chapter that explains it."
+  lede="Short definitions, each linked to the chapter that teaches the idea. Inside chapters, terms with a dotted underline show the same definition on hover or tap."
+>
+  <input class="text-input gl-search" type="search" placeholder="Filter terms: try “kv”, “latency”, “parallel”…" data-gl-filter aria-label="Filter glossary terms" />
+  <div class="gl-groups">
+    {groups.map(({ p, terms }) => (
+      <section class="gl-group" data-gl-group>
+        <h2><span>Part {p.num}</span>{p.title}</h2>
+        <dl>
+          {terms.map((g) => (
+            <div class="gl-item" id={termId(g.term)} data-gl-item data-hay={`${g.term} ${(g.aliases ?? []).join(' ')} ${g.def}`.toLowerCase()}>
+              <dt>{g.term}{g.aliases?.length ? <small> · {g.aliases.join(', ')}</small> : null}</dt>
+              <dd>{g.def} <a href={chapterUrl(g.ch)}>{chapters[chapterIndex(g.ch)].short} →</a></dd>
+            </div>
+          ))}
+        </dl>
+      </section>
+    ))}
+  </div>
+  <p class="gl-none" data-gl-none hidden>No terms match.</p>
+  <script>
+    const input = document.querySelector<HTMLInputElement>('[data-gl-filter]')!;
+    const items = [...document.querySelectorAll<HTMLElement>('[data-gl-item]')];
+    const groups = [...document.querySelectorAll<HTMLElement>('[data-gl-group]')];
+    const none = document.querySelector<HTMLElement>('[data-gl-none]')!;
+    input.addEventListener('input', () => {
+      const q = input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      let any = false;
+      items.forEach((it) => { const ok = q.every((t) => it.dataset.hay!.includes(t)); it.hidden = !ok; any ||= ok; });
+      groups.forEach((g) => { g.hidden = !g.querySelector('[data-gl-item]:not([hidden])'); });
+      none.hidden = any;
+    });
+    if (location.hash) document.querySelector(location.hash)?.classList.add('hit');
+  </script>
+  <style>
+    .gl-search { max-width: 520px; margin-bottom: 8px; }
+    .gl-groups { columns: 2 420px; column-gap: 28px; }
+    .gl-group { break-inside: avoid-column; margin-top: 26px; }
+    .gl-group[hidden] { display: none; }
+    h2 { font-size: 1.05rem; margin: 0 0 8px; letter-spacing: -0.01em; display: flex; gap: 10px; align-items: baseline; }
+    h2 span { font-family: var(--font-mono); font-size: 0.7rem; color: var(--accent); letter-spacing: 0.08em; text-transform: uppercase; }
+    dl { margin: 0; }
+    .gl-item { break-inside: avoid; padding: 10px 12px; border-radius: 10px; border: 1px solid transparent; scroll-margin-top: calc(var(--header-h) + 20px); }
+    .gl-item:hover { background: var(--surface); border-color: var(--border); }
+    .gl-item:global(.hit), .gl-item:target { border-color: var(--accent); background: var(--accent-soft); }
+    .gl-item[hidden] { display: none; }
+    dt { font-weight: 650; }
+    dt small { font-weight: 450; color: var(--text-faint); font-size: 0.8rem; }
+    dd { margin: 2px 0 0; color: var(--text-dim); font-size: 0.92rem; line-height: 1.55; }
+    dd a { font-size: 0.82rem; white-space: nowrap; }
+    .gl-none { color: var(--text-faint); }
+  </style>
+</Page>

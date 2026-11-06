@@ -45,7 +45,7 @@
       line(svg, X0, 40, X1, 40, C.border);
       for (let t = 0; t <= TMAX; t += 200) {
         line(svg, sx(t), 36, sx(t), 44, C.borderStrong);
-        text(svg, sx(t), 26, `${t} ms`, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+        text(svg, sx(t), 26, `${t} ms`, { 'text-anchor': t === TMAX ? 'end' : 'middle', class: 't-small t-faint t-mono' });
       }
       text(svg, 8, 40, 'time →', { class: 't-small t-faint' });
 

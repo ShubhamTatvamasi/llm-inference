@@ -45,7 +45,7 @@ Each iteration, a typical scheduler:
 
 When a sequence is preempted, its KV cache has to go somewhere:
 
-- **Recompute**: drop it. When the request is rescheduled, the engine runs prefill again over prompt + tokens generated so far. This costs **compute**, but prefill is fast and parallel. It needs no extra memory or PCIe traffic. Modern vLLM defaults to recompute.
+- **Recompute**: drop it. When the request is rescheduled, the engine runs prefill again over prompt + tokens generated so far. This costs **compute**, but prefill is fast and parallel. It needs no extra memory or PCIe traffic. vLLM V1 supports only recompute (the V0 swap mode was removed); CPU-side KV now comes through the offload tiers described below.
 - **Swap**: copy the blocks to **CPU memory** and copy them back later. This costs **PCIe bandwidth** and CPU RAM in both directions, but does no recomputation. It is useful for very long sequences, where recomputation is expensive.
 
 <Callout type="warn" title="Preemption is a symptom">

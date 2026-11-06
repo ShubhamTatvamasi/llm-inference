@@ -39,7 +39,7 @@
       const tNaive = Math.max(flops / peak, naiveBytes / bw);
       const tFlash = Math.max(flops / peak, flashBytes / bw);
 
-      const LX = 190, BW = W - LX - 130;
+      const LX = 190, BW = W - LX - 150;
       const lo = 6, hi = 13; // 1 MB … 10 TB (log)
       const xs = (b: number) => LX + Math.max(0, Math.min(1, (Math.log10(Math.max(b, 1)) - lo) / (hi - lo))) * BW;
       const row = (y: number, label: string, sub: string, a: number, b: number, unit: (v: number) => string) => {

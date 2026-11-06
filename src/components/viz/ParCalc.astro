@@ -24,7 +24,7 @@
     select(b2, 'TP', [1, 2, 4, 8].map((n) => ({ value: String(n), label: String(n) })), String(tp), (v) => { tp = Number(v); render(); });
     select(b2, 'PP', [1, 2, 4, 8].map((n) => ({ value: String(n), label: String(n) })), String(pp), (v) => { pp = Number(v); render(); });
     select(b2, 'TP link', [
-      { value: 'auto', label: 'GPU interconnect (NVLink / IF)' },
+      { value: 'auto', label: 'GPU interconnect (NVLink / IF, per direction)' },
       { value: 'pcie', label: 'PCIe Gen5 (~50 GB/s)' },
       { value: 'ib', label: 'Network 400 Gb/s (~50 GB/s)' },
       { value: 'eth', label: 'Ethernet 100 Gb/s (~12 GB/s)' },
@@ -60,10 +60,12 @@
       const activeW = model.activeParams * wBytes;
       const touched = model.experts ? 1 - Math.pow(1 - model.experts.active / model.experts.total, batch) : 1;
       const wRead = activeW + (wTotal - activeW) * touched;
-      const kvRead = batch * ctx * (model.attn === 'MLA' && model.mlaDim ? model.layers * model.mlaDim * 2 : 2 * model.layers * model.kvHeads * model.headDim * 2);
-      const tMem = (wRead / tp + kvRead / tp) / bw;
+      // per GPU, summed over the PP stages a token passes through; KV heads replicated when TP > KV heads (MLA latent on every rank)
+      const kvReadGpu = batch * ctx * kvTokPer * pp;
+      const tMem = (wRead / tp + kvReadGpu) / bw;
       // comm: 2 all-reduces / layer, message = batch × hidden × 2 bytes; ring sends 2(n-1)/n × msg; plus per-hop latency
-      const linkGBs = link === 'auto' ? gpu.linkGBs : link === 'pcie' ? 50 : link === 'ib' ? 50 : 12.5;
+      // ring all-reduce is limited by per-direction bandwidth; NVLink / Infinity Fabric specs are both directions summed
+      const linkGBs = link === 'auto' ? (gpu.linkGBs >= 100 ? gpu.linkGBs / 2 : gpu.linkGBs) : link === 'pcie' ? 50 : link === 'ib' ? 50 : 12.5;
       // fixed latency per collective (kernel launch + sync + hops), rough
       const alpha = link === 'auto' ? 6e-6 : link === 'pcie' ? 20e-6 : link === 'ib' ? 30e-6 : 50e-6;
       const msg = batch * model.hidden * 2;

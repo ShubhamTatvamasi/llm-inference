@@ -99,7 +99,7 @@ Verifying *k* draft tokens in one pass multiplies the decode matmul's intensity 
   <Q q="Why doesn't batching improve the arithmetic intensity of decode attention?" level="mid">
     Weights are shared across sequences, but KV caches are not. Doubling the batch doubles the attention FLOPs **and** doubles the KV bytes read, so the ratio stays fixed at about 2·(query heads per KV head) ÷ bytes per element. Only shrinking KV (GQA, MLA, quantization) or reusing it (for example, shared prefixes in some kernels) moves it.
   </Q>
-  <Q q="FP8 doubles both the FLOPs and the bytes saved. What happens to the ridge, and to decode?" level="mid">
+  <Q q="FP8 doubles peak FLOPs and halves the bytes per weight. What happens to the ridge, and to decode?" level="mid">
     FP8 tensor-core peak is about 2× BF16, so the **ridge doubles** (H100 ≈ 590 FLOP/B). But FP8 weights are half the bytes, so the decode matmul's intensity also doubles (≈ 2b). Decode still gets a large real speedup: it reads half as many bytes per step, and in the memory-bound regime bytes are what count.
   </Q>
   <Q q="Your kernel benchmark shows 40% of peak FLOPs on a decode workload. Is that good or bad?" level="senior">

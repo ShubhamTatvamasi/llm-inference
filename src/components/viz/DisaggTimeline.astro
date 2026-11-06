@@ -153,7 +153,7 @@
       panel(A, 14, topMode === 'plain' ? 'Colocated: 2 GPUs, each does prefill + decode' : 'Colocated + chunked prefill (512-token chunks)');
       panel(B, 206, 'Disaggregated: 1 prefill GPU → KV → 1 decode GPU');
       // axis
-      for (let t = 0; t <= T_END; t += 400) text(svg, sx(t), H - 6, `${t} ms`, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      for (let t = 0; t <= T_END; t += 400) text(svg, sx(t), H - 6, `${t} ms`, { 'text-anchor': t === T_END ? 'end' : 'middle', class: 't-small t-faint t-mono' });
       s('line', { x1: sx(now), y1: 20, x2: sx(now), y2: H - 18, stroke: C.accent, 'stroke-width': 1.5, opacity: 0.8 }, svg);
     }
 

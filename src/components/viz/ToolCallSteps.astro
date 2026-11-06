@@ -148,7 +148,7 @@
       text(svg, 10, yb, k >= 5 ? 'Next request (same session): what the engine prefills' : 'Next request: (after step 6)', { class: 't-small t-bold', fill: k >= 5 ? C.text : C.faint });
       if (k >= 5) {
         const parts: [string, number, string][] = [
-          ['system + tools', 260, C.kv], ['user', 70, C.kv], [reasoning ? 'asst: tool_calls (+ think?*)' : 'asst: tool_calls', 230, C.kv],
+          ['system + tools', 240, C.kv], ['user', 70, C.kv], [reasoning ? 'asst: tool_calls (+ think?*)' : 'asst: tool_calls', 210, C.kv],
           ['tool results', 150, C.prefill], ['asst header', 70, C.prefill],
         ];
         let x = 10;

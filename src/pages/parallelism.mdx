@@ -52,7 +52,7 @@ Decode is [memory-bandwidth-bound](../roofline/). With TP = 4, each GPU reads on
 
 ### Why TP stays inside one node
 
-A 70B model has 80 layers, so each decode step performs **160 all-reduces**. Each message is small: batch × hidden × 2 bytes, about 0.5 MB for a batch of 32. So the cost is dominated by **latency per collective**, not bandwidth. Inside a node, NVLink or NVSwitch gives roughly 900 GB/s and microsecond latency. Across nodes, even a fast 400 Gb/s network is about 18× less bandwidth with much higher latency. Hence the standard layout: **TP inside a node, PP (or DP) across nodes.**
+A 70B model has 80 layers, so each decode step performs **160 all-reduces**. Each message is small: batch × hidden × 2 bytes, about 0.5 MB for a batch of 32. So the cost is dominated by **latency per collective**, not bandwidth. Inside a node, NVLink or NVSwitch gives roughly 900 GB/s on H100 (450 GB/s each way) and microsecond latency. Across nodes, even a fast 400 Gb/s network (50 GB/s each way) is about 9× less bandwidth with much higher latency. Hence the standard layout: **TP inside a node, PP (or DP) across nodes.**
 
 There is a second constraint: TP must divide the number of attention heads, and ideally the number of KV heads. Llama 3.1 has 8 KV heads, so with TP = 16 the KV heads would have to be **replicated**, wasting KV memory.
 

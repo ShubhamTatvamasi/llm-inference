@@ -4,6 +4,7 @@ import '@fontsource-variable/geist-mono';
 import 'katex/dist/katex.min.css';
 import '../styles/global.css';
 import { chapters, parts } from '../data/chapters';
+import { glossary, termId } from '../data/glossary';
 import { u, chapterUrl } from '../lib/url';
 
 interface Props { title?: string; description?: string; wide?: boolean }
@@ -11,10 +12,16 @@ const SITE = 'Token by Token';
 const { title, description = 'LLM inference and serving, visualized: interactive, technical diagrams of every stage of an LLM request — from tokenization to GPU kernels to production serving.' } = Astro.props;
 const fullTitle = title ? `${title} · ${SITE}` : `${SITE} — LLM inference & serving, visualized`;
 const canonical = new URL(Astro.url.pathname, Astro.site);
-const searchIndex = chapters.map((c, i) => ({
-  n: String(i + 1).padStart(2, '0'), t: c.title, s: c.short, b: c.blurb,
-  p: parts.find((p) => p.id === c.part)!.title, h: chapterUrl(c.slug),
-}));
+const searchIndex = [
+  ...chapters.map((c, i) => ({
+    n: String(i + 1).padStart(2, '0'), t: c.title, s: c.short, b: c.blurb,
+    p: parts.find((p) => p.id === c.part)!.title, h: chapterUrl(c.slug),
+  })),
+  { n: '◆', t: 'Inference Lab', s: 'lab playground simulator calculator', b: 'Model + GPU + workload → memory, step time, roofline, throughput–latency, cost.', p: 'Tool', h: u('lab/') },
+  { n: '◆', t: 'Concept Map', s: 'map graph prerequisites path', b: 'How every chapter connects; get a reading path to any topic.', p: 'Tool', h: u('map/') },
+  { n: '◆', t: 'Glossary', s: 'glossary terms definitions', b: `${glossary.length} short definitions, each linked to its chapter.`, p: 'Tool', h: u('glossary/') },
+  ...glossary.map((g) => ({ n: 'Aa', t: g.term, s: (g.aliases ?? []).join(' '), b: g.def, p: 'Glossary', h: u(`glossary/#${termId(g.term)}`) })),
+];
 ---
 <!doctype html>
 <html lang="en">
@@ -81,7 +88,7 @@ const searchIndex = chapters.map((c, i) => ({
       <div class="palette-box" role="dialog" aria-modal="true" aria-label="Search chapters">
         <div class="palette-input">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="9" cy="9" r="5.5"/><path d="m13.2 13.2 3.3 3.3"/></svg>
-          <input type="text" placeholder="Jump to a chapter — try “kv”, “ttft”, “lora”…" data-palette-input autocomplete="off" spellcheck="false" />
+          <input type="text" placeholder="Chapters, tools and terms — try “kv”, “ttft”, “lab”…" data-palette-input autocomplete="off" spellcheck="false" />
           <kbd>esc</kbd>
         </div>
         <ul class="palette-list" data-palette-list></ul>
@@ -148,7 +155,7 @@ const searchIndex = chapters.map((c, i) => ({
       const filter = () => {
         const q = input.value.trim().toLowerCase();
         const terms = q.split(/\s+/).filter(Boolean);
-        shown = !terms.length ? items : items.filter((it) => {
+        shown = !terms.length ? items.filter((it) => it.p !== 'Glossary') : items.filter((it) => {
           const hay = `${it.t} ${it.s} ${it.b} ${it.p}`.toLowerCase();
           return terms.every((t) => hay.includes(t));
         });

@@ -41,6 +41,13 @@ src/
 2. Create `src/pages/<slug>.mdx` with `layout: ../layouts/Chapter.astro`.
 3. Build diagrams in `src/components/viz/`. Each one renders a `<div data-viz="name">` and calls `mountAll('name', root => …)` from `src/lib/viz.ts`.
 
+### Learning tools (non-chapter pages)
+
+- **`/lab/`, the Inference Lab** (`src/components/lab/`): one set of knobs (model, GPU, TP, precision, prompt/output length, batch) driving five linked views: HBM map, decode-step anatomy, roofline, throughput–latency curve, request timeline. The maths is in `labModel.ts` and uses the same assumptions as `capacityModel.ts`. State lives in the URL hash, so setups can be shared.
+- **`/map/`, the Concept Map**: built automatically from the `../<slug>/` cross-links in the chapter MDX (`src/data/graph.ts`). The same graph powers the "Builds on / Comes up again in" box at the end of every chapter. To connect two chapters, just link one from the other.
+- **`/glossary/`** (`src/data/glossary.ts`): each term is linked to the chapter that teaches it. The first mention of each term in a chapter gets a hover/tap definition, and terms are searchable from ⌘K. Mark very common words `hover: false`.
+- Every `<Viz>` frame has a full-screen button (Esc closes it).
+
 ### Colour language
 
 Use the semantic tokens (`C.prefill`, `C.decode`, `C.kv`, `C.weight`, `C.token`, `C.compute`, `C.mem`, `C.comm`, `C.waste`) so every diagram means the same thing by the same colour.

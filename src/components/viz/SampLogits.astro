@@ -48,8 +48,9 @@
       const order = p.map((_, i) => i).sort((a, b) => p[b] - p[a]);
       const why: string[] = new Array(p.length).fill('');
       order.forEach((i, rank) => { if (rank >= K) why[i] = 'top-k'; });
+      const zk = p.reduce((a, x, i) => a + (why[i] ? 0 : x), 0); // top-p sees the top-k survivors, renormalised
       let cum = 0;
-      order.forEach((i) => { if (why[i]) return; if (cum >= P - 1e-9) why[i] = 'top-p'; cum += p[i]; });
+      order.forEach((i) => { if (why[i]) return; if (cum >= (P - 1e-9) * zk) why[i] = 'top-p'; cum += p[i]; });
       const pmax = Math.max(...p);
       p.forEach((x, i) => { if (!why[i] && x < MINP * pmax) why[i] = 'min-p'; });
       const kept = p.map((x, i) => (why[i] ? 0 : x));
@@ -83,7 +84,7 @@
         rect(svg, BX, y + ROW - 9, raw[i] * BW, 3, C.mem, { rx: 1.5, opacity: 0.8 });
         if (!cut) rect(svg, BX, y, Math.max(2, final[i] * BW), ROW - 9, i === last ? C.kv : C.token, { rx: 4 });
         else text(svg, BX + 8, y + 7, `✕ ${why[i]}`, { class: 't-small t-bold', style: `fill:${C.waste}` });
-        if (!cut) text(svg, BX + Math.max(2, final[i] * BW) + 6, y + 7, `${(final[i] * 100).toFixed(final[i] < 0.01 ? 2 : 1)}%`, { class: 't-small t-mono' });
+        if (!cut) { const inside = final[i] * BW > BW - 56; text(svg, inside ? BX + final[i] * BW - 6 : BX + Math.max(2, final[i] * BW) + 6, y + 7, `${(final[i] * 100).toFixed(final[i] < 0.01 ? 2 : 1)}%`, { class: 't-small t-mono', 'text-anchor': inside ? 'end' : 'start', style: inside ? 'fill:var(--bg)' : '' }); }
         const cx = BX + BW + 24;
         if (counts[i]) {
           rect(svg, cx, y + 2, (counts[i] / maxC) * 120, ROW - 12, C.kv, { rx: 3, opacity: 0.85 });

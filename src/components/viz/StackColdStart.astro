@@ -74,7 +74,8 @@
         if (active) cur = p;
         rect(svg, x0, 30, Math.max(2, x1 - x0 - 2), 40, p.col, { rx: 6, opacity: done ? 0.9 : active ? 1 : 0.28 });
         if (x1 - x0 > 70) {
-          text(svg, x0 + 8, 44, p.name, { class: 't-small t-bold', fill: 'var(--bg)' });
+          const maxCh = Math.floor((x1 - x0 - 14) / 6.8); // keep the label inside its segment
+          text(svg, x0 + 8, 44, p.name.length <= maxCh ? p.name : p.name.slice(0, maxCh - 1).trimEnd() + '…', { class: 't-small t-bold', fill: 'var(--bg)' });
           text(svg, x0 + 8, 60, p.sec >= 60 ? `${(p.sec / 60).toFixed(1)} min` : `${p.sec.toFixed(0)} s`, { class: 't-small t-mono', fill: 'var(--bg)' });
         }
         t0 += p.sec;

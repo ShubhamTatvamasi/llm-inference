@@ -22,7 +22,7 @@
     }
     route();
     const pb = button(bar, 'Pause', () => { if (loop.running) { loop.pause(); pb.querySelector('span')!.textContent = 'Play'; } else { loop.resume(); pb.querySelector('span')!.textContent = 'Pause'; } });
-    button(bar, 'New batch', () => { seed++; route(); t = 0; }, { icon: 'reset' });
+    button(bar, 'New batch', () => { seed++; route(); t = 0; lastPhase = -1; draw(); }, { icon: 'reset' });
 
     const svg = svgRoot(root, W, H, { 'aria-label': 'All-to-all dispatch and combine between GPUs in expert parallelism' });
     const say = narration(root);

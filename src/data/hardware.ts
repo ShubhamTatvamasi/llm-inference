@@ -11,9 +11,10 @@ export interface GPU {
   fp8TF: number | null; // dense FP8 TFLOPS (null = unsupported)
   fp4TF: number | null; // dense FP4 TFLOPS
   int8TOPS: number | null;
-  linkGBs: number;      // GPU↔GPU bandwidth per GPU (NVLink/IF; PCIe if none), GB/s
+  linkGBs: number;      // GPU↔GPU bandwidth per GPU, GB/s. NVLink/Infinity Fabric: BOTH directions summed
+                        // (H100 900 = 450 each way). PCIe cards: per direction. Halve NVLink for α–β maths.
   sms: number;          // streaming multiprocessors / compute units
-  l2MB: number;
+  l2MB: number;         // last-level on-chip cache (MI300X: 256 MB Infinity Cache; its true L2 is 4 MB per XCD)
   smemKB: number;       // on-chip shared memory (configurable L1/SMEM) per SM, KB
   pricePerHr: number;   // rough cloud on-demand USD/GPU-hour (illustrative)
 }

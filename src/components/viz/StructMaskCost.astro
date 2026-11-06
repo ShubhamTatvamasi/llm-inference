@@ -57,7 +57,10 @@
         text(svg, 16, y + 11, b.label, { class: 't-bold t-small' });
         rect(svg, X0, y, Math.max(2, sx(Math.min(b.ms, maxMs))), 22, b.color, { rx: 5 });
         const over = i > 0 && b.ms > gpuMs;
-        text(svg, X0 + Math.min(sx(b.ms), X1 - X0) + 8, y + 11, `${fmt.ms(b.ms)}${over ? `  → stalls every step by ${fmt.ms(b.ms - gpuMs)}` : i > 0 ? '  ✓ hidden' : ''}`, { class: 't-small t-mono', fill: over ? C.waste : i > 0 ? C.good : C.text });
+        const lbl = `${fmt.ms(b.ms)}${over ? `  → stalls every step by ${fmt.ms(b.ms - gpuMs)}` : i > 0 ? '  ✓ hidden' : ''}`;
+        const bw = Math.min(sx(b.ms), X1 - X0);
+        const inside = bw + 8 + lbl.length * 7 > W - X0 - 8; // label would run past the viewBox: draw it inside the bar
+        text(svg, inside ? X0 + bw - 8 : X0 + bw + 8, y + 11, lbl, { 'text-anchor': inside ? 'end' : 'start', class: 't-small t-mono' + (inside ? ' t-bold' : ''), fill: inside ? 'var(--bg)' : over ? C.waste : i > 0 ? C.good : C.text });
       });
       s('line', { x1: X0 + sx(gpuMs), x2: X0 + sx(gpuMs), y1: 14, y2: 170, stroke: C.decode, 'stroke-dasharray': '4 3' }, svg);
       text(svg, 16, 200, `${fmt.int(vocab)} tokens × ${AVG_TOK_CHARS} chars × ~${NS_PER_CHAR} ns/step ÷ ${THREADS} CPU threads; precomputing leaves ~${(G.ctxDep * 100).toFixed(1)}% of tokens to check.`, { class: 't-small t-faint' });

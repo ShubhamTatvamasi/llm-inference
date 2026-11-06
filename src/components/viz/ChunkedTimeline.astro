@@ -54,7 +54,7 @@
       // axis
       for (let ms = 0; ms <= T_END; ms += 100) {
         s('line', { x1: sx(ms), y1: 26, x2: sx(ms), y2: H - 26, stroke: C.border, 'stroke-dasharray': '2 4' }, g);
-        text(g, sx(ms), H - 12, `${ms} ms`, { 'text-anchor': 'middle', class: 't-small t-mono t-faint' });
+        text(g, sx(ms), H - 12, `${ms} ms`, { 'text-anchor': ms === T_END ? 'end' : 'middle', class: 't-small t-mono t-faint' });
       }
       // iteration lane
       text(g, 0, 44, 'GPU iterations', { class: 't-small t-bold' });
@@ -103,7 +103,7 @@
       if (now === 0) say('Four users are streaming tokens. Press <b>Play</b>: a 6,000-token prompt is about to arrive.');
       else if (now < ARRIVE) say('Steady state: each iteration decodes one token for each of the 4 users, about every 8 ms.');
       else if (mode === 'off') say('<b>No chunking:</b> the whole 6,000-token prefill runs as <b>one iteration</b>. Everyone else’s stream freezes until it finishes.');
-      else say(`<b>Chunked prefill (budget ${mode}):</b> each iteration first takes the 4–5 decode tokens, then fills the rest of the budget with the next chunk of the prompt. Streams keep flowing; the long prompt takes a little longer to start.`);
+      else say(`<b>Chunked prefill (budget ${mode}):</b> each iteration first takes the 4–5 decode tokens, then fills the rest of the budget with the next chunk of the prompt. ${mode === '2048' ? 'The one long freeze becomes a few shorter ~150 ms hiccups.' : 'Each iteration stays under ~45 ms, so streams keep flowing.'} The long prompt takes a little longer to start.`);
     }
 
     const pp = player(bar, root, { step: () => { now = Math.min(T_END, now + 12); return now < T_END; }, reset: () => { now = 0; }, render, interval: 40, autoplay: true, speeds: [0.5, 1, 2] });

@@ -87,7 +87,9 @@
       text(svg, 6, y0 + 37, `${dims}-d ${prec.label}`, { class: 't-small t-bold' });
       rect(svg, X0, y0 + 28, Math.max(sx(vec), 1), 18, C.kv, { rx: 3 });
       rect(svg, X0 + sx(vec), y0 + 28, Math.max(sx(graph), 1), 18, C.mem, { rx: 0, opacity: 0.8 });
-      text(svg, X0 + sx(vec + graph) + 6, y0 + 37, `${fmt.bytes(vec)} + ${fmt.bytes(graph)} index`, { class: 't-small t-mono t-bold' });
+      const vEnd = X0 + sx(vec + graph);
+      const vInside = vEnd + 6 + 180 > W; // label would overflow the viewBox: draw it inside the bar, right-aligned
+      text(svg, vInside ? vEnd - 6 : vEnd + 6, y0 + 37, `${fmt.bytes(vec)} + ${fmt.bytes(graph)} index`, { class: 't-small t-mono t-bold', 'text-anchor': vInside ? 'end' : 'start', fill: vInside ? 'var(--bg)' : undefined });
 
       const sel = rows.find((r) => r.id === gpuId)!;
       const gpuH = N / sel.sps / 3600;

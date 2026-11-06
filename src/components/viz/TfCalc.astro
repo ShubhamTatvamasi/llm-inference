@@ -14,7 +14,7 @@
     let lg = 12; // log2 context
     const bar = ctrlBar(root);
     select(bar, 'Model', MODELS.filter((m) => m.attn !== 'MLA').map((m) => ({ value: m.id, label: m.name })), model.id, (v) => { model = getModel(v); render(); });
-    slider(bar, { label: 'Context so far', min: 8, max: 17, step: 0.5, value: lg, format: (v) => fmt.num(Math.round(2 ** v), 0), onInput: (v) => { lg = v; render(); } });
+    slider(bar, { label: 'Context so far', min: 8, max: 17, step: 0.5, value: lg, format: (v) => fmt.int(2 ** v), onInput: (v) => { lg = v; render(); } });
     const svg = svgRoot(root, W, H, { 'aria-label': 'Parameter breakdown by component' });
     legend(root, [['Embeddings', C.token], ['Attention projections', C.compute], ['MLP / experts (all)', C.weight], ['LM head', C.decode]]);
     const st = stats(root, ['Total params (computed)', 'Active per token', 'FLOPs / generated token', 'Bytes read / step (batch 1)', 'FLOPs per byte']);
@@ -61,7 +61,7 @@
       const fW = 2 * (active - emb); // matmuls (embedding lookup is free)
       const fA = 4 * L * n * m.heads * hd; // QKᵀ + PV for one query over n keys
       const fy = 124;
-      text(svg, X, fy - 8, `FLOPs for one decode step at context ${fmt.num(n, 0)}`, { class: 't-small t-dim t-bold' });
+      text(svg, X, fy - 8, `FLOPs for one decode step at context ${fmt.int(n)}`, { class: 't-small t-dim t-bold' });
       const tot = fW + fA;
       rect(svg, X, fy, (fW / tot) * BW - 2, 20, C.weightSoft, { rx: 4, stroke: C.weight });
       rect(svg, X + (fW / tot) * BW, fy, Math.max(2, (fA / tot) * BW), 20, C.computeSoft, { rx: 4, stroke: C.compute });

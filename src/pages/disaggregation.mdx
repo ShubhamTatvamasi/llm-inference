@@ -26,7 +26,7 @@ The same six requests run on the same two GPUs, scheduled two ways. Watch the pe
 <Viz title="Colocated vs disaggregated on an identical trace" label="Live">
   <DisaggTimeline />
   <Fragment slot="caption">
-    <p>Top: each GPU runs prefill and decode, and a 4,000-token prefill freezes every stream on that GPU. Switch to <b>chunked prefill</b> to see the usual single-pool fix: stalls shrink, but decode steps get slower while chunks are mixed in. Bottom: the decode GPU never runs a prefill, so streaming is steady. The cost is that prompts now queue for a single prefill GPU, and each request waits for a KV transfer.</p>
+    <p>Top: each GPU runs prefill and decode, and a 4,200-token prefill freezes every stream on that GPU. Switch to <b>chunked prefill</b> to see the usual single-pool fix: stalls shrink, but decode steps get slower while chunks are mixed in. Bottom: the decode GPU never runs a prefill, so streaming is steady. The cost is that prompts now queue for a single prefill GPU, and each request waits for a KV transfer.</p>
   </Fragment>
 </Viz>
 

@@ -10,7 +10,7 @@
   const PROMPT = ['The', 'quick', 'brown', 'fox', 'jumps', 'over'];
   const GEN = ['the', 'lazy', 'dog', '.', 'It', 'was', 'not', 'amused'];
   const LAYERS = 4;
-  const W = 940, H = 390;
+  const W = 940, H = 420;
   const X0 = 92, CW = 58, TOK_Y = 26, GRID_Y = 124, ROW_H = 30, KV_H = 11;
 
   mountAll('kv-growth', (root) => {
@@ -90,7 +90,8 @@
           const mid = (qx + kx) / 2;
           s('path', { d: `M${qx},${y0} Q${mid},${y0 - 26 - Math.abs(qx - kx) * 0.05} ${kx},${y0}`, fill: 'none', stroke: C.accent, 'stroke-width': 1.2, opacity: 0.55 }, svg);
         }
-        text(svg, qx, GRID_Y + LAYERS * (ROW_H * 2 + 6) + 6, `▲ query of “${all[newest]}” attends to all ${n} keys`, { 'text-anchor': 'middle', class: 't-small t-dim' });
+        const right = qx > W / 2;
+        text(svg, qx + (right ? 6 : -6), GRID_Y + LAYERS * (ROW_H * 2 + 6) - 20, right ? `query of “${all[newest]}” attends to all ${n} keys ▲` : `▲ query of “${all[newest]}” attends to all ${n} keys`, { 'text-anchor': right ? 'end' : 'start', class: 't-small t-dim' });
       }
 
       // footer bar: work counter visual
@@ -114,7 +115,7 @@
       else say(`<b>No cache, step ${step - 1}:</b> to produce one token we recompute K/V for all ${n} tokens. Total work grows like <b>n²</b>.`);
     }
 
-    player(bar, root, { step: stepFn, reset, render, interval: 1100, autoplay: true });
-    segmented(bar, [{ value: 'cache', label: 'With KV cache' }, { value: 'nocache', label: 'No cache' }], 'cache', (v) => { mode = v as typeof mode; reset(); render(); });
+    const p = player(bar, root, { step: stepFn, reset, render, interval: 1100, autoplay: true });
+    segmented(bar, [{ value: 'cache', label: 'With KV cache' }, { value: 'nocache', label: 'No cache' }], 'cache', (v) => { mode = v as typeof mode; p.reset(); });
   });
 </script>

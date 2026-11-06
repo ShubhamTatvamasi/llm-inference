@@ -82,7 +82,9 @@
           const s0 = findContig();
           if (s0 < 0) {
             const free = owner.filter((o) => o === -1).length;
-            events.push(`${def.name} must wait: needs ${MAXLEN} <b>contiguous</b> slots (${free} free in total, but not in one piece)`);
+            events.push(free >= MAXLEN
+              ? `${def.name} must wait: needs ${MAXLEN} <b>contiguous</b> slots (${free} free in total, but not in one piece)`
+              : `${def.name} must wait: needs a ${MAXLEN}-slot reservation, only ${free} slots unreserved (although most reserved slots hold no tokens yet)`);
             break;
           }
           for (let k = s0; k < s0 + MAXLEN; k++) owner[k] = rn.id;
@@ -185,6 +187,6 @@
 
     reset();
     const pp = player(bar, root, { step, reset, render, interval: 1300, autoplay: true });
-    segmented(bar, [{ value: 'contig', label: 'Contiguous (pre-allocate)' }, { value: 'paged', label: 'Paged blocks' }], mode, (v) => { mode = v as Mode; reset(); render(); });
+    segmented(bar, [{ value: 'contig', label: 'Contiguous (pre-allocate)' }, { value: 'paged', label: 'Paged blocks' }], mode, (v) => { mode = v as Mode; pp.reset(); });
   });
 </script>

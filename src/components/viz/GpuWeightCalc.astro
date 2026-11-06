@@ -59,7 +59,7 @@
       for (let k = lo; k <= hi; k++) {
         const v = Math.pow(10, k);
         s('line', { x1: PX, y1: y(v), x2: PX + PW, y2: y(v), stroke: C.border }, svg);
-        text(svg, PX - 8, y(v), fmt.num(v, 0), { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
+        text(svg, PX - 8, y(v), fmt.num(v, v < 1 ? 1 : 0), { 'text-anchor': 'end', class: 't-small t-mono t-faint' });
       }
       BATCHES.forEach((b, i) => text(svg, x(i), PY + PH + 16, String(b), { 'text-anchor': 'middle', class: 't-small t-mono t-faint' }));
       text(svg, PX + PW / 2, H - 12, 'batch size (concurrent sequences decoding together)', { 'text-anchor': 'middle', class: 't-small t-dim' });

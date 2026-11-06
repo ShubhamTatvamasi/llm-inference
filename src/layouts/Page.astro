@@ -1,0 +1,32 @@
+---
+/* Layout for non-chapter pages (Lab, concept map, glossary): sidebar + a wide main column. */
+import Base from './Base.astro';
+import Sidebar from '../components/Sidebar.astro';
+
+interface Props { title: string; description: string; current: string; eyebrow: string; lede: string }
+const { title, description, current, eyebrow, lede } = Astro.props;
+---
+<Base title={title} description={description}>
+  <div class="shell">
+    <Sidebar current={current} />
+    <main class="page-main">
+      <header class="pg-head">
+        <span class="pg-eyebrow">{eyebrow}</span>
+        <h1>{title}</h1>
+        <p class="pg-lede" set:html={lede} />
+      </header>
+      <slot />
+      <footer class="foot">Token by Token · LLM inference &amp; serving, visualized</footer>
+    </main>
+  </div>
+  <style>
+    .shell { display: grid; grid-template-columns: var(--sidebar-w) minmax(0, 1fr); max-width: 1600px; margin: 0 auto; }
+    .page-main { padding: 36px 48px 80px; min-width: 0; max-width: 1240px; }
+    .pg-head { margin: 8px 0 1.8rem; }
+    .pg-eyebrow { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); }
+    h1 { font-size: clamp(2rem, 4vw, 2.8rem); line-height: 1.08; letter-spacing: -0.035em; font-weight: 700; margin: 8px 0 10px; }
+    .pg-lede { font-size: 1.08rem; color: var(--text-dim); line-height: 1.6; margin: 0; max-width: 760px; }
+    .foot { margin-top: 3rem; padding-top: 1.4rem; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 0.82rem; }
+    @media (max-width: 960px) { .shell { grid-template-columns: minmax(0, 1fr); } .page-main { padding: 24px 16px 60px; } }
+  </style>
+</Base>

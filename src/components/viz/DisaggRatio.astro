@@ -65,7 +65,7 @@
       };
       pool(14, 380, xP, `Prefill pool × ${xP}`, C.prefill, C.prefillSoft, rhoP, `${fmt.ms(Sp * 1e3)} per ${fmt.num(prompt, 1)}-token prompt`, 'compute busy');
       const decUtil = kvOk ? kvNeed / kvRoom : 1.01;
-      pool(546, 380, yD, `Decode pool × ${yD}`, C.decode, C.decodeSoft, decUtil, `KV in use per GPU: ${fmt.num(kvNeed / 1e9, 1)} / ${fmt.num(kvRoom / 1e9, 0)} GB`, 'KV memory used');
+      pool(546, 380, yD, `Decode pool × ${yD}`, C.decode, C.decodeSoft, decUtil, kvOk ? `KV in use per GPU: ${fmt.num(kvNeed / 1e9, 1)} / ${fmt.num(kvRoom / 1e9, 0)} GB` : `KV needed exceeds ${fmt.num(kvRoom / 1e9, 0)} GB per GPU`, 'KV memory used');
       // transfer arrow
       s('path', { d: 'M400,98 L540,98', stroke: C.comm, 'stroke-width': 3, fill: 'none', 'stroke-dasharray': '6 5' }, svg);
       s('path', { d: 'M532,91 L542,98 L532,105', stroke: C.comm, 'stroke-width': 3, fill: 'none' }, svg);
@@ -76,7 +76,7 @@
       st.set('TTFT (disagg)', isFinite(ttft) ? fmt.ms(ttft * 1e3) : '∞', 'prefill + queueing', !isFinite(ttft) ? C.waste : undefined);
       st.set('ITL (disagg)', kvOk ? fmt.ms(itl * 1e3) : 'overloaded', 'steady, no prefill interference', kvOk ? C.good : C.waste);
       st.set('Seqs per decode GPU', kvOk ? fmt.num(N, 1) : '—', 'by Little’s law');
-      st.set('Colocated worst ITL', fmt.ms(worstCol * 1e3), `same ${nAll} GPUs, when a full prefill lands`, worstCol > 3 * itl ? C.waste : undefined);
+      st.set('Colocated worst ITL', kvOk && isFinite(worstCol) ? fmt.ms(worstCol * 1e3) : 'overloaded', `same ${nAll} GPUs, when a full prefill lands`, worstCol > 3 * itl ? C.waste : undefined);
 
       if (!isFinite(ttft)) say('<b>Prefill-bound:</b> prompts arrive faster than the prefill pool can process them. Add prefill GPUs (raise xP).');
       else if (!kvOk) say('<b>Decode-bound:</b> the decode pool runs out of KV memory or bandwidth for this many concurrent streams. Add decode GPUs (raise yD).');

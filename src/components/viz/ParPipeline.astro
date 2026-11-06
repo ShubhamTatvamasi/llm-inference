@@ -12,8 +12,8 @@
   mountAll('par-pipeline', (root) => {
     let P = 4, M = 6;
     const bar = ctrlBar(root);
-    slider(bar, { label: 'Pipeline stages (GPUs)', min: 2, max: 8, value: P, onInput: (v) => { P = v; t = 0; build(); } });
-    slider(bar, { label: 'Micro-batches in flight', min: 1, max: 16, value: M, onInput: (v) => { M = v; t = 0; build(); } });
+    slider(bar, { label: 'Pipeline stages (GPUs)', min: 2, max: 8, value: P, onInput: (v) => { P = v; t = 0; build(); draw(t); } });
+    slider(bar, { label: 'Micro-batches in flight', min: 1, max: 16, value: M, onInput: (v) => { M = v; t = 0; build(); draw(t); } });
     const pb = button(bar, 'Pause', () => { if (loop.running) { loop.pause(); pb.querySelector('span')!.textContent = 'Play'; } else { loop.resume(); pb.querySelector('span')!.textContent = 'Pause'; } });
 
     const svg = svgRoot(root, W, 320, { 'aria-label': 'Pipeline schedule: stages over time with idle bubbles' });

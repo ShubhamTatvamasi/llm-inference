@@ -27,14 +27,14 @@
     legend(root, [['Compute (tensor cores)', C.compute], ['On-chip memory', C.kv], ['Off-chip memory (HBM)', C.weight], ['Interconnect', C.comm], ['Host', C.mem]]);
 
     function levels() {
-      const pcie = gpu.linkGBs <= 64 ? gpu.linkGBs : 64; // PCIe Gen4 ≈32, Gen5 ≈64 GB/s per direction
+      const pcie = gpu.linkGBs <= 64 ? gpu.linkGBs : gpu.id === 'a100' ? 32 : 64; // PCIe Gen4 ≈32 (A100), Gen5 ≈64 GB/s per direction
       const clk = 1.75e9;
       const smemBW = gpu.sms * 128 * clk; // bytes/s, ~128 B/clk/SM
       const regBW = smemBW * 8;            // rough: registers ≫ SMEM
       return [
         { id: 'reg' as Level, name: 'Registers', cap: gpu.sms * 256 * 1024, bw: regBW, where: 'inside each SM, next to the ALUs', lat: '~1 cycle', est: true },
         { id: 'smem' as Level, name: 'Shared mem / L1', cap: gpu.sms * gpu.smemKB * 1024, bw: smemBW, where: 'inside each SM, programmer-managed', lat: '~30 cycles', est: true },
-        { id: 'l2' as Level, name: 'L2 cache', cap: gpu.l2MB * 1024 * 1024, bw: gpu.bwTBs * 1e12 * 2.5, where: 'on-chip, shared by all SMs', lat: '~200 cycles', est: true },
+        { id: 'l2' as Level, name: gpu.id === 'mi300x' ? 'Infinity Cache (LLC)' : 'L2 cache', cap: gpu.l2MB * 1024 * 1024, bw: gpu.bwTBs * 1e12 * 2.5, where: 'on-chip, shared by all SMs', lat: '~200 cycles', est: true },
         { id: 'hbm' as Level, name: 'HBM (VRAM)', cap: gpu.memGB * 1e9, bw: gpu.bwTBs * 1e12, where: 'stacked DRAM next to the die', lat: '~500+ cycles', est: false },
         { id: 'link' as Level, name: gpu.linkGBs > 64 ? 'NVLink / Infinity Fabric' : 'GPU↔GPU (PCIe)', cap: NaN, bw: gpu.linkGBs * 1e9, where: 'to other GPUs in the server', lat: '~µs', est: false },
         { id: 'pcie' as Level, name: 'PCIe to host', cap: NaN, bw: pcie * 1e9, where: 'to CPU RAM / NVMe', lat: '~µs', est: false },
@@ -110,7 +110,7 @@
         text(svg, 880, y + 36, `GPU ${i + 1}`, { 'text-anchor': 'middle', class: 't-dim t-small' });
         s('line', { x1: 790, y1: 140 + (i - 1) * 50, x2: 830, y2: y + 36, stroke: linkOn ? C.accent : C.comm, 'stroke-width': linkOn ? 4 : 2.5 }, svg);
       }
-      text(svg, 810, 330, gpu.linkGBs > 64 ? 'NVLink' : 'PCIe', { 'text-anchor': 'middle', class: 't-small t-dim' });
+      text(svg, 810, 330, gpu.linkGBs > 64 ? (gpu.id === 'mi300x' ? 'Infinity Fabric' : 'NVLink') : 'PCIe', { 'text-anchor': 'middle', class: 't-small t-dim' });
 
       // ---------- ladder ----------
       const L = levels();

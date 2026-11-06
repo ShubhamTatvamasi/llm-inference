@@ -25,8 +25,13 @@ export function flopsTotal(g: GPU, tp: number, wBytes: number) {
 export function stepTime(m: Model, g: GPU, tp: number, wBytes: number, kvBytes: number, B: number, ctx: number) {
   const bw = g.bwTBs * 1e12 * tp * BW_EFF;
   // MoE: the more tokens in the batch, the more distinct experts get touched
-  const frac = m.activeParams / m.params;
-  const touched = m.params * Math.max(frac, 1 - Math.pow(1 - frac, Math.max(1, B)));
+  // each token picks k of E routed experts; R = routed params from active = (params − R) + R·k/E
+  let touched = m.params;
+  if (m.experts) {
+    const kE = m.experts.active / m.experts.total;
+    const R = (m.params - m.activeParams) / (1 - kE);
+    touched = m.params - R * Math.pow(1 - kE, Math.max(1, B));
+  }
   const mem = (touched * wBytes + B * ctx * kvBytesPerToken(m, kvBytes)) / bw;
   const comp = (2 * m.activeParams * B) / flopsTotal(g, tp, wBytes);
   const comm = tp > 1 ? 2 * m.layers * 12e-6 * Math.log2(tp) : 0; // two all-reduces per layer

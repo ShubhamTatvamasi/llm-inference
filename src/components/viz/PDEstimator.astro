@@ -25,7 +25,7 @@
     const b2 = ctrlBar(root);
     slider(b2, { label: 'Prompt tokens', min: 0, max: LENS.length - 1, value: pi, format: (i) => fmt.int(LENS[i]), onInput: (i) => { pi = i; render(); } });
     slider(b2, { label: 'Output tokens', min: 0, max: LENS.length - 1, value: oi, format: (i) => fmt.int(LENS[i]), onInput: (i) => { oi = i; render(); } });
-    slider(b2, { label: 'Others decoding alongside', min: 1, max: 128, value: batch, onInput: (v) => { batch = v; render(); } });
+    slider(b2, { label: 'Sequences decoding (incl. this one)', min: 1, max: 128, value: batch, onInput: (v) => { batch = v; render(); } });
 
     const svg = svgRoot(root, W, H, { 'aria-label': 'End-to-end latency split into prefill and decode' });
     const st = stats(root, ['TTFT', 'ITL', 'End-to-end', 'Time spent decoding']);

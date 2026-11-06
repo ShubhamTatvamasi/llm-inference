@@ -2,7 +2,7 @@
 import Base from '../layouts/Base.astro';
 import Lifecycle from '../components/home/Lifecycle.astro';
 import { chapters, parts } from '../data/chapters';
-import { chapterUrl } from '../lib/url';
+import { chapterUrl, u } from '../lib/url';
 
 const colours = [
   ['Prefill', 'var(--c-prefill)', 'Processing the prompt: one wide, compute-bound pass'],
@@ -37,7 +37,7 @@ const partIcons: Record<string, string> = {
       </p>
       <div class="cta">
         <a class="btn primary big" href={chapterUrl(chapters[0].slug)}>Start the journey <span aria-hidden="true">→</span></a>
-        <a class="btn big" href={chapterUrl('kv-cache')}>Jump to the KV cache</a>
+        <a class="btn big" href={u('lab/')}>Open the Inference Lab</a>
         <button class="btn big ghost" type="button" data-palette-open><kbd>⌘K</kbd> Search</button>
       </div>
     </section>
@@ -49,6 +49,34 @@ const partIcons: Record<string, string> = {
         <p>The animation runs in slow motion. Click any stage to open the chapter that explains it.</p>
       </div>
       <Lifecycle />
+    </section>
+
+    <section class="tools reveal">
+      <div class="sec-head">
+        <span class="eyebrow">Learn by doing</span>
+        <h2>Three ways in</h2>
+        <p>Experiment first and read later, or the other way round.</p>
+      </div>
+      <div class="tool-grid">
+        <a class="tool" href={u('lab/')} data-spot>
+          <span class="tool-k">Inference Lab</span>
+          <b>Turn every knob at once</b>
+          <span>Pick a model, GPU and workload. Memory, step time, the roofline, the throughput–latency curve and cost all update together, with a plain-English note on what is limiting you.</span>
+          <span class="tool-go">Open the Lab →</span>
+        </a>
+        <a class="tool" href={u('map/')} data-spot>
+          <span class="tool-k">Concept Map</span>
+          <b>See how the ideas connect</b>
+          <span>All {chapters.length} chapters and the links between them. Click any topic for the shortest reading path to it.</span>
+          <span class="tool-go">Explore the map →</span>
+        </a>
+        <a class="tool" href={u('glossary/')} data-spot>
+          <span class="tool-k">Glossary</span>
+          <b>Never get stuck on a term</b>
+          <span>TTFT, GQA, MIG, goodput… Short definitions, also shown on hover inside every chapter.</span>
+          <span class="tool-go">Browse terms →</span>
+        </a>
+      </div>
     </section>
 
     <section class="parts">
@@ -167,6 +195,15 @@ const partIcons: Record<string, string> = {
     .card-list a:hover .t { color: var(--accent); }
     .card-list a:hover .arr { opacity: 1; transform: none; color: var(--accent); }
 
+    .tool-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .tool { --mx: 50%; --my: 0%; position: relative; display: flex; flex-direction: column; gap: 6px; padding: 20px; border-radius: 18px; border: 1px solid var(--border); background: var(--surface); color: var(--text); overflow: hidden; isolation: isolate; transition: border-color 0.25s, transform 0.25s; }
+    .tool::before { content: ''; position: absolute; inset: 0; z-index: -1; background: radial-gradient(360px circle at var(--mx) var(--my), var(--accent-soft), transparent 60%); opacity: 0; transition: opacity 0.3s; }
+    .tool:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); transform: translateY(-2px); background-size: auto; }
+    .tool:hover::before { opacity: 1; }
+    .tool-k { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent); }
+    .tool b { font-size: 1.15rem; letter-spacing: -0.02em; }
+    .tool span:not(.tool-k):not(.tool-go) { color: var(--text-dim); font-size: 0.9rem; line-height: 1.55; flex: 1; }
+    .tool-go { color: var(--link); font-size: 0.88rem; font-weight: 560; margin-top: 4px; }
     .swatches { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
     .sw { display: flex; gap: 14px; align-items: flex-start; padding: 14px 16px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); }
     .sw i { flex: none; width: 14px; height: 14px; border-radius: 4px; margin-top: 4px; }
@@ -184,6 +221,7 @@ const partIcons: Record<string, string> = {
       .card { grid-column: auto; }
       .swatches { grid-template-columns: 1fr 1fr; }
       .features { grid-template-columns: 1fr 1fr; }
+      .tool-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 560px) {
       .home { padding: 0 16px 40px; }

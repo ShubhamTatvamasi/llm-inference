@@ -1,0 +1,13 @@
+---
+import Page from '../layouts/Page.astro';
+import InferenceLab from '../components/lab/InferenceLab.astro';
+---
+<Page
+  title="Inference Lab"
+  current="lab"
+  eyebrow="Playground · every chapter in one place"
+  description="Pick a model, GPU and workload and watch memory, the decode step, the roofline, the throughput–latency trade-off and a request timeline update together."
+  lede="One set of knobs, five linked views. Choose a model, a GPU and a workload, then see how memory, the decode step, the roofline and the throughput–latency trade-off all respond. Start with a scenario, then change one thing at a time."
+>
+  <InferenceLab />
+</Page>

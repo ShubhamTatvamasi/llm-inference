@@ -36,7 +36,7 @@ Operating systems solved the same problem decades ago with **virtual memory**. A
 <Viz title="Contiguous reservation vs paged blocks" label="Live">
   <PagedAlloc />
   <Fragment slot="caption">
-    <p>Same five requests, same 64 token slots of KV memory. In <b>contiguous</b> mode each request reserves 20 slots up front; D and E wait even though free slots exist, because no free run of 20 exists. In <b>paged</b> mode blocks are handed out one at a time from a free list, from <i>anywhere</i> in memory, and all five requests run at once. Each request wastes at most one partially filled block.</p>
+    <p>Same five requests, same 64 token slots of KV memory. In <b>contiguous</b> mode each request reserves 20 slots up front; D and E have to wait even though most reserved slots (hatched) hold no tokens yet. In <b>paged</b> mode blocks are handed out one at a time from a free list, from <i>anywhere</i> in memory, and no request has to wait. Each request wastes at most one partially filled block.</p>
   </Fragment>
 </Viz>
 
@@ -66,7 +66,7 @@ Because blocks are reached through a table, **two sequences can point at the sam
 - **Beam search**: beams share their common history and fork only where they diverge.
 - **[Prefix caching](../prefix-caching/)**: different requests with the same system prompt share blocks.
 
-When a sequence needs to **write** into a block that is shared, the engine first copies that block. This is the same copy-on-write trick an OS uses after `fork()`.
+When a sequence needs to **write** into a block that is shared, the engine first copies that block. This is the same copy-on-write trick an OS uses after `fork()`. (This is the original vLLM design. vLLM V1 simplifies it: an `n > 1` request is fanned out into separate child requests that share the prompt's **full** blocks through prefix caching, and each child recomputes the small partial last block instead of copying it.)
 
 <Viz title="Parallel sampling with copy-on-write" label="Live">
   <PagedCoW />

@@ -94,7 +94,8 @@
         for (let i = fmt.E - 1; i >= 0; i--) { bits.push((r.ef >> i) & 1); fields.push('e'); }
         for (let i = fmt.M - 1; i >= 0; i--) { bits.push(Math.floor(r.m / 2 ** i) % 2); fields.push('m'); }
         stored = r.val; note = r.note; maxV = info.max;
-        precision = `${fmt.M} mantissa bits ≈ ${Math.max(1, Math.round(fmt.M * Math.log10(2) + 1))} sig. digit${fmt.M > 3 ? 's' : ''}`;
+        const sd = Math.max(1, Math.round(fmt.M * Math.log10(2) + 1));
+        precision = `${fmt.M} mantissa bit${fmt.M === 1 ? '' : 's'} ≈ ${sd} sig. digit${sd > 1 ? 's' : ''}`;
         formula = r.ef === 0
           ? `(−1)^${r.sign} × 0.${r.m.toString(2).padStart(fmt.M, '0')}₂ × 2^${1 - fmt.bias}`
           : Number.isFinite(r.val) ? `(−1)^${r.sign} × 1.${r.m.toString(2).padStart(fmt.M, '0').slice(0, 10)}${fmt.M > 10 ? '…' : ''}₂ × 2^(${r.ef} − ${fmt.bias})` : '∞';

@@ -20,9 +20,9 @@
       story: 'For "give me one GPU" the device plugin is shorter and works everywhere. DRA pays off only when the request needs to say <i>which</i> device, or how devices relate.',
     },
     {
-      id: 'model', label: 'H100 or H200, ≥ 80 GiB',
+      id: 'model', label: 'H100 or H200, ≥ 80 GB',
       dp: { v: 'partial', tag: 'Node labels', yaml: ['affinity:', '  nodeAffinity:', '    requiredDuringScheduling…:', '      nodeSelectorTerms:', '      - matchExpressions:', '        - key: nvidia.com/gpu.product', '          operator: In', '          values: [NVIDIA-H100-80GB-HBM3, NVIDIA-H200]', 'resources: { limits: { nvidia.com/gpu: 1 } }'], note: 'Selects a node, not a device: assumes every GPU in it is identical.' },
-      dra: { v: 'yes', tag: 'CEL on the device', yaml: ['exactly:', '  deviceClassName: gpu.nvidia.com', '  selectors:', '  - cel:', '      expression: |', "        device.attributes['gpu.nvidia.com']", "          .productName.matches('H100|H200') &&", "        device.capacity['gpu.nvidia.com']", "          .memory.compareTo(quantity('80Gi')) >= 0"], note: 'Evaluated per device against what the driver published.' },
+      dra: { v: 'yes', tag: 'CEL on the device', yaml: ['exactly:', '  deviceClassName: gpu.nvidia.com', '  selectors:', '  - cel:', '      expression: |', "        device.attributes['gpu.nvidia.com']", "          .productName.matches('H100|H200') &&", "        device.capacity['gpu.nvidia.com']", "          .memory.compareTo(quantity('80G')) >= 0", "# 80G, not 80Gi: an H100 80GB reports ~79.6 GiB"], note: 'Evaluated per device against what the driver published.' },
       story: 'GFD labels describe the <b>node</b>, so with the device plugin you filter nodes and hope the GPUs inside match. DRA drivers publish each device with typed attributes and capacities in a <code>ResourceSlice</code>, and the CEL selector is checked against each one.',
     },
     {

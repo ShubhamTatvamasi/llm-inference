@@ -18,7 +18,7 @@ That gives an unusual cost profile: **memory scales with total parameters, compu
 
 ## The router
 
-Inside each MoE layer, the router is one small linear layer. It scores the token's hidden vector against every expert, applies a softmax, and keeps the **top-k**:
+Inside each MoE layer, the router is one small linear layer. It scores the token's hidden vector against every expert, applies a softmax (DeepSeek-V3 uses a sigmoid instead, then renormalises over the chosen experts), and keeps the **top-k**:
 
 $$
 g = \mathrm{softmax}(x\,W_\text{gate}), \qquad y = \sum_{e \,\in\, \text{top-}k(g)} \tilde g_e \; \mathrm{Expert}_e(x)

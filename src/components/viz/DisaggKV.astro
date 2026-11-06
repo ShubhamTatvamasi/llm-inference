@@ -9,7 +9,7 @@
   import { MODELS, getModel, getGPU, kvBytesPerToken } from '../../data/hardware';
 
   const LINKS = [
-    { id: 'nvl', label: 'NVLink, same node (~900 GB/s)', gbs: 900 },
+    { id: 'nvl', label: 'NVLink 4, same node (~450 GB/s per direction)', gbs: 450 },
     { id: 'ib400', label: 'RDMA 400 Gb/s (~50 GB/s)', gbs: 50 },
     { id: 'roce200', label: 'RDMA 200 Gb/s (~25 GB/s)', gbs: 25 },
     { id: 'tcp100', label: 'TCP 100 GbE (~10 GB/s)', gbs: 10 },

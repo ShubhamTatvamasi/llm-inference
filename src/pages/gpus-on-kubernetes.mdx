@@ -83,7 +83,7 @@ The `FailedScheduling` event counts each node under the **first** filter that re
 
 ## Beyond counting: Dynamic Resource Allocation
 
-The device plugin model has one number per node. It cannot say "an H100 or H200 with at least 80 GiB", "these two containers share one GPU", or "these 16 GPUs must sit in one NVLink domain". **Dynamic Resource Allocation** (DRA, `resource.k8s.io/v1`, GA in Kubernetes 1.34) replaces the count with a structured request:
+The device plugin model has one number per node. It cannot say "an H100 or H200 with at least 80 GB", "these two containers share one GPU", or "these 16 GPUs must sit in one NVLink domain". **Dynamic Resource Allocation** (DRA, `resource.k8s.io/v1`, GA in Kubernetes 1.34) replaces the count with a structured request:
 
 - A DRA driver publishes every device with typed **attributes** and **capacities** in `ResourceSlice` objects.
 - A **DeviceClass** names a kind of device. The NVIDIA DRA driver (now the kubernetes-sigs `dra-driver-nvidia-gpu` project) provides `gpu.nvidia.com` and `mig.nvidia.com`.

@@ -65,7 +65,8 @@
       const knee = T_MEM / ((k + 1) * T_TOK);
       if (knee >= 1 && knee <= 512) {
         s('line', { x1: lx(knee), x2: lx(knee), y1: Y0, y2: Y1, stroke: C.compute, 'stroke-dasharray': '3 4' }, svg);
-        text(svg, lx(knee) + 6, Y0 + 8, `verify pass turns compute-bound (B ≈ ${Math.round(knee)})`, { class: 't-small', fill: C.compute });
+        const kr = lx(knee) > X1 - 290;
+        text(svg, lx(knee) + (kr ? -6 : 6), Y0 + 8, `verify pass turns compute-bound (B ≈ ${Math.round(knee)})`, { 'text-anchor': kr ? 'end' : 'start', class: 't-small', fill: C.compute });
       }
       const v = speed(B);
       s('circle', { cx: lx(B), cy: ly(v), r: 6, fill: v >= 1 ? C.kv : C.waste, stroke: 'var(--bg)', 'stroke-width': 2 }, svg);

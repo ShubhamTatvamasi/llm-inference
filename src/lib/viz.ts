@@ -262,7 +262,9 @@ export function player(bar: Element, root: Element, o: PlayerOpts) {
 
   function setBtn() { playBtn.innerHTML = (playing ? ICON.pause : ICON.play) + `<span>${playing ? 'Pause' : 'Play'}</span>`; }
   function tick() {
-    if (done) { if (o.loop) { o.reset(); done = false; } else { pause(); return; } }
+    // A finished run restarts on the next Step/Play. This also covers diagrams that reset
+    // their own state on a mode switch without telling the player (Step used to go dead).
+    if (done) { o.reset(); done = false; }
     const r = o.step();
     o.render();
     if (r === false) { done = true; if (!o.loop) pause(); }

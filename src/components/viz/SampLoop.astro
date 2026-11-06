@@ -36,7 +36,7 @@
         if (t === '<eos>') finish = 'stop (EOS token)';
         else if (stopMode === 'period' && t === '.') finish = 'stop (stop string ".")';
         else if (out.length >= maxTok) finish = 'length (max_tokens)';
-        if (t !== '<eos>') streamed += t.replace(/␣/g, ' ');
+        if (t !== '<eos>' && !finish.startsWith('stop (stop string')) streamed += t.replace(/␣/g, ' '); // a matched stop string is not returned
       }
       return !finish;
     }
@@ -92,7 +92,7 @@
         'The token joins the context. Its K/V were written to the cache during the forward pass, and the text is <b>detokenized and streamed</b>.',
         'Check stop conditions: <b>EOS</b> token, a <b>stop string</b>, or <b>max_tokens</b>. Otherwise loop again.',
       ];
-      if (station < 0) say('Prefill has already processed the prompt and produced the first token\'s logits. Press <b>Play</b> to walk the per-token loop.');
+      if (station < 0) say('Prefill has already processed the prompt and filled its KV cache. Press <b>Play</b> to walk the per-token loop (the first lap stands in for the prefill pass that yields the first token).');
       else if (finish) say(`Request finished: <b>${finish}</b>. Its KV-cache blocks are freed immediately, and the scheduler can admit a waiting request in the very next step.`);
       else say(msgs[station]);
       st.set('Generated tokens', String(out.length), `max_tokens = ${maxTok}`);

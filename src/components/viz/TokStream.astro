@@ -76,13 +76,13 @@
 
       const cur = i > 0 ? toks[i - 1] : '';
       if (i === 0) say('Press <b>Play</b>. The model emits <b>token IDs</b>, one per decode step. Each token is a few <b>bytes</b>, and some characters span several tokens.');
-      else if (mode === 'naive' && out.includes('�')) say(`Token “${label(cur)}” is only <b>part</b> of a character. Decoding it alone produces <b style="color:var(--c-waste)">�</b> replacement characters on the user's screen.`);
+      else if (mode === 'naive' && dec.decode(new Uint8Array(symBytes(cur))).includes('�')) say(`Token “${label(cur)}” is only <b>part</b> of a character. Decoding it alone produces <b style="color:var(--c-waste)">�</b> replacement characters on the user's screen.`);
       else if (held) say(`Token “${label(cur)}” ends <b>mid-character</b>. The detokenizer <b>holds back</b> ${buf.length} byte${buf.length > 1 ? 's' : ''} until the character is complete.`);
       else say(`Token “${label(cur)}” completes the text so far, so it is flushed to the client as an SSE event.`);
     }
 
-    player(bar, root, { step, reset, render, interval: 750, autoplay: true });
-    segmented(bar, [{ value: 'inc', label: 'Incremental detokenizer' }, { value: 'naive', label: 'Naive per-token decode' }], 'inc', (v) => { mode = v as typeof mode; reset(); render(); });
+    const p = player(bar, root, { step, reset, render, interval: 750, autoplay: true });
+    segmented(bar, [{ value: 'inc', label: 'Incremental detokenizer' }, { value: 'naive', label: 'Naive per-token decode' }], 'inc', (v) => { mode = v as typeof mode; p.reset(); });
   });
 </script>
 

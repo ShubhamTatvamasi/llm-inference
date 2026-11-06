@@ -19,7 +19,7 @@ A decode token costs almost nothing extra; the step is dominated by reading the 
 <Viz title="A long prompt arrives while four users stream" label="Live">
   <ChunkedTimeline />
   <Fragment slot="caption">
-    <p>The top lane shows GPU iterations, each block as wide as it took. Below, each dot is a token delivered to a user. With <b>no chunking</b>, one 400+ ms iteration creates a visible freeze in every stream (red). With a <b>token budget</b>, the prompt is split into chunks small enough that streams keep their normal pace. The cost is a somewhat later first token for the long prompt.</p>
+    <p>The top lane shows GPU iterations, each block as wide as it took. Below, each dot is a token delivered to a user. With <b>no chunking</b>, one 400+ ms iteration creates a visible freeze in every stream (red). With a <b>token budget</b>, the prompt is split into chunks: a 2048 budget turns the freeze into a few ~150 ms hiccups, and a 512 budget keeps every gap under ~45 ms. The cost is a somewhat later first token for the long prompt.</p>
   </Fragment>
 </Viz>
 
