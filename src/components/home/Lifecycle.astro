@@ -112,6 +112,20 @@ const links = {
 
     const dyn = s('g', { 'pointer-events': 'none' }, svg);
     let paused = false; let t = 0;
+
+    // Phones: the diagram is wider than the screen, so glide the scroller to keep the active
+    // stage in view. A touch/scroll by the reader pauses following for a few seconds.
+    const scroller = root.closest<HTMLElement>('.lc-scroll');
+    let userUntil = 0;
+    if (scroller) for (const ev of ['pointerdown', 'touchstart', 'wheel']) scroller.addEventListener(ev, () => { userUntil = performance.now() + 5000; }, { passive: true });
+    function follow(xView: number) {
+      if (!scroller || scroller.scrollWidth <= scroller.clientWidth + 4 || performance.now() < userUntil) return;
+      const svgEl = svg as unknown as SVGSVGElement;
+      const px = svgEl.getBoundingClientRect().left - scroller.getBoundingClientRect().left + scroller.scrollLeft + (xView / W) * svgEl.clientWidth;
+      const target = clamp(px - scroller.clientWidth / 2, 0, scroller.scrollWidth - scroller.clientWidth);
+      const next = scroller.scrollLeft + (target - scroller.scrollLeft) * (reducedMotion() ? 1 : 0.08);
+      if (Math.abs(next - scroller.scrollLeft) > 0.5) scroller.scrollLeft = next;
+    }
     const btn = hud('pause');
     const lp = rafLoop(root, (dt) => {
       if (paused) return;
@@ -163,6 +177,7 @@ const links = {
         rect(dyn, 900, 140, 140 * local, 6, C.decode, { rx: 3 });
       } else { phase = 'Done · KV blocks freed'; }
       setActive(active);
+      follow(t < T.travel ? along(FWD, ease(t / T.travel))[0] : t < T.sched ? 600 : t < T.prefill ? 790 : t < DECODE_END ? 900 : 110);
 
       // scheduler shows a running batch during work
       schedSlots.forEach((r, i) => r.setAttribute('fill', t >= T.sched && t < DECODE_END ? (i === 0 ? C.token : i < 3 ? C.decodeSoft : C.surface3) : C.surface3));
