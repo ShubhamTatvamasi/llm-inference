@@ -1,6 +1,7 @@
 ---
 import { chapters, parts } from '../data/chapters';
 import { u, chapterUrl } from '../lib/url';
+import { tools, toolSvg } from '../data/tools';
 interface Props { current?: string }
 const { current } = Astro.props;
 ---
@@ -11,11 +12,8 @@ const { current } = Astro.props;
       <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M3 9.5 10 3.5l7 6V16a1 1 0 0 1-1 1h-3.5v-4.5h-5V17H4a1 1 0 0 1-1-1Z"/></svg>
       The full lifecycle
     </a>
-    <div class="sb-tools">
-      <a href={u('lab/')} class={current === 'lab' ? 'on' : ''}><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5h4M8.8 2.5v5L4 15.5A1.4 1.4 0 0 0 5.2 17.5h9.6a1.4 1.4 0 0 0 1.2-2L11.2 7.5v-5"/><path d="M6 13h8"/></svg>Lab</a>
-      <a href={u('hardware/')} class={current === 'hardware' ? 'on' : ''}><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="10" height="10" rx="1.5"/><path d="M8 2.5V5M12 2.5V5M8 15v2.5M12 15v2.5M2.5 8H5M2.5 12H5M15 8h2.5M15 12h2.5"/><rect x="8" y="8" width="4" height="4" rx="0.6"/></svg>Hardware</a>
-      <a href={u('map/')} class={current === 'map' ? 'on' : ''}><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="4.5" cy="10" r="2"/><circle cx="15.5" cy="4.5" r="2"/><circle cx="15.5" cy="15.5" r="2"/><path d="m6.3 9 7.4-3.6M6.3 11l7.4 3.6"/></svg>Map</a>
-      <a href={u('glossary/')} class={current === 'glossary' ? 'on' : ''}><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M4 3.5h9.5a2 2 0 0 1 2 2v11H6a2 2 0 0 1-2-2z"/><path d="M4 14.5a2 2 0 0 1 2-2h9.5M7.5 7h5"/></svg>Glossary</a>
+    <div class="sb-tools" aria-label="Tools">
+      {tools.map((t) => <a href={u(`${t.slug}/`)} class={current === t.slug ? 'on' : ''}><Fragment set:html={toolSvg(t)} />{t.label}</a>)}
     </div>
     <div class="sb-progress"><div class="sb-pbar"><i data-progress-fill></i></div><span data-progress-text>0 / {chapters.length} explored</span></div>
     {parts.map((p) => (
@@ -60,7 +58,7 @@ const { current } = Astro.props;
   .sb-home { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 10px; color: var(--text); font-weight: 600; font-size: 0.9rem; background: none; border: 1px solid var(--border); }
   .sb-home svg { width: 16px; height: 16px; color: var(--accent); }
   .sb-home:hover, .sb-home.on { border-color: var(--accent); background: var(--accent-soft); }
-  .sb-tools { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
+  .sb-tools { display: none; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
   .sb-tools a { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 7px 4px 6px; border-radius: 10px; border: 1px solid var(--border); color: var(--text-dim); font-size: 0.74rem; font-weight: 560; background: none; transition: all 0.15s; }
   .sb-tools a:hover, .sb-tools a.on { color: var(--text); border-color: var(--accent); background: var(--accent-soft); }
   .sb-tools svg { width: 16px; height: 16px; color: var(--accent); }
@@ -82,6 +80,7 @@ const { current } = Astro.props;
   li a.seen .sb-dot { background: var(--c-kv); box-shadow: 0 0 8px var(--c-kv); opacity: 0.8; }
   .nav-scrim { display: none; }
   @media (max-width: 960px) {
+    .sb-tools { display: grid; }
     .sidebar { position: fixed; z-index: 70; top: 0; left: 0; bottom: 0; height: 100vh; width: min(310px, 86vw); background: var(--surface-solid); transform: translateX(-102%); transition: transform 0.25s cubic-bezier(.2,.8,.2,1); box-shadow: 20px 0 60px rgba(0,0,0,0.4); }
     :global(body.nav-open) .sidebar { transform: none; }
     :global(body.nav-open) .nav-scrim { display: block; position: fixed; inset: 0; z-index: 65; background: rgba(4,6,12,0.55); backdrop-filter: blur(3px); }
