@@ -5,7 +5,7 @@
 
 <script>
   import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, select, slider, h, C, fmt } from '../../lib/viz';
-  import { MODELS, GPUS, getModel, getGPU, kvBytesPerToken } from '../../data/hardware';
+  import { MODELS, GPUS, getModel, getGPU, kvBytesPerToken, kvBytesPerGpu } from '../../data/hardware';
 
   const LENS = [2048, 4096, 8192, 16384, 32768, 65536, 131072];
   const SEQS = [8, 16, 32, 64, 128, 256, 512, 1024];
@@ -43,7 +43,7 @@
       const wPer = (model.params * 2) / tp;
       const overheadPer = Math.max(1.5e9, 0.04 * memPer);
       const kvPer = Math.max(0, budgetPer - wPer - overheadPer);
-      const kvTok = (kvPer * tp) / kvBytesPerToken(model, kvb);
+      const kvTok = kvPer / kvBytesPerGpu(model, tp, kvb);
       const fitsW = wPer + overheadPer <= budgetPer;
       const cap = Math.floor(kvTok / Math.min(avg, maxLen));
       const conc = Math.min(maxSeqs, cap);
@@ -86,7 +86,8 @@
       if (cap < maxSeqs) add('warn', `<b>KV memory, not max_num_seqs, limits the batch:</b> about ${fmt.int(cap)} requests of ~${fmt.num(avg, 1)} tokens fit. Under load the scheduler stops admitting and starts <b>preempting</b>, so tail latency suffers.`);
       else add('ok', `<b>max_num_seqs caps the batch at ${maxSeqs}</b> while KV could hold ~${fmt.int(cap)}. ${cap > maxSeqs * 1.5 ? 'You could raise max_num_seqs for more throughput, if latency SLOs allow.' : 'Balanced.'}`);
       if (util > 0.95) add('warn', 'Utilization above 0.95 leaves little headroom for activation spikes, CUDA graphs and other processes on the GPU: risk of OOM at runtime.');
-      if (tp > 1) add('ok', `Tensor parallelism ${tp}: each GPU holds 1/${tp} of the weights and of every KV head group, so the KV pool scales almost ×${tp}, at the cost of all-reduce traffic every layer.`);
+      if (tp > 1 && model.attn === 'MLA') add('warn', `Tensor parallelism ${tp} splits the weights, but MLA's compressed KV latent is shared by all heads, so <b>every GPU stores the full KV cache</b>. Extra GPUs free room only through the smaller weight shard; data-parallel attention (one replica of attention per GPU) is how DeepSeek-style models avoid this.`);
+      else if (tp > 1) add('ok', `Tensor parallelism ${tp}: each GPU holds 1/${tp} of the weights and ${tp > model.kvHeads ? `a replicated copy of its KV heads (TP ${tp} > ${model.kvHeads} KV heads)` : `1/${tp} of the KV heads`}, so the KV pool grows about ×${Math.min(tp, model.kvHeads)}, at the cost of all-reduce traffic every layer.`);
       if (kvb === 1) add('ok', 'FP8 KV cache halves bytes per token: about twice the concurrency or context. Validate accuracy on long-context tasks.');
     }
     render();

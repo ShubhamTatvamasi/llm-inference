@@ -25,13 +25,13 @@ A request is always in exactly one state:
 |---|---|---|
 | **Waiting** | Arrived, not yet admitted (or preempted and re-queued) | No |
 | **Running** | In the batch: prefilling or decoding | Yes, and growing |
-| **Swapped** | Paused; its KV blocks were copied to CPU memory | No (on CPU) |
+| **Swapped** *(older engines)* | Paused; its KV blocks were copied to CPU memory. vLLM V1 dropped this state and recomputes instead | No (on CPU) |
 | **Finished** | Hit EOS / stop / `max_tokens`; blocks freed (or kept as [prefix cache](../prefix-caching/)) | No |
 
 Each iteration, a typical scheduler:
 
 1. Gives every **running** sequence one more token. If a sequence's last block is full, it needs a new block; if none are free, it **preempts** the lowest-priority running sequence, usually the most recently admitted.
-2. **Resumes** swapped sequences if space is available. They get priority over new arrivals so that they don't starve.
+2. **Resumes** preempted (or, in older engines, swapped) sequences if space is available. They get priority over new arrivals so that they don't starve.
 3. **Admits** waiting requests in FIFO order (or by priority) while there are free blocks (keeping a small *watermark* in reserve) and the batch is below `max_num_seqs` and within the [token budget](../chunked-prefill/).
 
 <Viz title="The scheduler under memory pressure" label="Live">

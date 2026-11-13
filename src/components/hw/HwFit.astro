@@ -1,0 +1,126 @@
+---
+/* "What should I run this on?" Runs the Inference Lab's first-order model (labModel.ts)
+   against every priced accelerator in the catalog and ranks them by cost per 1M output tokens. */
+---
+<div class="hwf" data-viz="hw-fit"></div>
+
+<script>
+  import { mountAll, h, select, slider, segmented, clear, checkbox } from '../../lib/viz';
+  import { ACCELS } from '../../data/accelerators';
+  import { MODELS, getModel } from '../../data/hardware';
+  import { evaluate, type LabIn } from '../lab/labModel';
+  import { isSram, priceMid, placement, type Accel } from '../../data/accelType';
+  import { toGPU, swatch, nf, priceStr } from './hwShared';
+  import { u } from '../../lib/url';
+
+  const TPS = [1, 2, 4, 8, 16, 32, 64];
+  const CTX = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const OUT = [64, 128, 256, 512, 1024, 2048, 4096, 8192];
+  const CONC = [1, 4, 8, 16, 32, 64, 128, 256, 512];
+  const SLO = [5, 10, 20, 30, 50, 80, 120, 200];
+  const W = [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }, { value: '0.5', label: 'FP4 / INT4' }];
+  const KV = [{ value: '2', label: 'BF16' }, { value: '1', label: 'FP8' }];
+  const k = (n: number) => (n >= 1024 ? `${n / 1024}k` : String(n));
+
+  interface Row { a: Accel; tp: number; r?: ReturnType<typeof evaluate>; why?: string; ok: boolean; place: ReturnType<typeof placement>; cost: number | null }
+
+  mountAll('hw-fit', (root) => {
+    const st = { m: 'llama3-70b', w: 1, kv: 1, p: 4096, o: 512, c: 32, slo: 20, all: false };
+    const ctl = h('div', { class: 'hwf-ctl' }, root);
+    const c1 = h('div', { class: 'hwf-g' }, ctl);
+    h('div', { class: 'hwf-k', text: 'Model' }, c1);
+    select(c1, 'Model', MODELS.map((m) => ({ value: m.id, label: m.name })), st.m, (v) => { st.m = v; run(); });
+    const r1 = h('div', { class: 'field' }, c1); h('span', { text: 'Weights' }, r1);
+    segmented(r1, W, String(st.w), (v) => { st.w = Number(v); run(); });
+    const r2 = h('div', { class: 'field' }, c1); h('span', { text: 'KV cache' }, r2);
+    segmented(r2, KV, String(st.kv), (v) => { st.kv = Number(v); run(); });
+    const c2 = h('div', { class: 'hwf-g' }, ctl);
+    h('div', { class: 'hwf-k', text: 'Workload & SLO' }, c2);
+    slider(c2, { label: 'Prompt', min: 0, max: CTX.length - 1, value: CTX.indexOf(st.p), format: (i) => `${k(CTX[i])} tok`, onInput: (i) => { st.p = CTX[i]; run(); } });
+    slider(c2, { label: 'Output', min: 0, max: OUT.length - 1, value: OUT.indexOf(st.o), format: (i) => `${k(OUT[i])} tok`, onInput: (i) => { st.o = OUT[i]; run(); } });
+    slider(c2, { label: 'Concurrent requests', min: 0, max: CONC.length - 1, value: CONC.indexOf(st.c), format: (i) => String(CONC[i]), onInput: (i) => { st.c = CONC[i]; run(); } });
+    slider(c2, { label: 'Min speed per user', min: 0, max: SLO.length - 1, value: SLO.indexOf(st.slo), format: (i) => `${SLO[i]} tok/s`, onInput: (i) => { st.slo = SLO[i]; run(); } });
+
+    const opts = h('div', { class: 'hwf-opts' }, root);
+    checkbox(opts, 'Include previous generations and options that miss the SLO', st.all, (v) => { st.all = v; run(); });
+    const summary = h('div', { class: 'narr hwf-sum', 'aria-live': 'polite' }, root);
+    const wrap = h('div', { class: 'hwf-wrap' }, root);
+    h('p', { class: 'hwf-note', html: `Same first-order model as the <a href="${u('lab/')}">Inference Lab</a>: 75% of peak bandwidth, 50% of peak FLOPs, 2 ms per-step overhead, 90% memory utilisation, ring all-reduce over the scale-up fabric, list on-demand prices (midpoint). It finds the smallest tensor-parallel size that holds every concurrent request’s KV cache <i>and</i> meets the per-user speed. It ignores queueing, prefix-cache hits, speculative decoding and engine-specific kernels, so treat the ranking as a shortlist to <a href="${u('benchmarking/')}">benchmark</a>, not a verdict. SRAM-based chips (Groq, Cerebras) are left out: they shard a model over hundreds of chips and are sold per token. GeForce cards are priced at marketplace rates (RunPod, Vast.ai); NVIDIA’s driver licence restricts GeForce use in data centres, and marketplace capacity is not guaranteed.` }, root);
+
+    function plan(a: Accel): Row {
+      const m = getModel(st.m); const gpu = toGPU(a);
+      let last: Row | null = null;
+      for (const tp of TPS) {
+        const inp: LabIn = { model: m, gpu, tp, wBytes: st.w, kvBytes: st.kv, prompt: st.p, output: st.o, batch: st.c };
+        const r = evaluate(inp);
+        const place = placement(a, tp);
+        const cost = a.price ? r.costPerM : null;
+        if (r.mem.maxSeqs < st.c) { last = { a, tp, r, ok: false, place, cost, why: r.mem.fits ? `KV for ${st.c} requests does not fit` : 'weights do not fit' }; continue; }
+        if (r.perUser < st.slo) { last = { a, tp, r, ok: false, place, cost, why: `${nf(r.perUser)} tok/s per user, under the target` }; continue; }
+        return { a, tp, r, ok: true, place, cost };
+      }
+      return last ?? { a, tp: 64, ok: false, place: 'multi-node', cost: null, why: 'no fit' };
+    }
+
+    function run() {
+      const cand = ACCELS.filter((a) => !isSram(a) && priceMid(a) != null && (st.all || a.status !== 'legacy'));
+      const rows = cand.map(plan).filter((r) => st.all || r.ok)
+        .sort((x, y) => Number(y.ok) - Number(x.ok) || (x.cost ?? 1e9) - (y.cost ?? 1e9));
+      clear(wrap);
+      const best = rows.find((r) => r.ok);
+      const m = getModel(st.m);
+      summary.innerHTML = best
+        ? `<b>Cheapest that meets the target:</b> ${best.tp}× ${best.a.name}, about <b>$${best.cost!.toFixed(2)}</b> per 1M output tokens at ${nf(best.r!.perUser)} tok/s per user. ${rows.filter((r) => r.ok).length} of ${cand.length} priced accelerators can serve ${st.c} concurrent ${k(st.p)}+${k(st.o)}-token requests of ${m.name}.`
+        : `<b>Nothing meets this target</b> within 64 chips. Lower the per-user speed, the concurrency or the context, or quantize further.`;
+      const t = h('table', { class: 'hwf-table' }, wrap);
+      const hr = h('tr', {}, h('thead', {}, t));
+      ['Accelerator', 'Chips', 'TTFT', 'Per user', 'Replica total', '$/hr', '$ / 1M out'].forEach((x, i) => h('th', { class: i ? 'num' : '', text: x }, hr));
+      const tb = h('tbody', {}, t);
+      const maxCost = Math.max(...rows.filter((r) => r.ok && r.cost).map((r) => r.cost!), 0.01);
+      rows.slice(0, st.all ? 60 : 25).forEach((row, i) => {
+        const tr = h('tr', { class: row.ok ? (row === best ? 'best' : '') : 'miss' }, tb);
+        h('td', { html: `<span class="hwf-nm">${swatch(row.a.group)}${row.a.name}</span>${row.ok ? '' : `<span class="hwf-why">${row.why}</span>`}` }, tr);
+        const badge = row.place === 'multi-node' ? ` <span class="hwf-multi" title="More chips than one server or scale-up domain: the all-reduce crosses the network and this estimate is optimistic">multi-node</span>`
+          : row.place === 'pcie' ? ` <span class="hwf-pcie" title="No NVLink-class fabric across this many chips: the all-reduce runs over PCIe">PCIe</span>` : '';
+        h('td', { class: 'num', html: `${row.tp}×${badge}` }, tr);
+        const r = row.r;
+        h('td', { class: 'num', text: r ? (r.ttft >= 1 ? `${r.ttft.toFixed(2)} s` : `${Math.round(r.ttft * 1000)} ms`) : '—' }, tr);
+        h('td', { class: 'num', text: r ? `${nf(r.perUser)} tok/s` : '—' }, tr);
+        h('td', { class: 'num', text: r ? `${nf(r.total)} tok/s` : '—' }, tr);
+        h('td', { class: 'num', text: row.a.price ? `$${(row.tp * priceMid(row.a)!).toFixed(2)}` : '—', title: `${priceStr(row.a.price)} per chip-hour` }, tr);
+        const c = h('td', { class: 'num hwf-cost' }, tr);
+        h('span', { text: row.cost != null && row.ok ? `$${row.cost < 1 ? row.cost.toFixed(3) : row.cost.toFixed(2)}` : '—' }, c);
+        if (row.ok && row.cost) { const b = h('i', {}, c); b.style.width = `${Math.max(3, (row.cost / maxCost) * 100)}%`; }
+        if (i === 0 && !row.ok) tr.classList.add('first');
+      });
+    }
+    run();
+  });
+</script>
+
+<style>
+  .hwf :global(.hwf-ctl) { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .hwf :global(.hwf-g) { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+  .hwf :global(.hwf-g .field) { justify-content: space-between; flex-wrap: wrap; }
+  .hwf :global(.hwf-g .field > span:first-child) { flex: 1; }
+  .hwf :global(.hwf-g select) { max-width: 66%; }
+  .hwf :global(.hwf-k) { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.09em; color: var(--text-faint); font-weight: 650; }
+  .hwf :global(.hwf-opts) { margin: 10px 0 0; }
+  .hwf :global(.hwf-wrap) { overflow-x: auto; margin-top: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
+  .hwf :global(.hwf-table) { width: 100%; border-collapse: collapse; font-size: 0.84rem; min-width: 720px; }
+  .hwf :global(.hwf-table th) { text-align: left; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); background: var(--surface-2); padding: 9px 10px; font-weight: 650; white-space: nowrap; }
+  .hwf :global(.hwf-table td) { padding: 8px 10px; border-top: 1px solid var(--border); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .hwf :global(.num) { text-align: right; font-family: var(--font-mono); font-size: 0.8rem; }
+  .hwf :global(th.num) { font-family: var(--font-sans); }
+  .hwf :global(.hwf-nm) { display: inline-flex; gap: 7px; align-items: center; font-weight: 600; }
+  .hwf :global(.hwf-why) { display: block; font-size: 0.72rem; color: var(--c-waste); padding-left: 19px; font-weight: 450; }
+  .hwf :global(tr.miss td) { color: var(--text-faint); }
+  .hwf :global(tr.best) { background: var(--c-good); background: color-mix(in srgb, var(--c-good) 10%, transparent); }
+  .hwf :global(.hwf-multi), .hwf :global(.hwf-pcie) { font-family: var(--font-sans); font-size: 0.68rem; color: var(--c-waste); font-weight: 600; }
+  .hwf :global(.hwf-pcie) { color: var(--c-prefill); }
+  .hwf :global(.hwf-cost) { position: relative; min-width: 110px; }
+  .hwf :global(.hwf-cost span) { position: relative; z-index: 1; font-weight: 650; }
+  .hwf :global(.hwf-cost i) { position: absolute; right: 10px; bottom: 4px; height: 3px; border-radius: 2px; background: var(--c-decode); max-width: calc(100% - 20px); }
+  .hwf :global(.hwf-note) { font-size: 0.78rem; color: var(--text-faint); margin: 10px 0 0; line-height: 1.55; }
+  @media (max-width: 860px) { .hwf :global(.hwf-ctl) { grid-template-columns: 1fr; } }
+</style>

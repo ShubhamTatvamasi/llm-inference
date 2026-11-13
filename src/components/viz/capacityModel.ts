@@ -1,7 +1,8 @@
 /* First-order capacity model used by the capacity-planning chapter.
    Roofline-style estimates: decode reads weights + KV once per step; prefill is compute-bound.
    Efficiency factors are rough; real numbers come from load tests. */
-import { kvBytesPerToken, type GPU, type Model } from '../../data/hardware';
+import { kvBytesPerToken, kvReplication, type GPU, type Model } from '../../data/hardware';
+import { peakFlops, touchedWeightBytes, attnFlopsPerCtx } from '../lab/labModel';
 
 export interface PlanIn {
   model: Model; gpu: GPU; tp: number;
@@ -17,23 +18,15 @@ export interface PlanIn {
 const BW_EFF = 0.75, FLOP_EFF = 0.5, OVERHEAD_S = 0.002;
 
 export function flopsTotal(g: GPU, tp: number, wBytes: number) {
-  const tf = wBytes <= 1 && g.fp8TF ? g.fp8TF : g.bf16TF; // FP8/INT8 weights use FP8 tensor cores when available
-  return tf * 1e12 * tp * FLOP_EFF;
+  return peakFlops(g, wBytes) * tp * FLOP_EFF; // same precision → tensor-core rules as the Lab
 }
 
 /** Seconds per decode step for a batch of B sequences with average context ctx. */
 export function stepTime(m: Model, g: GPU, tp: number, wBytes: number, kvBytes: number, B: number, ctx: number) {
   const bw = g.bwTBs * 1e12 * tp * BW_EFF;
-  // MoE: the more tokens in the batch, the more distinct experts get touched
-  // each token picks k of E routed experts; R = routed params from active = (params − R) + R·k/E
-  let touched = m.params;
-  if (m.experts) {
-    const kE = m.experts.active / m.experts.total;
-    const R = (m.params - m.activeParams) / (1 - kE);
-    touched = m.params - R * Math.pow(1 - kE, Math.max(1, B));
-  }
-  const mem = (touched * wBytes + B * ctx * kvBytesPerToken(m, kvBytes)) / bw;
-  const comp = (2 * m.activeParams * B) / flopsTotal(g, tp, wBytes);
+  // MoE: the more tokens in the batch, the more distinct experts get touched (see labModel.touchedWeightBytes)
+  const mem = (touchedWeightBytes(m, wBytes, B) + B * ctx * kvBytesPerToken(m, kvBytes) * kvReplication(m, tp)) / bw;
+  const comp = (2 * m.activeParams * B + attnFlopsPerCtx(m) * ctx * B) / flopsTotal(g, tp, wBytes);
   const comm = tp > 1 ? 2 * m.layers * 12e-6 * Math.log2(tp) : 0; // two all-reduces per layer
   return Math.max(mem, comp) + comm + OVERHEAD_S;
 }
@@ -43,7 +36,7 @@ export function prefillTime(m: Model, g: GPU, tp: number, wBytes: number, prompt
   const f = flopsTotal(g, tp, wBytes);
   const linear = 2 * m.activeParams * prompt;
   const attn = 2 * m.layers * prompt * prompt * m.heads * m.headDim; // causal QKᵀ + AV
-  const wRead = (m.activeParams * wBytes) / (g.bwTBs * 1e12 * tp * BW_EFF);
+  const wRead = touchedWeightBytes(m, wBytes, prompt) / (g.bwTBs * 1e12 * tp * BW_EFF);
   return Math.max((linear + attn) / f, wRead);
 }
 
@@ -55,7 +48,7 @@ export function plan(p: PlanIn) {
   const overhead = Math.max(1.5e9 * p.tp, 0.04 * totalMem);
   const kvAvail = budget - weights - overhead;
   const fits = kvAvail > 0;
-  const kvTok = kvBytesPerToken(p.model, p.kvBytes);
+  const kvTok = kvBytesPerToken(p.model, p.kvBytes) * kvReplication(p.model, p.tp); // across the TP group
   const seqTokens = p.prompt + p.output;
   const kvSeq = kvTok * seqTokens;
   const maxSeqMem = fits ? Math.floor(kvAvail / kvSeq) : 0;
@@ -83,7 +76,7 @@ export function plan(p: PlanIn) {
   const costHr = gpus * p.gpu.pricePerHr;
   const outPerHr = p.rps * p.output * 3600;
   const costPerM = costHr / (outPerHr / 1e6);
-  const ttft = pT + best.st; // excluding queueing
+  const ttft = pT; // prefill emits the first token; excludes queueing
   const e2e = ttft + (p.output - 1) * best.tpot;
   const inflight = p.rps * e2e; // Little's law
   return {

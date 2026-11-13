@@ -100,7 +100,7 @@ Most GPU engines default to **16 tokens**, which keeps waste under a few percent
 </Viz>
 
 <Callout type="note" title="It's not only vLLM">
-PagedAttention was introduced with vLLM, and the idea is now everywhere. TensorRT-LLM, SGLang, TGI and llama.cpp all manage KV memory in blocks or pages. Some use different block sizes, or token-granular pools with radix trees, but the principle is the same: **no per-request contiguous reservation**.
+PagedAttention was introduced with vLLM, and the idea is now everywhere. TensorRT-LLM, SGLang and llama.cpp all manage KV memory in blocks or pages. Some use different block sizes, or token-granular pools with radix trees, but the principle is the same: **no per-request contiguous reservation**.
 </Callout>
 
 <Interview>

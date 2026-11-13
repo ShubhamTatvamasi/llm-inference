@@ -55,7 +55,7 @@ The other formats you will meet:
 | **Pickle** (`pytorch_model.bin`, `.pt`) | Older checkpoints, training code | Loading executes an opcode stream that can import and call any function. Modern `torch.load` restricts this by default (`weights_only`), but serving stacks should simply refuse these files. |
 | **GGUF** | llama.cpp and its ecosystem | One file holding weights, tokenizer, template and metadata, with many block-[quantization](../quantization/) types. Built for CPU, laptops and edge; datacenter engines support it only partially. |
 | **ONNX** | ONNX Runtime, some embedding/[reranker](../embedding-serving/) stacks | Graph and weights together. Common for small encoders, rare for large decoder LLMs. |
-| **TensorRT-LLM engines** | TensorRT-LLM, Triton | Compiled plans tied to the **GPU architecture, TensorRT version, TP/PP layout and maximum batch/sequence shapes**. Change any of these and you rebuild. Store them as build artifacts, never as the source of truth. |
+| **TensorRT-LLM engines** (legacy) | Older TensorRT-LLM, Triton | Compiled plans tied to the **GPU architecture, TensorRT version, TP/PP layout and maximum batch/sequence shapes**. Change any of these and you rebuild. Since TensorRT-LLM 1.0 the default PyTorch backend loads Hugging Face safetensors directly, so new deployments rarely need them. |
 | **Pre-quantized safetensors** | vLLM, SGLang, TensorRT-LLM | FP8, AWQ, GPTQ or compressed-tensors checkpoints. Still safetensors, with a `quantization_config` in `config.json` that tells the engine which kernels to use. Half or a quarter of the bytes to move. |
 
 <Callout type="warn" title="trust_remote_code is code execution">
@@ -99,7 +99,7 @@ With TP = 4, each of four worker processes needs a quarter of every large matrix
 
 - With **safetensors + mmap**, each rank maps the shard files and copies out only its slice. Column-parallel slices are contiguous. Row-parallel slices are strided, a piece of every row. Each rank moves about 1/TP of the bytes to its GPU, but the files and page cache are shared on the node. If the page cache is cold, the disk sees roughly one full read in total.
 - With **pickle**, every rank unpickles the full state dict into CPU memory and then throws away three quarters of it. Host RAM briefly needs TP × the checkpoint size.
-- **Pre-sharded checkpoints** (one file set per rank, saved after a first load) and **TensorRT-LLM engines** turn this into a plain sequential read per rank. They are tied to that exact TP layout.
+- **Pre-sharded checkpoints** (one file set per rank, saved after a first load, or legacy **TensorRT-LLM engines**) turn this into a plain sequential read per rank. They are tied to that exact TP layout.
 
 The host-to-GPU copy runs over **one PCIe link per GPU** (Gen5 x16, about 64 GB/s per direction peak; loaders reach a fraction of that). Adding GPUs to a replica therefore speeds up the last stage, until host memory bandwidth or the loader's CPU threads become the limit.
 

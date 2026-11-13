@@ -1,0 +1,349 @@
+---
+/* Accelerator explorer: filter + sort the catalog, open a spec sheet, compare up to four.
+   State lives in the query string (?gpu=…&cmp=…&m=…&p=…) so any view can be shared. */
+---
+<div class="hwx" data-viz="hw-explorer"></div>
+
+<script>
+  import { mountAll, h, select, segmented, checkbox, clear } from '../../lib/viz';
+  import { ACCELS } from '../../data/accelerators';
+  import { MODELS, getModel } from '../../data/hardware';
+  import {
+    type Accel, type Group, type Segment, GROUP_LABEL, SEGMENT_LABEL, STATUS_LABEL, USABLE,
+    ridgeBF16, decodeCeiling, isSram, placement,
+  } from '../../data/accelType';
+  import { swatch, nf, memStr, priceStr, host, G_COLOR } from './hwShared';
+  import { u } from '../../lib/url';
+
+  const PREC = [{ value: 'bf16', label: 'BF16', b: 2 }, { value: 'fp8', label: 'FP8', b: 1 }, { value: 'fp4', label: 'FP4 / INT4', b: 0.5 }] as const;
+  type Prec = (typeof PREC)[number]['value'];
+  const pb = (p: Prec) => PREC.find((x) => x.value === p)!.b;
+
+  /** Chips needed to hold the weights with ~25% headroom for KV cache and activations. */
+  function chipsFor(a: Accel, weightBytes: number) {
+    const need = Math.ceil((weightBytes * 1.25) / (a.memGB * 1e9 * USABLE));
+    if (isSram(a)) return need;
+    let n = 1; while (n < need) n *= 2; // tensor-parallel sizes are powers of two
+    return n;
+  }
+
+  interface Col { key: string; label: string; unit?: string; tip: string; val: (a: Accel) => number | null; cell: (a: Accel) => string; bar?: boolean; num?: boolean }
+
+  mountAll('hw-explorer', (root) => {
+    const q0 = new URLSearchParams(location.search);
+    const st = {
+      grp: 'all' as 'all' | Group, seg: 'all' as 'all' | Segment, prev: true, q: '',
+      sort: 'year', dir: -1, sel: (q0.get('gpu') && ACCELS.some((a) => a.id === q0.get('gpu'))) ? q0.get('gpu') : null as string | null,
+      cmp: (q0.get('cmp') ?? '').split(',').filter((id) => ACCELS.some((a) => a.id === id)).slice(0, 4),
+      m: MODELS.some((m) => m.id === q0.get('m')) ? q0.get('m')! : 'llama3-70b',
+      p: (PREC.some((x) => x.value === q0.get('p')) ? q0.get('p') : 'fp8') as Prec,
+    };
+    const persist = () => {
+      const q = new URLSearchParams(location.search);
+      st.sel ? q.set('gpu', st.sel) : q.delete('gpu');
+      st.cmp.length ? q.set('cmp', st.cmp.join(',')) : q.delete('cmp');
+      q.set('m', st.m); q.set('p', st.p);
+      history.replaceState(null, '', `${location.pathname}?${q.toString().replace(/%2C/g, ',')}${location.hash}`);
+    };
+
+    const model = () => getModel(st.m);
+    const fitCell = (a: Accel) => {
+      const m = model(); const w = m.params * pb(st.p);
+      const n = chipsFor(a, w);
+      const tps = decodeCeiling(a, m.activeParams * pb(st.p), n);
+      const warn = !isSram(a) && placement(a, n) === 'multi-node' ? ` <span class="hw-warn" title="More chips than one server or scale-up domain: needs multi-node serving">multi-node</span>` : '';
+      return { n, tps, html: `<b>${nf(tps)}</b> tok/s<span class="hw-sub">${n}× chip${n > 1 ? 's' : ''}${warn}</span>` };
+    };
+
+    const COLS: Col[] = [
+      { key: 'mem', label: 'Memory', tip: 'Capacity: decides which models fit and how much KV cache is left.', val: (a) => a.memGB, bar: true, num: true,
+        cell: (a) => `${memStr(a.memGB)}<span class="hw-sub">${a.memType}</span>` },
+      { key: 'bw', label: 'Bandwidth', tip: 'Memory bandwidth (TB/s): the speed limit for decode.', val: (a) => a.bwTBs, bar: true, num: true,
+        cell: (a) => `${nf(a.bwTBs, a.bwTBs < 10 ? 2 : 0)}<span class="hw-sub">TB/s</span>` },
+      { key: 'bf16', label: 'BF16', tip: 'Dense BF16/FP16 tensor TFLOPS (no sparsity).', val: (a) => a.bf16, num: true, cell: (a) => nf(a.bf16) },
+      { key: 'fp8', label: 'FP8', tip: 'Dense FP8 TFLOPS. "—" means no FP8 tensor cores: FP8 weights still load but are upcast.', val: (a) => a.fp8 ?? null, num: true, cell: (a) => nf(a.fp8) },
+      { key: 'fp4', label: 'FP4', tip: 'Dense FP4 TFLOPS (NVFP4 / MXFP4).', val: (a) => a.fp4 ?? null, num: true, cell: (a) => nf(a.fp4) },
+      { key: 'ridge', label: 'Ridge', tip: 'BF16 FLOPs per byte of memory traffic needed to be compute-bound. Higher = decode is more memory-bound.', val: (a) => ridgeBF16(a), num: true, cell: (a) => nf(ridgeBF16(a)) },
+      { key: 'link', label: 'Scale-up', tip: 'Chip-to-chip bandwidth (both directions) and how many chips share that fabric.', val: (a) => a.link?.GBs ?? null, num: true,
+        cell: (a) => a.link ? `${nf(a.link.GBs)}<span class="hw-sub">${a.link.name}${a.link.domain > 1 ? ' · ' + a.link.domain : ''}</span>` : '—' },
+      { key: 'tdp', label: 'Power', tip: 'Board / module power (W).', val: (a) => a.tdpW ?? null, num: true, cell: (a) => a.tdpW ? `${nf(a.tdpW)}<span class="hw-sub">W</span>` : '—' },
+      { key: 'price', label: '$/hr', tip: 'Typical on-demand price per chip-hour, late 2026. Varies 2–3× by provider and commitment.', val: (a) => a.price ? (a.price[0] + a.price[1]) / 2 : null, num: true, cell: (a) => priceStr(a.price) },
+      { key: 'fit', label: 'Decode ceiling', tip: 'Best-case single-stream tok/s for the chosen model at batch 1, on the fewest chips that hold it (75% of peak bandwidth).', val: (a) => fitCell(a).tps, num: true, cell: (a) => fitCell(a).html },
+    ];
+
+    /* ---------- filters ---------- */
+    const bar = h('div', { class: 'hwx-bar' }, root);
+    const g1 = h('div', { class: 'hwx-row' }, bar);
+    segmented(g1, [{ value: 'all', label: 'All' }, ...(Object.keys(GROUP_LABEL) as Group[]).map((g) => ({ value: g, label: GROUP_LABEL[g] }))], st.grp, (v) => { st.grp = v as typeof st.grp; render(); });
+    select(g1, '', [{ value: 'all', label: 'Every segment' }, ...(Object.keys(SEGMENT_LABEL) as Segment[]).map((s) => ({ value: s, label: SEGMENT_LABEL[s] }))], st.seg, (v) => { st.seg = v as typeof st.seg; render(); });
+    checkbox(g1, 'Previous generations', st.prev, (v) => { st.prev = v; render(); });
+    const search = h('input', { class: 'text-input hwx-q', type: 'search', placeholder: 'Search: “hbm3e”, “nvl72”, “tpu”…', 'aria-label': 'Search accelerators' }, g1) as HTMLInputElement;
+    search.addEventListener('input', () => { st.q = search.value.trim().toLowerCase(); render(); });
+
+    const g2 = h('div', { class: 'hwx-row hwx-model' }, bar);
+    h('span', { class: 'hwx-k', text: 'Decode ceiling for' }, g2);
+    select(g2, '', MODELS.map((m) => ({ value: m.id, label: m.name })), st.m, (v) => { st.m = v; persist(); render(); });
+    segmented(g2, PREC.map(({ value, label }) => ({ value, label })), st.p, (v) => { st.p = v as Prec; persist(); render(); });
+
+    const count = h('div', { class: 'hwx-count' }, root);
+    const wrap = h('div', { class: 'hwx-tablewrap' }, root);
+    const table = h('table', { class: 'hwx-table' }, wrap);
+    const detail = h('section', { class: 'hwx-detail', 'aria-live': 'polite' }, root);
+    const cmpEl = h('section', { class: 'hwx-cmp' }, root);
+
+    function visible() {
+      const terms = st.q.split(/\s+/).filter(Boolean);
+      const list = ACCELS.filter((a) =>
+        (st.grp === 'all' || a.group === st.grp) &&
+        (st.seg === 'all' || a.segment === st.seg) &&
+        (st.prev || a.status !== 'legacy') &&
+        terms.every((t) => `${a.name} ${a.vendor} ${a.family} ${a.memType} ${a.form} ${a.link?.name ?? ''} ${a.clouds?.join(' ') ?? ''} ${SEGMENT_LABEL[a.segment]}`.toLowerCase().includes(t)));
+      const col = COLS.find((c) => c.key === st.sort);
+      const key = (a: Accel) => (st.sort === 'name' ? 0 : st.sort === 'year' ? a.year : col?.val(a) ?? null);
+      return list.sort((a, b) => {
+        if (st.sort === 'name') return st.dir * a.name.localeCompare(b.name);
+        const x = key(a), y = key(b);
+        if (x == null && y == null) return 0; if (x == null) return 1; if (y == null) return -1;
+        return st.dir * (x - y) || b.bwTBs - a.bwTBs; // ties: faster memory first
+      });
+    }
+
+    function render() {
+      const list = visible();
+      count.textContent = `${list.length} of ${ACCELS.length} accelerators`;
+      clear(table);
+      const thead = h('thead', {}, table); const tr = h('tr', {}, thead);
+      h('th', { class: 'hwx-c', title: 'Add to comparison (up to 4)', text: 'vs' }, tr);
+      const th = (key: string, label: string, tip: string, num = false) => {
+        const t = h('th', { class: num ? 'num' : '', 'aria-sort': st.sort === key ? (st.dir < 0 ? 'descending' : 'ascending') : 'none' }, tr);
+        const b = h('button', { type: 'button', title: tip, html: `${label}<i>${st.sort === key ? (st.dir < 0 ? '↓' : '↑') : ''}</i>` }, t);
+        b.addEventListener('click', () => { if (st.sort === key) st.dir = -st.dir as -1 | 1; else { st.sort = key; st.dir = key === 'name' ? 1 : -1; } render(); });
+      };
+      th('name', 'Accelerator', 'Sort by name');
+      th('year', 'Year', 'Sort by year', true);
+      COLS.forEach((c) => th(c.key, c.key === 'fit' ? `${model().name.replace(/ \(.*\)/, '')} · ${PREC.find((x) => x.value === st.p)!.label}` : c.label, c.tip, c.num));
+
+      // magnitude bars use a log scale: capacities span 0.2 GB → 750 GB and bandwidths 0.2 → 21,000 TB/s
+      const span: Record<string, [number, number]> = {};
+      COLS.filter((c) => c.bar).forEach((c) => {
+        const v = list.map((a) => c.val(a) ?? 0).filter((x) => x > 0);
+        span[c.key] = [Math.log10(Math.min(...v)), Math.log10(Math.max(...v))];
+      });
+      const tb = h('tbody', {}, table);
+      for (const a of list) {
+        const r = h('tr', { class: a.id === st.sel ? 'on' : '', tabindex: 0, 'data-id': a.id }, tb);
+        const cc = h('td', { class: 'hwx-c' }, r);
+        const cb = h('input', { type: 'checkbox', checked: st.cmp.includes(a.id), 'aria-label': `Compare ${a.name}`, disabled: !st.cmp.includes(a.id) && st.cmp.length >= 4 }, cc) as HTMLInputElement;
+        cb.addEventListener('click', (e) => e.stopPropagation());
+        cb.addEventListener('change', () => { st.cmp = cb.checked ? [...st.cmp, a.id] : st.cmp.filter((x) => x !== a.id); persist(); render(); });
+        const nm = h('td', { class: 'hwx-name' }, r);
+        nm.innerHTML = `<span class="hwx-nm">${swatch(a.group)}<b>${a.name}</b></span><span class="hw-sub">${a.vendor} · ${SEGMENT_LABEL[a.segment]}${a.status !== 'shipping' ? ` · <em class="st-${a.status}">${STATUS_LABEL[a.status]}</em>` : ''}</span>`;
+        h('td', { class: 'num', text: String(a.year) }, r);
+        for (const c of COLS) {
+          const td = h('td', { class: 'num' + (c.key === 'fit' ? ' hwx-fit' : '') }, r);
+          td.innerHTML = c.cell(a);
+          if (c.bar) {
+            const v = c.val(a) ?? 0; const [lo, hi] = span[c.key];
+            const f = v > 0 && hi > lo ? (Math.log10(v) - lo) / (hi - lo) : 1;
+            const i = h('i', { class: 'hwx-bar-fill', title: 'log scale' }, td); i.style.width = `calc(${(8 + f * 92).toFixed(1)}% - 20px)`;
+          }
+        }
+        const open = () => { st.sel = st.sel === a.id ? null : a.id; persist(); render(); if (st.sel) detail.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); };
+        r.addEventListener('click', open);
+        r.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+      }
+      if (!list.length) { const r = h('tr', {}, tb); h('td', { colspan: COLS.length + 3, class: 'hwx-none', text: 'Nothing matches those filters.' }, r); }
+      renderDetail(); renderCompare();
+    }
+
+    /* ---------- spec sheet for one accelerator ---------- */
+    function renderDetail() {
+      clear(detail);
+      const a = ACCELS.find((x) => x.id === st.sel);
+      detail.hidden = !a;
+      if (!a) return;
+      const hd = h('header', { class: 'hwd-head' }, detail);
+      const t = h('div', {}, hd);
+      t.innerHTML = `<div class="hwd-badges"><span class="hwd-vendor" style="--gc:${G_COLOR[a.group]}">${swatch(a.group)}${a.vendor}</span><span>${a.family}</span><span>${a.year}</span><span>${SEGMENT_LABEL[a.segment]}</span><span class="st-${a.status}">${STATUS_LABEL[a.status]}</span></div><h3>${a.name}</h3>`;
+      const acts = h('div', { class: 'hwd-acts' }, hd);
+      const inCmp = st.cmp.includes(a.id);
+      const cb = h('button', { type: 'button', class: 'btn', text: inCmp ? 'Remove from compare' : 'Add to compare', disabled: !inCmp && st.cmp.length >= 4 }, acts);
+      cb.addEventListener('click', () => { st.cmp = inCmp ? st.cmp.filter((x) => x !== a.id) : [...st.cmp, a.id]; persist(); render(); });
+      if (a.calc) h('a', { class: 'btn', href: `${u('lab/')}#g=${a.calc}`, text: 'Open in the Lab →' }, acts);
+      const x = h('button', { type: 'button', class: 'btn', 'aria-label': 'Close spec sheet', text: '✕' }, acts);
+      x.addEventListener('click', () => { st.sel = null; persist(); render(); });
+
+      h('p', { class: 'hwd-take', text: a.take }, detail);
+
+      // inference profile: derived numbers
+      const m8 = getModel('llama3-8b'); const m70 = getModel('llama3-70b');
+      const usable = a.memGB * USABLE;
+      const tiles = h('div', { class: 'stats hwd-tiles' }, detail);
+      const tile = (k: string, v: string, s: string) => { const d = h('div', { class: 'stat' }, tiles); h('div', { class: 'k', text: k }, d); h('div', { class: 'v', text: v }, d); h('div', { class: 's', text: s }, d); };
+      const n70 = chipsFor(a, m70.params);
+      tile('Fits on one chip', isSram(a) ? `${memStr(a.memGB)}` : `≈${nf(usable * 0.75)}B`, isSram(a) ? 'SRAM: models are spread across many chips' : 'params at FP8, leaving ~25% for KV cache');
+      tile('8B, BF16, batch 1', a.memGB * USABLE >= m8.params * 2 / 1e9 * 1.1 ? `≤ ${nf(decodeCeiling(a, m8.params * 2))} tok/s` : 'does not fit', 'single-stream decode ceiling');
+      tile('70B, FP8, batch 1', `≤ ${nf(decodeCeiling(a, m70.params, n70))} tok/s`, `on ${n70}× chip${n70 > 1 ? 's' : ''}${!isSram(a) && placement(a, n70) === 'multi-node' ? ', across nodes' : ''}`);
+      if (ridgeBF16(a) != null) tile('Ridge point', `${nf(ridgeBF16(a))} FLOP/B`, 'BF16; below this intensity, memory-bound');
+      if (a.price && a.memGB >= 1) tile('Memory per $', `${nf(a.memGB / ((a.price[0] + a.price[1]) / 2))} GB`, 'per dollar-hour (midpoint price)');
+
+      const grid = h('div', { class: 'hwd-grid' }, detail);
+      const sec = (title: string, rows: [string, string | null | undefined][]) => {
+        const rs = rows.filter(([, v]) => v != null && v !== '' && v !== '—');
+        if (!rs.length) return;
+        const g = h('div', { class: 'hwd-sec' }, grid);
+        h('h4', { text: title }, g);
+        const dl = h('dl', {}, g);
+        rs.forEach(([k, v]) => { h('dt', { text: k }, dl); h('dd', { html: v! }, dl); });
+      };
+      const tf = (v: number | null | undefined, unit = 'TFLOPS') => (v == null ? null : `${nf(v)} ${unit}`);
+      sec('Compute (dense)', [
+        ['BF16 / FP16', tf(a.bf16)], ['FP8', tf(a.fp8)], ['FP6', tf(a.fp6)], ['FP4', tf(a.fp4)], ['INT8', tf(a.int8, 'TOPS')], ['TF32', tf(a.tf32)],
+        ['FP4 formats', a.fp4Formats?.length ? a.fp4Formats.join(', ') : null],
+        [a.coreLabel ?? 'Cores', a.cores ? nf(a.cores) : null],
+      ]);
+      sec('Memory', [
+        ['Capacity', `${memStr(a.memGB)} ${a.memType}`], ['Bandwidth', `${nf(a.bwTBs, 2)} TB/s`],
+        ['On-chip SRAM / LLC', a.sramMB ? memStr(a.sramMB / 1000) : null],
+        ['Full-memory sweep', `${nf((a.memGB / (a.bwTBs * 1000)) * 1000, 1)} ms`],
+      ]);
+      sec('Scale-up & I/O', [
+        ['Fabric', a.link ? `${a.link.name}: ${nf(a.link.GBs)} GB/s` : null],
+        ['Domain', a.link && a.link.domain > 1 ? `${a.link.domain} chips` : null],
+        ['Host link', a.pcie], ['Partitioning', a.partitioning],
+      ]);
+      sec('Physical & market', [
+        ['Form factor', a.form], ['Process', a.process], ['Transistors', a.transistorsB ? `${nf(a.transistorsB)} B` : null],
+        ['Power', a.tdpW ? `${nf(a.tdpW)} W` : null], ['Cloud $/hr', a.price ? priceStr(a.price) : null],
+        ['Purchase', a.msrp ? `≈ $${a.msrp.toLocaleString('en-US')}` : null], ['Where', a.clouds?.length ? a.clouds.join(', ') : null],
+      ]);
+      if (a.caveats) h('p', { class: 'hwd-cav', html: `<b>Read the fine print.</b> ${a.caveats}` }, detail);
+      if (a.sources.length) {
+        const srcs = h('p', { class: 'hwd-src' }, detail);
+        srcs.innerHTML = 'Sources: ' + a.sources.map((s, i) => `<a href="${s}" target="_blank" rel="noopener">${host(s)}${a.sources.filter((x) => host(x) === host(s)).length > 1 ? ' ' + (i + 1) : ''}</a>`).join(' · ');
+      }
+    }
+
+    /* ---------- side-by-side comparison ---------- */
+    function renderCompare() {
+      clear(cmpEl);
+      const list = st.cmp.map((id) => ACCELS.find((a) => a.id === id)!).filter(Boolean);
+      cmpEl.hidden = list.length < 1;
+      if (!list.length) return;
+      const hd = h('header', { class: 'hwd-head' }, cmpEl);
+      h('h3', { text: list.length === 1 ? 'Pick at least one more to compare' : `Comparing ${list.length}` }, hd);
+      const clr = h('button', { type: 'button', class: 'btn', text: 'Clear' }, hd);
+      clr.addEventListener('click', () => { st.cmp = []; persist(); render(); });
+      if (list.length < 2) return;
+      const rows: { k: string; v: (a: Accel) => number | null; f: (a: Accel) => string; lower?: boolean }[] = [
+        { k: 'Memory', v: (a) => a.memGB, f: (a) => memStr(a.memGB) },
+        { k: 'Bandwidth (TB/s)', v: (a) => a.bwTBs, f: (a) => nf(a.bwTBs, 2) },
+        { k: 'BF16 TFLOPS', v: (a) => a.bf16, f: (a) => nf(a.bf16) },
+        { k: 'FP8 TFLOPS', v: (a) => a.fp8 ?? null, f: (a) => nf(a.fp8) },
+        { k: 'FP4 TFLOPS', v: (a) => a.fp4 ?? null, f: (a) => nf(a.fp4) },
+        { k: 'Scale-up (GB/s)', v: (a) => a.link?.GBs ?? null, f: (a) => a.link ? nf(a.link.GBs) : '—' },
+        { k: 'Ridge (FLOP/B)', v: (a) => ridgeBF16(a), f: (a) => nf(ridgeBF16(a)), lower: true },
+        { k: 'Power (W)', v: (a) => a.tdpW ?? null, f: (a) => nf(a.tdpW), lower: true },
+        { k: '$/hr', v: (a) => a.price ? (a.price[0] + a.price[1]) / 2 : null, f: (a) => priceStr(a.price), lower: true },
+        { k: `${model().name.replace(/ \(.*\)/, '')} ${PREC.find((x) => x.value === st.p)!.label} tok/s`, v: (a) => fitCell(a).tps, f: (a) => { const c = fitCell(a); return `${nf(c.tps)} <small>(${c.n}×)</small>`; } },
+      ];
+      const t = h('div', { class: 'hwc-grid', style: `--n:${list.length}` }, cmpEl);
+      h('div', { class: 'hwc-k' }, t);
+      list.forEach((a) => h('div', { class: 'hwc-h', html: `${swatch(a.group)}<span>${a.name}</span>` }, t));
+      for (const r of rows) {
+        const vals = list.map(r.v); const mx = Math.max(...vals.map((v) => v ?? 0));
+        const valid = vals.filter((v): v is number => v != null && v > 0);
+        const best = valid.length ? (r.lower ? Math.min(...valid) : Math.max(...valid)) : null;
+        h('div', { class: 'hwc-k', text: r.k }, t);
+        list.forEach((a, i) => {
+          const c = h('div', { class: 'hwc-v' + (vals[i] != null && vals[i] === best && valid.length > 1 ? ' best' : '') }, t);
+          h('span', { html: r.f(a) }, c);
+          const b = h('i', {}, c); b.style.width = `${vals[i] ? Math.max(2, (vals[i]! / (mx || 1)) * 100) : 0}%`; b.style.background = G_COLOR[a.group];
+        });
+      }
+      h('p', { class: 'hwc-note', text: 'Bars are scaled to the largest value in each row. Bold marks the best value; for ridge point, power and price, lower is better. The tok/s row is a bandwidth ceiling, not a benchmark.' }, cmpEl);
+    }
+
+    render();
+    addEventListener('hw:open', (e) => {
+      st.sel = (e as CustomEvent<string>).detail; st.grp = 'all'; st.seg = 'all'; st.prev = true; st.q = ''; search.value = '';
+      persist(); render();
+      detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
+</script>
+
+<style>
+  .hwx :global(.hwx-bar) { display: flex; flex-direction: column; gap: 10px; margin-bottom: 10px; }
+  .hwx :global(.hwx-row) { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+  .hwx :global(.hwx-q) { flex: 1; min-width: 200px; max-width: 340px; padding: 7px 12px; font-size: 0.85rem; }
+  .hwx :global(.hwx-k) { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.09em; color: var(--text-faint); font-weight: 650; }
+  .hwx :global(.hwx-count) { font-size: 0.78rem; color: var(--text-faint); margin: 4px 0 6px; }
+  .hwx :global(.hwx-tablewrap) { overflow: auto; max-height: min(76vh, 860px); overscroll-behavior: contain; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); }
+  .hwx :global(.hwx-table) { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 0.84rem; min-width: 1120px; }
+  .hwx :global(.hwx-table th) { position: sticky; top: 0; z-index: 2; background: var(--surface-2); text-align: left; padding: 0; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .hwx :global(.hwx-table th button) { appearance: none; border: 0; background: none; font: inherit; color: var(--text-faint); font-size: 0.7rem; font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em; padding: 10px 10px; cursor: pointer; width: 100%; text-align: inherit; }
+  .hwx :global(.hwx-table th button:hover) { color: var(--text); }
+  .hwx :global(.hwx-table th[aria-sort='ascending'] button), .hwx :global(.hwx-table th[aria-sort='descending'] button) { color: var(--accent); }
+  .hwx :global(.hwx-table th i) { font-style: normal; margin-left: 3px; }
+  .hwx :global(.hwx-table th.num), .hwx :global(.hwx-table td.num) { text-align: right; }
+  .hwx :global(.hwx-table th.hwx-c) { padding: 10px 6px 10px 12px; font-size: 0.66rem; color: var(--text-faint); text-transform: uppercase; }
+  .hwx :global(.hwx-table td) { padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; font-variant-numeric: tabular-nums; position: relative; white-space: nowrap; }
+  .hwx :global(.hwx-table td.num) { font-family: var(--font-mono); font-size: 0.8rem; }
+  .hwx :global(.hwx-table td.hwx-c) { padding-left: 12px; width: 28px; }
+  .hwx :global(.hwx-table td.hwx-c input) { accent-color: var(--accent); width: 15px; height: 15px; }
+  .hwx :global(.hwx-table tbody tr) { cursor: pointer; transition: background 0.12s; }
+  .hwx :global(.hwx-table tbody tr:hover) { background: var(--surface-2); }
+  .hwx :global(.hwx-table tbody tr:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .hwx :global(.hwx-table tbody tr.on) { background: var(--accent-soft); }
+  .hwx :global(.hwx-table tbody tr:last-child td) { border-bottom: 0; }
+  .hwx :global(.hwx-name) { position: sticky; left: 0; z-index: 1; background: var(--surface-solid); }
+  .hwx :global(.hwx-table tbody tr:hover .hwx-name) { background: var(--surface-2); }
+  .hwx :global(.hwx-table tbody tr.on .hwx-name) { background: color-mix(in srgb, var(--accent) 12%, var(--surface-solid)); }
+  .hwx :global(.hwx-nm) { display: inline-flex; align-items: center; gap: 7px; }
+  .hwx :global(.hwx-nm b) { font-weight: 620; }
+  .hwx :global(.hw-sub) { display: block; font-size: 0.72rem; color: var(--text-faint); font-family: var(--font-sans); font-weight: 450; margin-top: 1px; }
+  .hwx :global(.hwx-name .hw-sub) { padding-left: 19px; }
+  .hwx :global(.hw-sub em) { font-style: normal; color: var(--c-prefill); }
+  .hwx :global(.hw-warn) { color: var(--c-waste); font-weight: 600; }
+  .hwx :global(.hwx-bar-fill) { position: absolute; right: 10px; bottom: 5px; height: 3px; border-radius: 2px; background: var(--accent); opacity: 0.5; }
+  .hwx :global(.hwx-fit b) { color: var(--c-decode); font-weight: 650; }
+  .hwx :global(.hwx-none) { text-align: center; color: var(--text-faint); padding: 26px; }
+
+  .hwx :global(.hwx-detail), .hwx :global(.hwx-cmp) { margin-top: 16px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); padding: 16px 18px; scroll-margin-top: calc(var(--header-h) + 16px); }
+  .hwx :global(.hwx-detail) { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+  .hwx :global(.hwd-head) { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+  .hwx :global(.hwd-head h3) { margin: 4px 0 0; font-size: 1.35rem; letter-spacing: -0.02em; }
+  .hwx :global(.hwd-badges) { display: flex; flex-wrap: wrap; gap: 6px; font-size: 0.74rem; color: var(--text-dim); }
+  .hwx :global(.hwd-badges span) { padding: 2px 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); display: inline-flex; align-items: center; gap: 5px; }
+  .hwx :global(.hwd-vendor) { color: var(--text) !important; font-weight: 600; }
+  .hwx :global(.st-announced), .hwx :global(.st-sampling) { color: var(--c-prefill) !important; }
+  .hwx :global(.st-legacy) { color: var(--text-faint) !important; }
+  .hwx :global(.hwd-acts) { display: flex; gap: 8px; flex-wrap: wrap; }
+  .hwx :global(.hwd-acts a.btn) { text-decoration: none; }
+  .hwx :global(.hwd-take) { margin: 10px 0 0; color: var(--text); line-height: 1.6; max-width: 900px; }
+  .hwx :global(.hwd-tiles) { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+  .hwx :global(.hwd-grid) { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px 22px; margin-top: 16px; }
+  .hwx :global(.hwd-sec h4) { margin: 0 0 6px; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.09em; color: var(--accent); }
+  .hwx :global(.hwd-sec dl) { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 0.84rem; }
+  .hwx :global(.hwd-sec dt) { color: var(--text-faint); }
+  .hwx :global(.hwd-sec dd) { margin: 0; font-family: var(--font-mono); font-size: 0.8rem; text-align: right; overflow-wrap: anywhere; }
+  .hwx :global(.hwd-cav) { margin: 16px 0 0; font-size: 0.86rem; padding: 10px 13px; border-radius: 10px; background: var(--c-prefill-soft); border: 1px solid color-mix(in srgb, var(--c-prefill) 30%, transparent); line-height: 1.55; }
+  .hwx :global(.hwd-cav b) { color: var(--c-prefill); }
+  .hwx :global(.hwd-src) { margin: 12px 0 0; font-size: 0.76rem; color: var(--text-faint); line-height: 1.7; }
+  .hwx :global(.hw-sw) { flex: none; vertical-align: -1px; }
+
+  .hwx :global(.hwc-grid) { display: grid; grid-template-columns: minmax(140px, 0.9fr) repeat(var(--n), minmax(110px, 1fr)); gap: 0; margin-top: 12px; overflow-x: auto; font-size: 0.84rem; }
+  .hwx :global(.hwc-grid > div) { padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  .hwx :global(.hwc-h) { font-weight: 650; display: flex; gap: 6px; align-items: center; font-size: 0.86rem; }
+  .hwx :global(.hwc-k) { color: var(--text-dim); font-size: 0.8rem; }
+  .hwx :global(.hwc-v) { font-family: var(--font-mono); font-size: 0.8rem; display: flex; flex-direction: column; gap: 4px; }
+  .hwx :global(.hwc-v.best span) { font-weight: 750; color: var(--text); }
+  .hwx :global(.hwc-v i) { display: block; height: 6px; border-radius: 3px; min-width: 0; }
+  .hwx :global(.hwc-v small) { color: var(--text-faint); }
+  .hwx :global(.hwc-note) { font-size: 0.76rem; color: var(--text-faint); margin: 10px 0 0; }
+  @media (max-width: 640px) {
+    .hwx :global(.hwx-q) { max-width: none; width: 100%; }
+    .hwx :global(.hwd-sec dd) { text-align: left; }
+  }
+</style>

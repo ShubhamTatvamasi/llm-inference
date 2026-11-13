@@ -7,7 +7,7 @@
 
 <script>
   import { mountAll, svgRoot, s, rect, text, line, clear, ctrlBar, select, slider, segmented, stats, legend, narration, C, fmt } from '../../lib/viz';
-  import { GPUS, MODELS, getGPU, getModel, kvBytesPerToken } from '../../data/hardware';
+  import { GPUS, MODELS, getGPU, getModel, kvBytesPerToken, kvBytesPerGpu } from '../../data/hardware';
   import { touchedWeightBytes, BW_EFF } from '../lab/labModel';
 
   const W = 940, H = 340, X0 = 70, X1 = 910, Y0 = 290, Y1 = 24;
@@ -32,7 +32,7 @@
       // weights may not fit on one GPU; the curve is still per-GPU-bandwidth intuition, so shard notionally
       const shards = Math.max(1, Math.ceil((model.params * wB) / (gpu.memGB * 1e9 * 0.75)));
       const wBytes = touchedWeightBytes(model, wB, B) / shards;
-      const kvTok = kvBytesPerToken(model, kvB) / shards;
+      const kvTok = kvBytesPerGpu(model, shards, kvB);
       const maxCtx = model.maxCtx;
       const tW = wBytes / bw;
       const tKV = (ctx: number) => (B * ctx * kvTok) / bw;

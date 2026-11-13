@@ -25,7 +25,7 @@
     { name: '70B on 4×H100 · FP8', st: { m: 'llama3-70b', g: 'h100', tp: 4, w: 'fp8', kv: 'fp8', p: 2048, o: 512, b: 64 }, look: 'Tensor parallelism splits the weights four ways, so each step reads ¼ of them per GPU, plus a little all-reduce time (teal).' },
     { name: 'Long-context RAG · 32k prompts', st: { m: 'llama3-8b', g: 'h100', tp: 1, w: 'bf16', kv: 'bf16', p: 32768, o: 512, b: 8 }, look: 'Now the KV cache dominates both memory and step time. Only a handful of requests fit, and TTFT is mostly attention FLOPs. Try KV = FP8.' },
     { name: 'Will not fit · 70B on 1×4090', st: { m: 'llama3-70b', g: 'rtx4090', tp: 1, w: 'bf16', kv: 'bf16', p: 1024, o: 256, b: 1 }, look: '141 GB of weights cannot fit in 24 GB. Try INT4 weights and more GPUs, and see how much is left for KV.' },
-    { name: 'MoE · DeepSeek-V3 on 8×H200', st: { m: 'deepseek-v3', g: 'h200', tp: 8, w: 'fp8', kv: 'bf16', p: 2048, o: 1024, b: 64 }, look: '671B parameters, but only 37B are active per token. At batch 1 a step reads only the chosen experts. As the batch grows, more experts are touched, so weight reads grow too. MLA keeps the KV tiny.' },
+    { name: 'MoE · DeepSeek-V3 on 8×H200', st: { m: 'deepseek-v3', g: 'h200', tp: 8, w: 'fp8', kv: 'bf16', p: 2048, o: 1024, b: 64 }, look: '671B parameters, but only 37B are active per token. At batch 1 a step reads only the chosen experts. As the batch grows, more experts are touched, so weight reads grow too. MLA keeps each token’s KV tiny, but under tensor parallelism every GPU stores the full latent, so 8 GPUs give no more KV room per token than one.' },
     { name: 'Compute-bound · huge batch', st: { m: 'llama3-8b', g: 'h100', tp: 1, w: 'fp8', kv: 'fp8', p: 128, o: 64, b: 512 }, look: 'With 512 very short sequences the tensor cores finally become the bottleneck (the orange lane is longest). Now raise the prompt to 512 tokens: the KV reads take over again before compute does. Reaching compute-bound decode is harder than it looks.' },
   ];
 
@@ -111,7 +111,7 @@
     const svgCurve = svgRoot(pCurve, 460, 250, { 'aria-label': 'Throughput versus per-user speed as batch grows' });
     const pTime = h('section', { class: 'lab-panel lab-wide' }, grid);
     { const hd = h('header', {}, pTime); h('h3', { text: '5 · One request, start to finish' }, hd); h('span', { class: 'lab-learnwrap', html: learn('prefill-decode', 'Prefill vs decode') + learn('metrics', 'Metrics') }, hd); }
-    h('p', { class: 'lab-sub', text: 'Time to first token is prefill plus one step. Every later token costs one decode step. Bars are drawn to scale; queueing time is not included.' }, pTime);
+    h('p', { class: 'lab-sub', text: 'The prefill pass emits the first token, so TTFT is prefill time. Every later token costs one decode step. Bars are drawn to scale; queueing time is not included.' }, pTime);
     const svgTime = svgRoot(pTime, 940, 96, { 'aria-label': 'Timeline of one request' });
 
     const share = h('div', { class: 'lab-foot' }, root);
@@ -133,7 +133,7 @@
       const fits = r.mem.fits && r.mem.maxSeqs >= 1;
       const over = fits && st.b > r.mem.maxSeqs;
       root.classList.toggle('lab-nofit', !fits);
-      sts.set('TTFT', fits ? ms(r.ttft) : '—', fits ? `prefill ${ms(r.pf.t)} + 1 step` : 'does not fit');
+      sts.set('TTFT', fits ? ms(r.ttft) : '—', fits ? `prefill of ${tok(st.p)} tokens` : 'does not fit');
       sts.set('TPOT', fits ? ms(r.tpot) : '—', 'time per output token');
       sts.set('Per-user speed', fits ? `${r.perUser.toFixed(0)} tok/s` : '—', !fits ? '' : r.perUser > 20 ? 'faster than reading' : 'below reading speed', fits && r.perUser < 20 ? C.waste : undefined);
       sts.set('Total throughput', fits ? `${fmt.int(over ? r.mem.maxSeqs / r.tpot : r.total)} tok/s` : '—', !fits ? '' : over ? `capped at ${r.mem.maxSeqs} running` : `${st.b} stream${st.b > 1 ? 's' : ''}`);
@@ -324,6 +324,8 @@
       if (d.bound === 'weights') parts.push(`<b>Weight-bandwidth-bound.</b> Every step streams ${gb(d.wB)} of weights through HBM to produce just ${st.b} token${st.b > 1 ? 's' : ''}. ${st.b < 64 ? 'More batch is nearly free: each step costs about the same but yields more tokens.' : 'Batching has amortized most of it.'} ${learn('batching', 'Batching')}`);
       if (d.bound === 'kv') parts.push(`<b>KV-bandwidth-bound.</b> Reading ${gb(d.kvB)} of cached keys and values now costs more than reading the weights. Long contexts make decode scale with context length. FP8 KV, GQA/MLA or prefix sharing help. ${learn('attention', 'GQA & MLA')}`);
       if (d.bound === 'compute') parts.push(`<b>Compute-bound.</b> The batch is big enough that tensor cores are the bottleneck. From here, more concurrency lowers every user's speed roughly in proportion. ${learn('roofline', 'Roofline')}`);
+      if (m.attn === 'MLA' && st.tp > 1) parts.push(`MLA’s compressed KV is shared by every head, so each of the ${st.tp} GPUs keeps a full copy: TP=${st.tp} multiplies KV memory by ${st.tp}. Production DeepSeek deployments use data-parallel attention for this reason. ${learn('moe', 'MoE')}`);
+      else if (st.tp > m.kvHeads) parts.push(`TP=${st.tp} exceeds the ${m.kvHeads} KV heads, so KV heads are replicated across GPUs. ${learn('parallelism', 'Parallelism')}`);
       if (r.pf.attnShare > 0.3) parts.push(`Prefill is ${fmt.pct(r.pf.attnShare)} attention at ${tok(st.p)} tokens, the quadratic term. ${learn('flash-attention', 'FlashAttention')}`);
       if (d.tComm / d.step > 0.15) parts.push(`All-reduce is ${fmt.pct(d.tComm / d.step)} of each step at TP=${st.tp}. ${learn('interconnects', 'Interconnects')}`);
       if (r.perUser < 20) parts.push(`<span style="color:${C.waste}">Each user gets ${r.perUser.toFixed(0)} tok/s, slower than people read.</span>`);

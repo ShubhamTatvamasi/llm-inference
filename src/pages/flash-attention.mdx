@@ -67,9 +67,11 @@ The arithmetic intensity of the fused kernel is roughly the Q block size: each K
 | **FlashAttention (v1)** | Tiling + online softmax, fused into one kernel | Removed the N² memory wall |
 | **FlashAttention-2** | Better parallelism across sequence length and warps; fewer non-matmul FLOPs | ~2× faster; standard for prefill |
 | **FlashAttention-3** | Hopper-specific: asynchronous tensor-core ops (WGMMA), TMA loads, warp specialisation, FP8 | Overlaps data movement with math on H100-class GPUs |
+| **FlashAttention-4** | Blackwell-specific: tensor memory (TMEM), 5th-gen tensor cores, a software exponential and conditional softmax rescaling | Keeps attention near the tensor-core peak on B200/B300-class GPUs, where softmax, not the matmuls, became the bottleneck |
+| **FlashMLA & MLA kernels** | Decode kernels for DeepSeek-style [MLA](../attention/) that attend directly in the compressed latent | MLA decode does more FLOPs per byte than GQA, so it needs its own kernels |
 | **Flash-Decoding (split-K)** | Splits the **KV sequence** across thread blocks at decode time, then reduces | Fills the GPU when batch × heads is small but context is long |
 | **Paged variants** | Read K/V through a [block table](../paged-attention/) instead of contiguous memory | Lets serving engines use PagedAttention without copying |
-| **FlashInfer & similar libraries** | Kernels specialised for serving: paged/ragged KV, shared-prefix ("cascade") attention, sampling | Used by engines like vLLM and SGLang |
+| **FlashInfer, cuDNN, TRT-LLM kernels** | Kernels specialised for serving: paged/ragged KV, shared-prefix ("cascade") attention, sampling, FP8 KV | Engines like vLLM and SGLang pick a backend per GPU and model; the "FlashAttention" in production is often one of these |
 
 ## Decode is a different problem
 
@@ -102,7 +104,7 @@ At decode time each sequence has only **one query row**. The work is "one row ti
   <Q q="How does FlashAttention interact with PagedAttention?" level="senior">
     PagedAttention stores KV in non-contiguous fixed-size blocks. A paged attention kernel loads each K/V tile by looking up the block table, then does the same tiled online-softmax computation. Block size is therefore co-designed with the kernel's tile size, and serving engines ship paged variants of FlashAttention-style kernels.
   </Q>
-  <Q q="What did FlashAttention-3 change, and why does it only apply to newer GPUs?" level="senior">
-    It uses Hopper-generation features: asynchronous warp-group matrix multiplies, the Tensor Memory Accelerator for bulk async loads, and warp specialisation. These let it overlap softmax, data movement and matmul, and support FP8 attention with techniques to control quantization error. Older architectures lack these instructions, so they keep FA-2-style kernels.
+  <Q q="What did FlashAttention-3 and -4 change, and why are they tied to specific GPUs?" level="senior">
+    FA-3 uses Hopper features: asynchronous warp-group matrix multiplies, the Tensor Memory Accelerator for bulk async loads, and warp specialisation. These overlap softmax, data movement and matmul, and support FP8 attention. FA-4 targets Blackwell, whose tensor cores are so fast that the softmax exponentials became the bottleneck. It computes some exponentials in software and skips most rescaling steps. Each depends on instructions older architectures lack, so those keep FA-2-style kernels.
   </Q>
 </Interview>

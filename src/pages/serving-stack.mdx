@@ -40,7 +40,7 @@ vLLM, SGLang, TensorRT-LLM (`trtllm-serve`) and llama.cpp (`llama-server`) all e
 |---|---|---|
 | **vLLM** | General-purpose GPU serving; widest model coverage; PagedAttention, prefix caching, multi-LoRA, structured output, speculative decoding, P/D connectors | Many knobs; defaults (like max context) are often not right for your workload |
 | **SGLang** | Workloads with heavy prefix sharing (agents, RAG, few-shot) via RadixAttention; strong large-MoE and P/D support | Smaller ecosystem; check model support |
-| **TensorRT-LLM** | Highest performance on NVIDIA, FP8/FP4 kernels, in-flight batching, pairs with Triton / Dynamo | NVIDIA-only; engine builds per GPU and config |
+| **TensorRT-LLM** | Highest performance on NVIDIA, FP8/FP4 kernels, in-flight batching, pairs with Triton / Dynamo. Since 1.0 it runs on a PyTorch backend and serves Hugging Face checkpoints directly with `trtllm-serve`, no engine build | NVIDIA-only; the older compiled-engine workflow is legacy |
 | **llama.cpp** | CPU, Apple Silicon, edge and laptops; GGUF single-file models with many quantization types | Not built for high-concurrency datacenter GPU serving |
 | **Hugging Face TGI** | Existing deployments | In maintenance mode; prefer an actively developed engine for new work |
 

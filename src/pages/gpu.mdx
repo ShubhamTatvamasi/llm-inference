@@ -81,6 +81,10 @@ Things to try in the calculator:
 - **INT4 weights**: the single-stream ceiling roughly quadruples, because there are 4× fewer bytes to read. This is why weight-only [quantization](../quantization/) is so popular for low-batch serving.
 - **H100 vs H200**: identical FLOPs but 43% more bandwidth. Decode gets faster; compute-bound prefill does not.
 
+<Callout type="tip" title="Every chip, side by side">
+The calculators here use a handful of common GPUs. The [inference hardware page](../hardware/) covers 76 accelerators, including TPUs, Trainium, MI355X, Rubin, Apple silicon and SRAM chips like Groq and Cerebras. It has sortable specs, a capacity × bandwidth map, side-by-side comparison, and a calculator that ranks every option by cost per token for your model.
+</Callout>
+
 ## What this means for serving
 
 | Fact about the hardware | Consequence for serving |

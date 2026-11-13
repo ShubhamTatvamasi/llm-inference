@@ -54,7 +54,7 @@ const partIcons: Record<string, string> = {
     <section class="tools reveal">
       <div class="sec-head">
         <span class="eyebrow">Learn by doing</span>
-        <h2>Three ways in</h2>
+        <h2>Four ways in</h2>
         <p>Experiment first and read later, or the other way round.</p>
       </div>
       <div class="tool-grid">
@@ -63,6 +63,12 @@ const partIcons: Record<string, string> = {
           <b>Turn every knob at once</b>
           <span>Pick a model, GPU and workload. Memory, step time, the roofline, the throughput–latency curve and cost all update together, with a plain-English note on what is limiting you.</span>
           <span class="tool-go">Open the Lab →</span>
+        </a>
+        <a class="tool" href={u('hardware/')} data-spot>
+          <span class="tool-k">Inference Hardware</span>
+          <b>Know your silicon</b>
+          <span>Every inference GPU and accelerator, from RTX cards to Rubin racks, TPUs and Trainium. Sort, compare, and find the cheapest hardware for your model.</span>
+          <span class="tool-go">Browse hardware →</span>
         </a>
         <a class="tool" href={u('map/')} data-spot>
           <span class="tool-k">Concept Map</span>
@@ -122,7 +128,7 @@ const partIcons: Record<string, string> = {
 
     <section class="features reveal">
       <div class="feat"><b>Live, not static</b><span>Play, pause, step and scrub every simulation, or change the inputs and watch the result update.</span></div>
-      <div class="feat"><b>Real numbers</b><span>Calculators use real model configs (Llama, Qwen, DeepSeek, Mixtral) and real GPU specs (A100 → B200).</span></div>
+      <div class="feat"><b>Real numbers</b><span>Calculators use real model configs (Llama, Qwen, DeepSeek, Mixtral) and real specs for 76 accelerators, from RTX cards and Apple silicon to MI355X, TPUs and Rubin.</span></div>
       <div class="feat"><b>Interview-ready</b><span>Each chapter closes with core, mid and senior-level questions you can try before revealing the answer.</span></div>
       <div class="feat"><b>Keyboard-first</b><span><kbd>⌘K</kbd> or <kbd>/</kbd> to search, <kbd>[</kbd> and <kbd>]</kbd> for the previous and next chapter.</span></div>
     </section>
@@ -195,7 +201,8 @@ const partIcons: Record<string, string> = {
     .card-list a:hover .t { color: var(--accent); }
     .card-list a:hover .arr { opacity: 1; transform: none; color: var(--accent); }
 
-    .tool-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .tool-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+    @media (max-width: 1180px) { .tool-grid { grid-template-columns: repeat(2, 1fr); } }
     .tool { --mx: 50%; --my: 0%; position: relative; display: flex; flex-direction: column; gap: 6px; padding: 20px; border-radius: 18px; border: 1px solid var(--border); background: var(--surface); color: var(--text); overflow: hidden; isolation: isolate; transition: border-color 0.25s, transform 0.25s; }
     .tool::before { content: ''; position: absolute; inset: 0; z-index: -1; background: radial-gradient(360px circle at var(--mx) var(--my), var(--accent-soft), transparent 60%); opacity: 0; transition: opacity 0.3s; }
     .tool:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); transform: translateY(-2px); background-size: auto; }

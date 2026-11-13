@@ -57,7 +57,7 @@ Watch all three on the **same** request stream:
   </Fragment>
 </Viz>
 
-Continuous batching was introduced as **iteration-level scheduling**: the scheduler decides membership per forward pass, not per request. TensorRT-LLM calls the same idea **in-flight batching**. Today it is the default in vLLM, SGLang, TensorRT-LLM, TGI and llama.cpp's server.
+Continuous batching was introduced as **iteration-level scheduling**: the scheduler decides membership per forward pass, not per request. TensorRT-LLM calls the same idea **in-flight batching**. Today it is the default in vLLM, SGLang, TensorRT-LLM and llama.cpp's server (and in TGI, which is now in maintenance mode).
 
 ## How much does the tail cost?
 

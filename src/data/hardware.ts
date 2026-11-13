@@ -1,3 +1,5 @@
+import { ACCELS, CALC_GPUS } from './accelerators';
+
 /* Shared, reusable reference numbers so every chapter quotes the same specs.
    GPU numbers are spec-sheet peak, DENSE (no 2:4 sparsity). Treat as approximate.
    Model numbers come from the public model configs. */
@@ -19,15 +21,17 @@ export interface GPU {
   pricePerHr: number;   // rough cloud on-demand USD/GPU-hour (illustrative)
 }
 
-export const GPUS: GPU[] = [
-  { id: 'rtx4090', name: 'RTX 4090 24GB', memGB: 24, bwTBs: 1.01, bf16TF: 165, fp8TF: 330, fp4TF: null, int8TOPS: 660, linkGBs: 32, sms: 128, l2MB: 72, smemKB: 100, pricePerHr: 0.4 },
-  { id: 'l40s', name: 'L40S 48GB', memGB: 48, bwTBs: 0.864, bf16TF: 362, fp8TF: 733, fp4TF: null, int8TOPS: 733, linkGBs: 32, sms: 142, l2MB: 96, smemKB: 100, pricePerHr: 0.9 },
-  { id: 'a100', name: 'A100 80GB SXM', memGB: 80, bwTBs: 2.04, bf16TF: 312, fp8TF: null, fp4TF: null, int8TOPS: 624, linkGBs: 600, sms: 108, l2MB: 40, smemKB: 164, pricePerHr: 1.5 },
-  { id: 'h100', name: 'H100 80GB SXM', memGB: 80, bwTBs: 3.35, bf16TF: 989, fp8TF: 1979, fp4TF: null, int8TOPS: 1979, linkGBs: 900, sms: 132, l2MB: 50, smemKB: 228, pricePerHr: 2.5 },
-  { id: 'h200', name: 'H200 141GB', memGB: 141, bwTBs: 4.8, bf16TF: 989, fp8TF: 1979, fp4TF: null, int8TOPS: 1979, linkGBs: 900, sms: 132, l2MB: 50, smemKB: 228, pricePerHr: 3.5 },
-  { id: 'mi300x', name: 'MI300X 192GB', memGB: 192, bwTBs: 5.3, bf16TF: 1307, fp8TF: 2615, fp4TF: null, int8TOPS: 2615, linkGBs: 896, sms: 304, l2MB: 256, smemKB: 64, pricePerHr: 3.0 },
-  { id: 'b200', name: 'B200 180GB', memGB: 180, bwTBs: 8.0, bf16TF: 2250, fp8TF: 4500, fp4TF: 9000, int8TOPS: 4500, linkGBs: 1800, sms: 148, l2MB: 126, smemKB: 228, pricePerHr: 5.5 },
-];
+/** The GPUs offered in chapter calculators and the Lab, derived from the full accelerator catalog
+    (src/data/accelerators.ts) so every page quotes the same specs. pricePerHr = midpoint of the
+    catalog's on-demand range. */
+export const GPUS: GPU[] = CALC_GPUS.map(([catalogId, id, name]) => {
+  const a = ACCELS.find((x) => x.id === catalogId)!;
+  return {
+    id, name, memGB: a.memGB, bwTBs: a.bwTBs, bf16TF: a.bf16 ?? 0, fp8TF: a.fp8 ?? null, fp4TF: a.fp4 ?? null,
+    int8TOPS: a.int8 ?? null, linkGBs: a.link?.GBs ?? 32, sms: a.cores ?? 0, l2MB: a.sramMB ?? 0,
+    smemKB: a.smemKB ?? 0, pricePerHr: a.price ? Math.round(((a.price[0] + a.price[1]) / 2) * 100) / 100 : 0,
+  };
+});
 
 export interface Model {
   id: string;
@@ -73,6 +77,15 @@ export function kvBytesPerToken(m: Model, bytesPerElem = 2) {
   if (m.attn === 'MLA' && m.mlaDim) return m.layers * m.mlaDim * bytesPerElem;
   return 2 /* K and V */ * m.layers * m.kvHeads * m.headDim * bytesPerElem;
 }
+
+/** Copies of each token's KV a tensor-parallel group stores. GQA/MHA shard KV heads across ranks, but once
+    TP exceeds the KV-head count the heads are replicated. MLA's compressed latent is shared by all heads, so
+    every rank keeps the full latent: TP adds memory for weights but none for KV. */
+export const kvReplication = (m: Model, tp: number) => (m.attn === 'MLA' ? tp : Math.max(1, tp / m.kvHeads));
+
+/** KV-cache bytes for one token held by EACH GPU of a TP group. */
+export const kvBytesPerGpu = (m: Model, tp: number, bytesPerElem = 2) =>
+  (kvBytesPerToken(m, bytesPerElem) * kvReplication(m, tp)) / tp;
 
 /** Weight bytes. */
 export const weightBytes = (m: Model, bytesPerParam = 2) => m.params * bytesPerParam;

@@ -26,7 +26,9 @@ npm run preview
 ```
 src/
   data/chapters.ts      # navigation, ordering, parts: the single source of truth
-  data/hardware.ts      # shared GPU + model specs used by calculators
+  data/accelerators.ts  # the accelerator catalog (specs, prices, sources): single source of truth for hardware
+  data/accelType.ts     # catalog types, conventions (dense FLOPs, bidirectional links) and derived metrics
+  data/hardware.ts      # model specs, KV helpers, and the calculator GPU list derived from the catalog
   lib/viz.ts            # SVG/DOM helpers, player (play/pause/step), controls, colours
   styles/global.css     # design tokens (system / light / dark), prose + diagram styles
   layouts/              # Base (header, ⌘K palette, theme) and Chapter (sidebar, pager)
@@ -44,6 +46,7 @@ src/
 ### Learning tools (non-chapter pages)
 
 - **`/lab/`, the Inference Lab** (`src/components/lab/`): one set of knobs (model, GPU, TP, precision, prompt/output length, batch) driving five linked views: HBM map, decode-step anatomy, roofline, throughput–latency curve, request timeline. The maths is in `labModel.ts` and uses the same assumptions as `capacityModel.ts`. State lives in the URL hash, so setups can be shared.
+- **`/hardware/`, Inference Hardware** (`src/components/hw/`): 76 GPUs and accelerators (NVIDIA, AMD, TPU, Trainium, Gaudi, Ascend, SRAM chips, Apple silicon and desktop boxes) with a sortable explorer, per-chip spec sheets, side-by-side compare, a capacity × bandwidth map, a ridge-point-by-year chart and a "what should I run this on" calculator that runs the Lab's model on every priced chip. View state lives in the query string (`?gpu=…&cmp=…`).
 - **`/map/`, the Concept Map**: built automatically from the `../<slug>/` cross-links in the chapter MDX (`src/data/graph.ts`). The same graph powers the "Builds on / Comes up again in" box at the end of every chapter. To connect two chapters, just link one from the other.
 - **`/glossary/`** (`src/data/glossary.ts`): each term is linked to the chapter that teaches it. The first mention of each term in a chapter gets a hover/tap definition, and terms are searchable from ⌘K. Mark very common words `hover: false`.
 - Every `<Viz>` frame has a full-screen button (Esc closes it).

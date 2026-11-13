@@ -19,6 +19,7 @@ const searchIndex = [
     p: parts.find((p) => p.id === c.part)!.title, h: chapterUrl(c.slug),
   })),
   { n: '◆', t: 'Inference Lab', s: 'lab playground simulator calculator', b: 'Model + GPU + workload → memory, step time, roofline, throughput–latency, cost.', p: 'Tool', h: u('lab/') },
+  { n: '◆', t: 'Inference Hardware', s: 'hardware gpu gpus accelerator tpu trainium mi300x mi355x h100 h200 b200 b300 gb200 rubin rtx 4090 5090 spec specs compare buy', b: 'Every inference GPU and accelerator: specs, charts, compare, and what to run your model on.', p: 'Tool', h: u('hardware/') },
   { n: '◆', t: 'Concept Map', s: 'map graph prerequisites path', b: 'How every chapter connects; get a reading path to any topic.', p: 'Tool', h: u('map/') },
   { n: '◆', t: 'Glossary', s: 'glossary terms definitions', b: `${glossary.length} short definitions, each linked to its chapter.`, p: 'Tool', h: u('glossary/') },
   ...glossary.map((g) => ({ n: 'Aa', t: g.term, s: (g.aliases ?? []).join(' '), b: g.def, p: 'Glossary', h: u(`glossary/#${termId(g.term)}`) })),

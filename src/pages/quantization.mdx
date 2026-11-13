@@ -33,7 +33,7 @@ A floating-point number spends its bits on three things: a **sign**, an **expone
 | **FP8 E5M2** | 1 / 5 / 2 | 57,344 | Gradients (more range, less precision) |
 | **INT8** | 8-bit integer | scale × 127 | W8A8 (SmoothQuant), KV cache |
 | **INT4** | 4-bit integer | scale × 7 | Weight-only (GPTQ, AWQ, GGUF Q4) |
-| **FP4 E2M1** | 1 / 2 / 1 | 6 (× block scale) | NVFP4 / MXFP4 on Blackwell-class GPUs |
+| **FP4 E2M1** | 1 / 2 / 1 | 6 (× block scale) | NVFP4 (NVIDIA Blackwell and later) / MXFP4 (Blackwell, AMD MI355X) |
 
 ## Scales, granularity and outliers
 
@@ -48,7 +48,7 @@ The **absmax** sets the scale, so a single big value stretches the grid for ever
 <Viz title="Quantize a weight matrix, step by step" label="Live">
   <QuantMatrix />
   <Fragment slot="caption">
-    <p>Turn on the <b>outlier input channel</b> with per-channel INT4: each row's scale is set by its outlier, so the error map lights up across the whole matrix. Switch to <b>per-group</b>: only the groups that contain the outlier suffer. The extra scales cost very little, under 0.2 bits per weight at real group sizes.</p>
+    <p>Turn on the <b>outlier input channel</b> with per-channel INT4: each row's scale is set by its outlier, so the error map lights up across the whole matrix. Switch to <b>per-group</b>: only the groups that contain the outlier suffer. The extra scales cost very little: an FP16 scale per 128 weights is 0.125 bits per weight. Hardware block formats use smaller blocks: MXFP4 costs 0.25 bits per weight and NVFP4 0.5.</p>
   </Fragment>
 </Viz>
 
@@ -63,14 +63,14 @@ Rounding every weight to its nearest grid point (**round-to-nearest**, RTN) work
 - **GPTQ** quantizes weights one column at a time and updates the not-yet-quantized columns to **compensate** for the error, using second-order information from a small calibration set.
 - **AWQ** observes that ~1% of weight channels matter most, namely those that see large activations. It **scales those channels up** before quantizing so they keep more precision.
 - **GGUF** (llama.cpp) packs block-quantized formats like Q4_K and Q8_0 into a single file for CPU, Apple silicon and edge inference.
-- **Microscaling** (MXFP4, NVFP4) puts the scales into the hardware format itself: every block of 16–32 FP4 values shares an 8-bit scale, and the tensor cores apply it natively.
+- **Microscaling** puts the scales into the hardware format itself, and the tensor cores apply them natively. **MXFP4** (the OCP standard) gives each block of 32 FP4 values a power-of-two E8M0 scale. **NVFP4** uses blocks of 16 with an FP8 E4M3 scale, plus one FP32 scale per tensor: finer steps and better accuracy, at 0.5 bits per weight of overhead. A checkpoint made for one format is not automatically fast on hardware built for the other.
 
 ## Which phase gets faster?
 
 This is the most important practical question, and the answer depends on whether the **math** runs in low precision or only the **storage** does.
 
 - **Weight-only (W4A16, W8A16)**: weights are stored small and **dequantized to BF16 inside the kernel**. That cuts the bytes read per token, which is exactly what memory-bound [decode](../prefill-decode/) needs. The math still runs in BF16, so compute-bound **prefill gains little**, and at large batch the dequantization overhead can even make it slower.
-- **Weight + activation (W8A8 FP8/INT8, W4A4 FP4)**: both operands are low-precision, so the **tensor cores run at 2× (8-bit) or 4× (4-bit) the BF16 rate**. That speeds up prefill *and* large-batch decode. It needs hardware support: FP8 on Hopper, Ada and newer; FP4 on Blackwell.
+- **Weight + activation (W8A8 FP8/INT8, W4A4 FP4)**: both operands are low-precision, so the **tensor cores run at 2× (8-bit) or 4× (4-bit) the BF16 rate**. That speeds up prefill *and* large-batch decode. It needs hardware support: FP8 on NVIDIA Ada, Hopper and newer and on AMD MI300 and newer; FP4 on NVIDIA Blackwell and AMD MI355X. The [hardware page](../hardware/) lists every chip's formats.
 
 <Viz title="Memory, decode and prefill per scheme" label="Calculator">
   <QuantCalc />

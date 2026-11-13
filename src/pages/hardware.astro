@@ -1,0 +1,177 @@
+---
+import Page from '../layouts/Page.astro';
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import HwExplorer from '../components/hw/HwExplorer.astro';
+import HwCharts from '../components/hw/HwCharts.astro';
+import HwFit from '../components/hw/HwFit.astro';
+import { ACCELS, VERIFIED } from '../data/accelerators';
+import { chapterUrl } from '../lib/url';
+const vendors = new Set(ACCELS.map((a) => a.vendor)).size;
+const c = chapterUrl;
+---
+<Page
+  title="Inference Hardware"
+  current="hardware"
+  eyebrow={`${ACCELS.length} accelerators · ${vendors} vendors · verified ${VERIFIED}`}
+  description="Every GPU and AI accelerator that matters for LLM inference: memory, bandwidth, dense FLOPs per precision, interconnect, power and price, with charts, side-by-side comparison and a what-should-I-run-this-on calculator."
+  lede="Every GPU and accelerator worth knowing for LLM inference, from an RTX 4090 to a Vera Rubin rack, with the numbers that actually decide speed and cost. All figures are <b>dense</b> (no sparsity) and per chip. Click any row for its full spec sheet, tick up to four to compare, or jump to the calculator to see what your workload needs."
+>
+  <nav class="hw-toc" aria-label="On this page">
+    <a href="#five">The five numbers</a><a href="#explore">Explorer</a><a href="#map">Capacity × bandwidth</a><a href="#wall">The memory wall</a><a href="#fit">What should I run on?</a><a href="#landscape">2026 landscape</a><a href="#gotchas">Spec-sheet traps</a><a href="#method">Method & sources</a>
+  </nav>
+
+  <section id="five" class="hw-sec">
+    <h2>The five numbers that decide inference</h2>
+    <p class="hw-p">A spec sheet has dozens of lines. For serving LLMs, five of them explain almost everything, and each one maps to a part of this guide.</p>
+    <div class="hw-five">
+      <a href={c('kv-cache')}><b>1 · Memory capacity</b><span>Decides which models fit at all and how much is left for the KV cache, which caps concurrency.</span><i>GB</i></a>
+      <a href={c('gpu')}><b>2 · Memory bandwidth</b><span>Decode re-reads every weight per step, so bandwidth sets the single-user speed limit: tok/s ≤ bandwidth ÷ weight bytes.</span><i>TB/s</i></a>
+      <a href={c('roofline')}><b>3 · Dense low-precision FLOPs</b><span>Sets prefill speed (TTFT) and the ceiling for large-batch decode. FP8 and FP4 double it again, if your stack uses them.</span><i>TFLOPS</i></a>
+      <a href={c('interconnects')}><b>4 · Scale-up fabric</b><span>NVLink, Infinity Fabric, ICI. Sets how cheaply a model splits across chips (tensor and expert parallelism) and how big that domain can be.</span><i>GB/s × chips</i></a>
+      <a href={c('capacity-planning')}><b>5 · Price and power</b><span>What you actually pay per token. A slower chip that costs a third as much can win on $/token while losing every benchmark.</span><i>$/hr · W</i></a>
+    </div>
+  </section>
+
+  <section id="explore" class="hw-sec">
+    <h2>Explorer</h2>
+    <p class="hw-p">Filter by vendor or segment, sort any column, and click a row for the full spec sheet: compute per precision, memory, fabric, power, price, where to rent it, and the fine print. The last column shows the bandwidth-limited single-stream speed for the model you pick, on the fewest chips that hold it.</p>
+    <HwExplorer />
+  </section>
+
+  <section id="map" class="hw-sec">
+    <h2>Capacity × bandwidth: the map of inference hardware</h2>
+    <p class="hw-p">The two memory numbers explain most of inference. Up means bigger models and more KV cache; right means faster decode. The dashed lines show the time to read the <i>entire</i> memory once (capacity ÷ bandwidth). If you fill a chip with weights, that is the best-case time per decode step, so chips that sit high and to the left have lots of room but are slow to sweep it.</p>
+    <Viz title="Memory capacity vs memory bandwidth" label="Chart">
+      <HwCharts kind="map" />
+      <Fragment slot="caption">
+        <p>Log–log scales. Faded markers are announced but not yet shipping. Unified-memory machines (Apple, DGX Spark, Strix Halo) sit high and left: plenty of room for a big model, but slow per token. SRAM-based chips (Groq, Cerebras) sit far right and low: enormous bandwidth but tiny capacity, so one model spans many chips. Click a point for its spec sheet.</p>
+      </Fragment>
+    </Viz>
+  </section>
+
+  <section id="wall" class="hw-sec">
+    <h2>The memory wall, chip by chip</h2>
+    <p class="hw-p">The <a href={c('roofline')}>ridge point</a> is peak FLOPs ÷ peak bandwidth: how many operations a kernel must do per byte it loads before compute becomes the limit. At each chip's fastest precision the ridge has climbed from about 300 (A100, INT8) to 600 (H100, FP8), 1,100 (B200, FP4) and 1,800 (Rubin, FP4), because every new number format doubles the FLOPs while HBM only grows steadily. Decode at batch <i>B</i> does about 2<i>B</i> FLOPs per weight, or <i>B</i>–4<i>B</i> FLOPs per byte depending on precision, so it sits in the shaded band, far below every modern ridge. That gap is why <a href={c('batching')}>batching</a>, <a href={c('quantization')}>quantization</a> and <a href={c('speculative-decoding')}>speculative decoding</a> exist.</p>
+    <Viz title="Ridge point by year" label="Chart">
+      <HwCharts kind="wall" />
+      <Fragment slot="caption">
+        <p>Switch to <b>BF16 only</b> and the climb almost disappears: BF16 ridges have stayed between about 150 and 300 since 2020, because bandwidth kept pace with BF16 compute. The wall comes from the low-precision formats. Their extra FLOPs only help decode once the batch is big enough to use them; until then the chip is still waiting on memory. Faded markers are announced parts.</p>
+      </Fragment>
+    </Viz>
+  </section>
+
+  <section id="fit" class="hw-sec">
+    <h2>What should I run this on?</h2>
+    <p class="hw-p">Describe the workload: model, precision, prompt and output length, how many requests run at once, and the slowest speed a user should see. For every priced accelerator, the calculator finds the smallest tensor-parallel group that holds all of those requests' KV cache and meets the speed target, then ranks the options by cost per million output tokens.</p>
+    <Viz title="Hardware for your workload" label="Calculator">
+      <HwFit />
+    </Viz>
+    <Callout type="tip" title="Why the ranking moves so much">
+      Try the default (70B, FP8, 32 users) and then raise <b>concurrent requests</b> to 256. At low concurrency, cheap high-bandwidth chips win because decode is memory-bound and you pay mostly for idle FLOPs. At high concurrency, KV-cache capacity and compute take over and large-memory parts pull ahead. Now set the prompt to 128k: capacity decides almost everything. That is the <a href={c('capacity-planning')}>capacity-planning</a> chapter in one slider.
+    </Callout>
+  </section>
+
+  <section id="landscape" class="hw-sec hw-prose">
+    <h2>The 2026 landscape</h2>
+    <p>Five trends run through every vendor's roadmap, and each one shows up in the charts above.</p>
+    <div class="hw-trends">
+      <div><b>Capacity per chip keeps climbing.</b> 80 GB (H100) → 192 (MI300X) → 288 (B300, MI355X, Rubin) → 432 GB (MI455X). Whole 70B–400B models now fit on one chip or one node, and the leftover memory becomes <a href={c('kv-cache')}>KV cache</a>.</div>
+      <div><b>FP4 is the new default for decode.</b> Blackwell, MI355X, Trainium3, TPU 8 and Maia 200 all run 4-bit floats in hardware. The bytes per weight halve again, and so does the decode floor. See <a href={c('quantization')}>quantization</a>.</div>
+      <div><b>The scale-up domain became a rack.</b> NVLink went from 8 GPUs to 72 (NVL72), AMD's Helios also reaches 72, and TPU pods reach 9,216 chips. Tensor and <a href={c('moe')}>expert parallelism</a> can now span a rack without touching the network.</div>
+      <div><b>Prefill and decode are getting separate silicon.</b> Google split TPU 8 into 8i (inference) and 8t (training). NVIDIA pairs Rubin with SRAM-based Groq 3 LPX racks for decode. <a href={c('disaggregation')}>Disaggregation</a> moved from software into hardware.</div>
+      <div><b>Memory is the scarce input.</b> An HBM and LPDDR shortage kept Hopper prices flat to rising through 2026 and pushed up desktop AI boxes (DGX Spark went from $3,999 to about $4,700, with reports near $7,000). Bandwidth and capacity remain what you are really paying for.</div>
+    </div>
+
+    <h3>NVIDIA</h3>
+    <ul>
+      <li><b>Hopper (H100, H200, GH200)</b> is still the most widely deployed inference GPU. H200's 141 GB and 4.8 TB/s make it the better decode part at the same compute.</li>
+      <li><b>Blackwell (B200, GB200)</b> added native NVFP4, 8 TB/s of HBM3e and NVLink 5 at 1.8 TB/s per GPU. In GB200 NVL72, 72 GPUs share one NVLink domain.</li>
+      <li><b>Blackwell Ultra (B300, GB300)</b> raises memory to 288 GB and dense FP4 to 13.5–15 PFLOPS, trading away most FP64 and INT8 throughput.</li>
+      <li><b>Rubin (Vera Rubin NVL72)</b> began reaching clouds around August 2026 with HBM4. In September NVIDIA quietly cut the shipping specs from 22 to about 19.2 TB/s per GPU and NVLink 6 from 3.6 to 3.0 TB/s. The HGX Rubin NVL8 board carries 250 GB per GPU. Blackwell is still over 70% of 2026 shipments.</li>
+      <li><b>Rubin CPX</b>, a GDDR7 prefill chip announced in 2025, was dropped after GTC 2026. In its place NVIDIA offers <b>Groq 3 LPX</b> racks (256 SRAM-based LPUs, from a roughly $20B licensing deal with Groq) that handle decode-heavy FFN and MoE work next to Vera Rubin. <b>Rubin Ultra</b> (4 dies, 1 TB HBM4E, Kyber racks) is planned for 2027, with reports of a slip to 2028.</li>
+    </ul>
+
+    <h3>AMD</h3>
+    <ul>
+      <li><b>MI300X</b> (192 GB) was the first GPU to hold a 70B BF16 model alone. <b>MI325X</b> raised that to 256 GB. Both use the FNUZ variant of FP8, which is not bit-compatible with the OCP E4M3 that NVIDIA uses.</li>
+      <li><b>MI350X and MI355X</b> (2025): 288 GB, 8 TB/s, OCP FP8, and MXFP4 and FP6 at the same rate, which suits 6-bit quantization unusually well.</li>
+      <li><b>MI455X and the Helios rack</b> had their first revenue quarter in Q3 2026: 432 GB of HBM4 at 23.3 TB/s per GPU, with 72 GPUs joined by UALink over Ethernet. MI450X (288 GB) follows.</li>
+      <li><b>Software</b>: ROCm 7 brought day-0 vLLM and SGLang containers, AITER kernels with MXFP4, and P/D disaggregation. Independent results put MI355X near B200 on many models, but parity still varies by model and engine version, so benchmark your own workload.</li>
+    </ul>
+
+    <h3>Google, AWS and the hyperscalers</h3>
+    <ul>
+      <li><b>TPU7x Ironwood</b> (GA November 2025) is Google's first TPU designed around inference: 192 GB at 7.4 TB/s per chip, in pods of up to 9,216 chips. In April 2026 Google split the eighth generation into <b>TPU 8i</b> for inference (288 GB, 384 MB on-chip SRAM) and <b>TPU 8t</b> for training. TPUs serve through JAX and vLLM's TPU backend.</li>
+      <li><b>AWS Trainium2</b> (96 GB) and <b>Trainium3</b> (GA December 2025: 144 GB, 4.9 TB/s, MXFP8 and MXFP4, 144-chip UltraServers; Anthropic is a launch customer) serve through the Neuron SDK and vLLM-Neuron. <b>Inferentia2</b> remains a cheap option for small models.</li>
+      <li><b>Microsoft Maia 200</b> (January 2026: 216 GB, 10 PFLOPS FP4) and <b>Meta MTIA 400</b> serve their owners' internal models and cannot be rented.</li>
+    </ul>
+
+    <h3>SRAM and dataflow chips</h3>
+    <p>Groq, Cerebras and d-Matrix keep weights in on-chip SRAM instead of HBM. Per chip that means 80–150 TB/s (and 21 PB/s across a Cerebras wafer) but only hundreds of MB to a few GB of capacity, so one model spans hundreds of chips or several wafers. The payoff is single-stream speed: Cerebras serves 1T-parameter MoE models at roughly 1,000 tok/s, well past any GPU's <a href={c('gpu')}>bandwidth ceiling</a>. Cerebras went public in May 2026 and powers OpenAI's Codex-Spark. d-Matrix Corsair reached volume production in June 2026. Most of these are sold as tokens through an API rather than as chips, so compare them on $/token and tok/s, not on the per-chip specs in the table.</p>
+
+    <h3>Intel and Huawei</h3>
+    <ul>
+      <li><b>Intel Gaudi 3</b> still ships (OAM and PCIe) with modest adoption. Its dense BF16 figure was restated as 1,678 TFLOPS in 2025, down from the 1,835 quoted at launch. Falcon Shores was cancelled. <b>Crescent Island</b>, an inference GPU with 160 GB of LPDDR5X at 350 W, is sampling for a 2027 launch.</li>
+      <li><b>Huawei Ascend 910C</b> powers the CloudMatrix 384 system (384 chips in one optical all-to-all domain). The <b>950PR and 950DT</b> are Huawei's first chips with FP8 and MXFP4 and use in-house HBM, a response to export controls. Huawei publishes fewer figures than Western vendors, so treat those entries as estimates.</li>
+    </ul>
+
+    <h3>On your desk</h3>
+    <ul>
+      <li><b>RTX 5090</b> (32 GB, 1.8 TB/s) is the fastest single consumer card for local models. <b>RTX PRO 6000 Blackwell</b> (96 GB) runs a 70B model at FP8 on one card.</li>
+      <li><b>Apple M5 Ultra</b> (Mac Studio, September 2026) reaches 512 GB of unified memory at about 1.2 TB/s, enough to run very large MoE models locally through MLX or llama.cpp.</li>
+      <li><b>DGX Spark</b> (GB10, 128 GB at 273 GB/s), <b>AMD Strix Halo</b> (128 GB) and its 2026 refresh <b>Gorgon Halo</b> (192 GB, about 256 GB/s) trade speed for capacity: large models fit, but decode runs at a fraction of HBM speed. <b>DGX Station GB300</b> puts 748 GB of coherent memory under a desk.</li>
+    </ul>
+  </section>
+
+  <section id="gotchas" class="hw-sec hw-prose">
+    <h2>Reading a spec sheet without getting fooled</h2>
+    <div class="hw-gotchas">
+      <div><b>Sparse vs dense.</b> NVIDIA and AMD headline FLOPs with 2:4 structured sparsity, which doubles the number. Almost no LLM serving stack uses it. Halve the headline; every number on this page is already dense.</div>
+      <div><b>Both directions summed.</b> "900 GB/s NVLink" on an H100 is 450 GB/s each way. Collective maths (<a href={c('interconnects')}>α–β model</a>) needs the per-direction figure.</div>
+      <div><b>Marketed vs usable memory.</b> B200 is marketed at 192 GB, but HGX systems expose 180 GB. Then the driver, CUDA context, activations and CUDA graphs take another 5–10%. Plan on about 90% of the label.</div>
+      <div><b>GB vs GiB.</b> Spec sheets use decimal GB (10⁹). nvidia-smi and most engines report GiB (2³⁰), which is 7% larger, so "80 GB" shows up as about 79.6 GiB less reserved memory.</div>
+      <div><b>One name, several SKUs.</b> B200 (1000 W, HGX) and the GB200 GPU (1200 W) have different FLOPs. H100 SXM, PCIe and NVL differ in bandwidth by almost 2×. Check the form factor before you compare.</div>
+      <div><b>FP4 is two formats.</b> <b>NVFP4</b> (Blackwell and later) uses 16-value blocks with an FP8 E4M3 scale. <b>MXFP4</b> (OCP standard; AMD MI355X, Blackwell) uses 32-value blocks with a power-of-two scale. A checkpoint quantized for one is not automatically fast on the other. See <a href={c('quantization')}>quantization</a>.</div>
+      <div><b>No FP8 tensor cores ≠ no FP8 model.</b> A100 and A10 have no FP8 units. FP8 or INT4 weights still load (weight-only kernels such as Marlin upcast on the fly), so you get the memory and bandwidth savings but not the extra FLOPs.</div>
+      <div><b>GeForce accumulate rates.</b> Consumer cards run FP16 and BF16 tensor maths with FP32 accumulation at half the rate of FP16 accumulation, and inference kernels need FP32 accumulation. Use the lower figure.</div>
+      <div><b>Unified memory is shared.</b> On Apple silicon, DGX Spark and Strix Halo, "128 GB" is shared with the OS and CPU, and the bandwidth is a fraction of HBM's. Big models fit; tokens come slowly.</div>
+      <div><b>SRAM chips are a system, not a card.</b> Groq and Cerebras hold weights in on-chip SRAM, so a 70B model spans hundreds of chips or a whole wafer. Compare them per rack or per token, not per chip.</div>
+      <div><b>Per chip, per board or per rack?</b> Rack-scale numbers (NVL72, TPU pods) are often quoted for the whole system. This page normalizes to one chip (one GPU package, one TPU chip).</div>
+      <div><b>Cloud prices are a spread, not a number.</b> The same H100 hour costs about $2 at a marketplace and $6+ at a hyperscaler on demand; commitments cut it by 30–60%. The ranges here are on-demand, late 2026.</div>
+    </div>
+  </section>
+
+  <section id="method" class="hw-sec hw-prose">
+    <h2>Method & sources</h2>
+    <p>Specs come from vendor datasheets, product pages and architecture whitepapers, cross-checked against Hot Chips papers and independent analyses (Chips and Cheese, ServeTheHome, SemiAnalysis, TechPowerUp). Each spec sheet lists its own sources. Where a vendor publishes only sparse figures they are halved; where a value could not be verified it is left blank rather than guessed. Prices are typical on-demand ranges from public price lists and GPU price indexes, gathered in {VERIFIED}; treat them as indicative. Derived figures (ridge point, decode ceiling, fit) use the same first-order model as the <a href={c('gpu')}>GPU chapter</a> and the Lab: 75% of peak bandwidth and 90% of memory usable.</p>
+    <p>Found a wrong number? The data lives in one file, <code>src/data/accelerators.ts</code>, and every calculator on the site reads from it.</p>
+  </section>
+
+  <style>
+    .hw-toc { display: flex; flex-wrap: wrap; gap: 6px; margin: -6px 0 6px; }
+    .hw-toc a { font-size: 0.8rem; padding: 4px 11px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-dim); text-decoration: none; }
+    .hw-toc a:hover { color: var(--text); border-color: var(--border-strong); }
+    .hw-sec { margin-top: 3rem; scroll-margin-top: calc(var(--header-h) + 16px); }
+    .hw-sec h2 { font-size: 1.5rem; letter-spacing: -0.025em; font-weight: 650; margin: 0 0 0.6rem; }
+    .hw-sec h2::before { content: ''; display: block; width: 28px; height: 3px; border-radius: 3px; background: var(--accent-grad); margin-bottom: 14px; }
+    .hw-p, .hw-prose p { color: color-mix(in srgb, var(--text) 88%, var(--text-dim)); max-width: 820px; line-height: 1.65; margin: 0 0 1rem; }
+    .hw-five { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+    .hw-five a { display: flex; flex-direction: column; gap: 6px; padding: 14px 15px; border-radius: 14px; border: 1px solid var(--border); background: var(--surface); color: var(--text); text-decoration: none; transition: border-color 0.15s, transform 0.15s; }
+    .hw-five a:hover { border-color: var(--accent); transform: translateY(-1px); }
+    .hw-five b { font-size: 0.95rem; }
+    .hw-five span { font-size: 0.84rem; color: var(--text-dim); line-height: 1.5; flex: 1; }
+    .hw-five i { font-style: normal; font-family: var(--font-mono); font-size: 0.72rem; color: var(--accent); }
+    .hw-trends { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; margin-bottom: 0.5rem; }
+    .hw-trends > div { padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); border-top: 2px solid var(--accent); background: var(--surface); font-size: 0.88rem; line-height: 1.55; color: var(--text-dim); }
+    .hw-trends b { color: var(--text); display: block; margin-bottom: 3px; }
+    .hw-gotchas { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
+    .hw-gotchas > div { padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface); font-size: 0.88rem; line-height: 1.55; color: var(--text-dim); }
+    .hw-gotchas b { color: var(--text); }
+    .hw-prose :global(h3) { font-size: 1.1rem; margin: 1.8rem 0 0.5rem; letter-spacing: -0.015em; }
+    .hw-prose :global(ul) { max-width: 820px; color: color-mix(in srgb, var(--text) 88%, var(--text-dim)); line-height: 1.6; padding-left: 1.2rem; }
+    .hw-prose :global(li) { margin: 0.35rem 0; }
+    .hw-prose :global(li::marker) { color: var(--accent); }
+    .hw-prose code { font-family: var(--font-mono); font-size: 0.85em; padding: 1px 5px; border-radius: 5px; background: var(--surface-2); }
+  </style>
+</Page>

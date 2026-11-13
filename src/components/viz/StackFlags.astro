@@ -6,7 +6,7 @@
 
 <script>
   import { mountAll, h, ctrlBar, select, slider, checkbox, stats, narration, C, fmt } from '../../lib/viz';
-  import { getModel, getGPU, GPUS, kvBytesPerToken } from '../../data/hardware';
+  import { getModel, getGPU, GPUS, kvBytesPerToken, kvBytesPerGpu } from '../../data/hardware';
 
   const MODEL_IDS: [string, string][] = [
     ['llama3-8b', 'meta-llama/Llama-3.1-8B-Instruct'],
@@ -49,7 +49,7 @@
       const budget = g.memGB * 1e9 * util;
       const overhead = 1.5e9 + 0.05 * g.memGB * 1e9 * (batched / 32768);
       const kvRoom = budget - perGpuW - overhead;
-      const kvTokGpu = kvBytesPerToken(m, kvB) / Math.min(tp, m.kvHeads);
+      const kvTokGpu = kvBytesPerGpu(m, tp, kvB); // MLA: full latent on every rank
       const kvTokens = Math.max(0, kvRoom / kvTokGpu);
       const fullSeqs = kvTokens / ctx;
       const eff = Math.min(seqs, Math.floor(kvTokens / Math.min(ctx, 2048)));

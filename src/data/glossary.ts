@@ -57,7 +57,7 @@ export const glossary: Term[] = [
   { term: 'speculative decoding', def: 'A cheap drafter proposes several tokens, and the target model verifies them all in one forward pass, keeping the longest accepted prefix. The output distribution is unchanged.', ch: 'speculative-decoding' },
   { term: 'acceptance rate', def: 'In speculative decoding, the probability that the target model accepts a drafted token. It sets how many tokens each verify pass yields.', ch: 'speculative-decoding' },
   { term: 'quantization', def: 'Storing weights, activations or KV in fewer bits (FP8, INT8, INT4, FP4) with scale factors, to cut memory and bytes moved.', ch: 'quantization' },
-  { term: 'FP8', def: '8-bit floating point (E4M3 or E5M2). Halves memory versus BF16 and doubles tensor-core throughput on Hopper and Blackwell.', ch: 'quantization' },
+  { term: 'FP8', def: '8-bit floating point (E4M3 or E5M2). Halves memory versus BF16 and doubles tensor-core throughput on GPUs with FP8 units (NVIDIA Ada, Hopper, Blackwell; AMD MI300 and later).', ch: 'quantization' },
   { term: 'BF16', aliases: ['bfloat16'], def: '16-bit floating point with FP32’s 8-bit exponent and a 7-bit mantissa. The default precision for serving weights.', ch: 'quantization' },
   { term: 'constrained decoding', aliases: ['grammar-constrained decoding'], def: 'Masking the logits at every step so only tokens allowed by a grammar or JSON schema can be sampled.', ch: 'structured-output' },
   { term: 'LoRA', def: 'Low-rank adaptation: a fine-tune stored as two small matrices per layer (rank r). Many adapters can share one base model in the same batch.', ch: 'multi-lora' },
@@ -73,7 +73,7 @@ export const glossary: Term[] = [
   { term: 'disaggregation', aliases: ['disaggregated serving', 'P/D disaggregation'], def: 'Running prefill and decode on separate GPU pools sized independently, and transferring the KV cache between them.', ch: 'disaggregation' },
 
   // VI — production
-  { term: 'TTFT', aliases: ['time to first token'], def: 'Time to first token: from request arrival to the first streamed token. Queueing + prefill + one decode step.', ch: 'metrics' },
+  { term: 'TTFT', aliases: ['time to first token'], def: 'Time to first token: from request arrival to the first streamed token: queueing + prefill. The prefill pass’s last position already produces the first token.', ch: 'metrics' },
   { term: 'TPOT', aliases: ['time per output token'], def: 'Time per output token: average gap between tokens after the first, (E2E − TTFT) / (output tokens − 1).', ch: 'metrics' },
   { term: 'ITL', aliases: ['inter-token latency'], def: 'Inter-token latency: each individual gap between consecutive streamed tokens. Its tail (p99) shows stalls that TPOT averages away.', ch: 'metrics' },
   { term: 'goodput', def: 'Throughput counting only requests that met their latency SLOs. The number worth maximising.', ch: 'metrics' },
@@ -96,4 +96,20 @@ export const glossary: Term[] = [
   { term: 'safetensors', def: 'A simple, safe weight file format: a JSON header of tensor names, shapes and offsets followed by raw bytes, so it can be memory-mapped.', ch: 'model-loading' },
   { term: 'DCGM', def: 'NVIDIA Data Center GPU Manager: the agent and exporter behind GPU metrics such as utilisation, memory, power, clocks and errors.', ch: 'observability' },
   { term: 'Xid', aliases: ['Xid error', 'Xid errors'], def: 'A numbered error code the NVIDIA driver writes to the kernel log, e.g. 79 = GPU fell off the bus, 48 = double-bit ECC error.', ch: 'observability' },
+
+  // added with the hardware reference
+  { term: 'MBU', aliases: ['memory-bandwidth utilisation', 'memory bandwidth utilization'], def: 'Memory-bandwidth utilisation: achieved bytes/s ÷ peak memory bandwidth. The efficiency number for memory-bound decode; good kernels reach 70–90%.', ch: 'gpu' },
+  { term: 'MFU', def: 'Model FLOPs utilisation: achieved FLOP/s ÷ peak tensor FLOP/s. The efficiency number for compute-bound prefill; 40–70% is typical.', ch: 'gpu' },
+  { term: 'ridge point', def: 'Peak FLOP/s ÷ peak bytes/s. A kernel with fewer FLOPs per byte than this is memory-bound. About 295 for an H100 in BF16, and higher every generation.', ch: 'roofline' },
+  { term: 'Flash-Decoding', aliases: ['split-K attention'], def: 'Decode-time attention that splits a long KV sequence across thread blocks and merges the partial softmaxes, so a small batch still fills the GPU.', ch: 'flash-attention' },
+  { term: 'RadixAttention', def: 'SGLang’s prefix cache: KV blocks indexed in a radix tree of token sequences, so any shared prefix is found and reused automatically.', ch: 'prefix-caching' },
+  { term: 'EAGLE', def: 'A speculative-decoding method whose small draft head reads the target model’s hidden states, giving higher acceptance than a separate draft model.', ch: 'speculative-decoding' },
+  { term: 'NVFP4', def: 'NVIDIA’s 4-bit float format: E2M1 values in blocks of 16 sharing an FP8 (E4M3) scale, plus a per-tensor FP32 scale. Native on Blackwell and later.', ch: 'quantization' },
+  { term: 'MXFP4', def: 'The OCP microscaling 4-bit float: E2M1 values in blocks of 32 sharing a power-of-two (E8M0) scale. Native on AMD MI355X and NVIDIA Blackwell.', ch: 'quantization' },
+  { term: 'AWQ', def: 'Activation-aware weight quantization: protects the ~1% of weight channels that see large activations by scaling them before 4-bit quantization.', ch: 'quantization' },
+  { term: 'GGUF', def: 'llama.cpp’s single-file model format: weights, tokenizer, chat template and metadata, with many block-quantized types such as Q4_K and Q8_0.', ch: 'quantization' },
+  { term: 'NCCL', def: 'NVIDIA Collective Communications Library: the all-reduce, all-gather and all-to-all implementation that tensor and expert parallelism run on.', ch: 'interconnects' },
+  { term: 'NVL72', aliases: ['scale-up domain'], def: 'A rack of 72 Blackwell (or Rubin) GPUs joined by NVLink switches into one scale-up domain, so TP and EP can span the whole rack at NVLink speed.', ch: 'interconnects' },
+  { term: 'llm-d', def: 'A Kubernetes-native distributed inference stack built on vLLM: KV-aware routing through the Gateway API inference extension, P/D disaggregation and wide expert parallelism.', ch: 'routing-autoscaling' },
+  { term: 'Dynamo', aliases: ['NVIDIA Dynamo'], def: 'NVIDIA’s open-source orchestration layer above engines like vLLM, SGLang and TensorRT-LLM: disaggregated serving, KV-aware routing and a tiered KV block manager.', ch: 'disaggregation' },
 ];

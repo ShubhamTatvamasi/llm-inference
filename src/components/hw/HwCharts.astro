@@ -1,0 +1,193 @@
+---
+/* Two views of the whole catalog.
+   map:  memory capacity (what fits) vs bandwidth (how fast decode runs), log–log, with
+         iso-lines of "full-memory sweep" time = capacity / bandwidth.
+   wall: ridge point (FLOPs per byte) by year: compute outgrows bandwidth every generation. */
+interface Props { kind: 'map' | 'wall' }
+const { kind } = Astro.props;
+---
+<div class="hwch" data-viz={`hw-${kind}`}></div>
+
+<script>
+  import { mountAll, svgRoot, s, h, text, line, clear, segmented } from '../../lib/viz';
+  import { ACCELS } from '../../data/accelerators';
+  import { type Accel, type Group, GROUP_LABEL, ridgeBF16, bestLowPrec, lowPrecLabel, isSram } from '../../data/accelType';
+  import { marker, swatch, nf, memStr } from './hwShared';
+
+  /** Chips that get a permanent direct label (short name), in priority order. Others are identified on hover. */
+  const LABELS: Record<string, string> = {
+    'h100-sxm': 'H100', 'b200': 'B200', 'amd-mi300x': 'MI300X', 'rubin-vr200-nvl72': 'Rubin', 'amd-mi455x': 'MI455X',
+    'google-tpu7x-ironwood': 'Ironwood', 'rtx-4090': 'RTX 4090', 'apple-m5-ultra': 'M5 Ultra', 'dgx-spark': 'DGX Spark',
+    'cerebras-wse-3': 'Cerebras WSE-3', 'groq-lpu-v1': 'Groq LPU', 'nvidia-groq-3-lpu': 'Groq 3', 'h200-sxm': 'H200',
+    'b300': 'B300', 'amd-mi355x': 'MI355X', 'a100-80gb-sxm': 'A100', 'aws-trainium3': 'Trainium3', 'aws-trainium2': 'Trainium2',
+    'google-tpu-v6e': 'TPU v6e', 'rtx-5090': 'RTX 5090', 'l4': 'L4', 'l40s': 'L40S', 'apple-m3-ultra': 'M3 Ultra',
+    'amd-ryzen-ai-max-plus-395': 'Strix Halo', 'intel-gaudi3-oam': 'Gaudi 3', 'huawei-ascend-910c': 'Ascend 910C',
+    'rtx-pro-6000-blackwell': 'RTX PRO 6000', 'dmatrix-corsair': 'd-Matrix', 't4': 'T4', 'jetson-agx-thor': 'Jetson Thor',
+  };
+  const LABEL_ORDER = Object.keys(LABELS);
+  const log = Math.log10;
+
+  function legendBar(root: HTMLElement, hidden: Set<Group>, onChange: () => void) {
+    const lg = h('div', { class: 'hwch-legend', role: 'group', 'aria-label': 'Show or hide vendor groups' }, root);
+    (Object.keys(GROUP_LABEL) as Group[]).forEach((g) => {
+      const b = h('button', { type: 'button', 'aria-pressed': 'true', html: `${swatch(g, 12)}${GROUP_LABEL[g]}` }, lg);
+      b.addEventListener('click', () => { hidden.has(g) ? hidden.delete(g) : hidden.add(g); b.setAttribute('aria-pressed', String(!hidden.has(g))); onChange(); });
+    });
+    return lg;
+  }
+
+  function tooltip(root: HTMLElement) {
+    const tip = h('div', { class: 'hwch-tip', role: 'status' }, root); tip.hidden = true;
+    return {
+      show(html: string, x: number, y: number) {
+        tip.innerHTML = html; tip.hidden = false;
+        const r = root.getBoundingClientRect(); const w = tip.offsetWidth;
+        tip.style.left = `${Math.min(Math.max(4, x - r.left + 14), r.width - w - 4)}px`;
+        tip.style.top = `${y - r.top + 14}px`;
+      },
+      hide() { tip.hidden = true; },
+    };
+  }
+
+  const tipHtml = (a: Accel, extra: string) =>
+    `<b>${a.name}</b><span>${a.vendor} · ${a.year}</span>${extra}<em>Click for the full spec sheet</em>`;
+  /** Ask the explorer on the same page to open this chip's spec sheet. */
+  const openSheet = (a: Accel) => dispatchEvent(new CustomEvent('hw:open', { detail: a.id }));
+
+  type Box = { x0: number; y0: number; x1: number; y1: number };
+  const hit = (a: Box, b: Box) => a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+
+  function points(svg: SVGSVGElement, list: { a: Accel; x: number; y: number }[], tip: ReturnType<typeof tooltip>, extra: (a: Accel) => string, bounds: Box) {
+    for (const p of list) {
+      const g = s('g', { class: 'hwch-pt', tabindex: 0, role: 'button', 'aria-label': `${p.a.name}: ${extra(p.a).replace(/<[^>]+>/g, ' ')}` }, svg);
+      s('circle', { cx: p.x, cy: p.y, r: 13, fill: 'transparent' }, g); // generous hit target
+      marker(g, p.a.group, p.x, p.y, p.a.status === 'announced' ? 5 : 6, p.a.status === 'announced' ? { 'fill-opacity': 0.45 } : {});
+      const show = (e: { clientX: number; clientY: number }) => tip.show(tipHtml(p.a, extra(p.a)), e.clientX, e.clientY);
+      g.addEventListener('pointermove', show);
+      g.addEventListener('pointerleave', () => tip.hide());
+      g.addEventListener('focus', () => { const r = g.getBoundingClientRect(); show({ clientX: r.right, clientY: r.top }); });
+      g.addEventListener('blur', () => tip.hide());
+      g.addEventListener('click', () => openSheet(p.a));
+      g.addEventListener('keydown', (e) => { if (e.key === 'Enter') openSheet(p.a); });
+    }
+    // direct labels: try 8 positions around each point; skip if every spot collides with a label or another marker
+    const marks: Box[] = list.map((p) => ({ x0: p.x - 6, y0: p.y - 6, x1: p.x + 6, y1: p.y + 6 }));
+    const placed: Box[] = [];
+    const byId = new Map(list.map((p, i) => [p.a.id, i]));
+    for (const id of LABEL_ORDER) {
+      const i = byId.get(id); if (i === undefined) continue;
+      const p = list[i]; const label = LABELS[id];
+      const w = label.length * 6.3 + 2, hh = 13;
+      const cands: [number, number, 'start' | 'end' | 'middle'][] = [
+        [p.x + 9, p.y, 'start'], [p.x - 9, p.y, 'end'], [p.x + 7, p.y - 12, 'start'], [p.x + 7, p.y + 12, 'start'],
+        [p.x - 7, p.y - 12, 'end'], [p.x - 7, p.y + 12, 'end'], [p.x, p.y - 15, 'middle'], [p.x, p.y + 15, 'middle'],
+      ];
+      for (const [lx, ly, anchor] of cands) {
+        const x0 = anchor === 'start' ? lx : anchor === 'end' ? lx - w : lx - w / 2;
+        const box = { x0, y0: ly - hh / 2, x1: x0 + w, y1: ly + hh / 2 };
+        if (box.x0 < bounds.x0 || box.x1 > bounds.x1 || box.y0 < bounds.y0 || box.y1 > bounds.y1) continue;
+        if (placed.some((b) => hit(b, box)) || marks.some((m, j) => j !== i && hit(m, box))) continue;
+        placed.push(box);
+        text(svg, lx, ly, label, { class: 'hwch-lbl', 'text-anchor': anchor });
+        break;
+      }
+    }
+  }
+
+  /* ---------------------------------------------------------- capacity × bandwidth */
+  mountAll('hw-map', (root) => {
+    const hidden = new Set<Group>();
+    const W = 900, H = 520, L = 62, R = 20, T = 18, B = 50;
+    legendBar(root, hidden, draw);
+    const wrap = h('div', { class: 'hwch-plot' }, root);
+    const svg = svgRoot(wrap, W, H, { 'aria-label': 'Memory capacity versus memory bandwidth for every accelerator' });
+    const tip = tooltip(wrap);
+    const xMin = log(0.1), xMax = log(40000), yMin = log(0.1), yMax = log(2000);
+    const X = (v: number) => L + ((log(v) - xMin) / (xMax - xMin)) * (W - L - R);
+    const Y = (v: number) => H - B - ((log(v) - yMin) / (yMax - yMin)) * (H - T - B);
+
+    function draw() {
+      clear(svg);
+      // grid + axes
+      for (const v of [0.1, 1, 10, 100, 1000, 10000]) { line(svg, X(v), T, X(v), H - B, 'var(--border)', { 'stroke-width': 1 }); text(svg, X(v), H - B + 16, `${v.toLocaleString('en-US')} TB/s`, { 'text-anchor': 'middle', class: 'hwch-ax' }); }
+      for (const v of [0.1, 1, 10, 100, 1000]) { line(svg, L, Y(v), W - R, Y(v), 'var(--border)', { 'stroke-width': 1 }); text(svg, L - 8, Y(v), memStr(v), { 'text-anchor': 'end', class: 'hwch-ax' }); }
+      text(svg, (L + W - R) / 2, H - 10, 'Memory bandwidth → faster decode', { 'text-anchor': 'middle', class: 'hwch-axt' });
+      text(svg, 14, (T + H - B) / 2, 'Memory capacity → bigger models', { 'text-anchor': 'middle', class: 'hwch-axt', transform: `rotate(-90 14 ${(T + H - B) / 2})` });
+      // iso-lines: time to read the whole memory once = capacity / bandwidth
+      const clip = s('clipPath', { id: 'hwmapclip' }, s('defs', {}, svg));
+      s('rect', { x: L, y: T, width: W - L - R, height: H - T - B }, clip);
+      const iso = s('g', { 'clip-path': 'url(#hwmapclip)' }, svg);
+      for (const ms of [0.01, 0.1, 1, 10, 100, 1000]) {
+        // capacity(GB) = ms/1000 × bw(TB/s) × 1000  →  GB = ms × TB/s
+        const b0 = 0.1, b1 = 40000;
+        line(iso, X(b0), Y(ms * b0), X(b1), Y(ms * b1), 'var(--text-faint)', { 'stroke-dasharray': '3 5', 'stroke-width': 1, opacity: 0.6 });
+        const lb = Math.min(20000, 1500 / ms);
+        const ly = Y(ms * lb);
+        if (ly > T + 10 && ly < H - B - 6) text(iso, X(lb) - 4, ly - 7, ms >= 1 ? `${ms} ms sweep` : `${ms * 1000} µs`, { class: 'hwch-iso', 'text-anchor': 'end', transform: `rotate(-${(Math.atan((H - T - B) / (yMax - yMin) / ((W - L - R) / (xMax - xMin))) * 180) / Math.PI} ${X(lb) - 4} ${ly - 7})` });
+      }
+      const list = ACCELS.filter((a) => !hidden.has(a.group)).map((a) => ({ a, x: X(a.bwTBs), y: Y(a.memGB) }));
+      points(svg, list, tip, (a) => `<span>${memStr(a.memGB)} ${a.memType} · ${nf(a.bwTBs, 2)} TB/s</span><span>Full sweep: ${nf((a.memGB / a.bwTBs), 1)} ms${isSram(a) ? ' (on-chip SRAM)' : ''}</span>`, { x0: L, y0: T, x1: W - R, y1: H - B });
+    }
+    draw();
+  });
+
+  /* ---------------------------------------------------------- the memory wall */
+  mountAll('hw-wall', (root) => {
+    const hidden = new Set<Group>();
+    let mode: 'bf16' | 'low' = 'low';
+    const W = 900, H = 420, L = 62, R = 20, T = 18, B = 44;
+    const top = h('div', { class: 'hwch-top' }, root);
+    segmented(top, [{ value: 'low', label: 'Fastest precision (FP8/FP4)' }, { value: 'bf16', label: 'BF16 only' }], mode, (v) => { mode = v as typeof mode; draw(); });
+    legendBar(top, hidden, draw);
+    const wrap = h('div', { class: 'hwch-plot' }, root);
+    const svg = svgRoot(wrap, W, H, { 'aria-label': 'Ridge point (FLOPs per byte) by release year' });
+    const tip = tooltip(wrap);
+    const years = ACCELS.map((a) => a.year);
+    const x0 = Math.min(...years) - 0.5, x1 = Math.max(...years) + 0.7;
+    const yMin = log(20), yMax = log(5000);
+    const X = (v: number) => L + ((v - x0) / (x1 - x0)) * (W - L - R);
+    const Y = (v: number) => H - B - ((log(Math.max(20, v)) - yMin) / (yMax - yMin)) * (H - T - B);
+    const ridge = (a: Accel) => (mode === 'bf16' ? ridgeBF16(a) : (bestLowPrec(a) ?? 0) / a.bwTBs) ?? 0;
+
+    function draw() {
+      clear(svg);
+      for (let y = Math.ceil(x0); y <= Math.floor(x1); y++) { line(svg, X(y), T, X(y), H - B, 'var(--border)', { 'stroke-width': 1 }); text(svg, X(y), H - B + 16, String(y), { 'text-anchor': 'middle', class: 'hwch-ax' }); }
+      for (const v of [20, 50, 100, 200, 500, 1000, 2000, 5000]) { line(svg, L, Y(v), W - R, Y(v), 'var(--border)', { 'stroke-width': 1 }); text(svg, L - 8, Y(v), v.toLocaleString('en-US'), { 'text-anchor': 'end', class: 'hwch-ax' }); }
+      text(svg, 14, (T + H - B) / 2, 'FLOPs per byte to be compute-bound', { 'text-anchor': 'middle', class: 'hwch-axt', transform: `rotate(-90 14 ${(T + H - B) / 2})` });
+      // decode intensity band: a batch of B sequences does ~2·B FLOPs per weight byte (BF16) → B per byte
+      const band = s('g', {}, svg);
+      s('rect', { x: L, y: Y(64), width: W - L - R, height: H - B - Y(64), fill: 'var(--c-decode-soft)' }, band);
+      text(band, W - R - 8, Y(64) + 12, 'BF16 decode at batch ≤ 64 lives down here', { 'text-anchor': 'end', class: 'hwch-band' });
+      const jitter = new Map<number, number>();
+      const list = ACCELS.filter((a) => !hidden.has(a.group) && !isSram(a) && ridge(a) > 0).sort((a, b) => ridge(a) - ridge(b)).map((a) => {
+        const k = jitter.get(a.year) ?? 0; jitter.set(a.year, k + 1);
+        return { a, x: X(a.year) + ((k % 7) - 3) * 8, y: Y(ridge(a)) };
+      });
+      points(svg, list, tip, (a) => `<span>${nf(ridge(a))} FLOP/B (${mode === 'bf16' ? 'BF16' : lowPrecLabel(a)})</span><span>${nf(mode === 'bf16' ? a.bf16 : bestLowPrec(a))} TFLOPS ÷ ${nf(a.bwTBs, 2)} TB/s</span>`, { x0: L, y0: T, x1: W - R, y1: H - B });
+    }
+    draw();
+  });
+</script>
+
+<style>
+  .hwch { position: relative; }
+  .hwch :global(.hwch-top) { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+  .hwch :global(.hwch-legend) { display: flex; flex-wrap: wrap; gap: 6px; }
+  .hwch :global(.hwch-legend button) { appearance: none; font: inherit; font-size: 0.78rem; display: inline-flex; gap: 6px; align-items: center; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text-dim); cursor: pointer; }
+  .hwch :global(.hwch-legend button[aria-pressed='false']) { opacity: 0.45; text-decoration: line-through; }
+  .hwch :global(.hwch-plot) { position: relative; margin-top: 10px; }
+  .hwch :global(.hwch-plot > svg) { display: block; width: 100%; height: auto; overflow: visible; font-family: var(--font-sans); }
+  .hwch :global(.hwch-ax) { font-size: 11px; fill: var(--text-faint); font-family: var(--font-mono); }
+  .hwch :global(.hwch-axt) { font-size: 12px; fill: var(--text-dim); font-weight: 600; }
+  .hwch :global(.hwch-iso) { font-size: 10.5px; fill: var(--text-faint); font-style: italic; }
+  .hwch :global(.hwch-band) { font-size: 11px; fill: var(--c-decode); font-weight: 600; }
+  .hwch :global(.hwch-lbl) { font-size: 10.5px; fill: var(--text-dim); pointer-events: none; paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round; }
+  .hwch :global(.hwch-pt) { cursor: pointer; outline: none; }
+  .hwch :global(.hwch-pt:hover > :not(:first-child)), .hwch :global(.hwch-pt:focus-visible > :not(:first-child)) { stroke: var(--text); }
+  .hwch :global(.hwch-tip[hidden]) { display: none; }
+  .hwch :global(.hw-sw) { display: inline-block; width: 12px; height: 12px; }
+  .hwch :global(.hwch-tip) { position: absolute; z-index: 5; pointer-events: none; max-width: 260px; padding: 8px 11px; border-radius: 10px; background: var(--surface-solid); border: 1px solid var(--border-strong); box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5); font-size: 0.8rem; display: flex; flex-direction: column; gap: 2px; }
+  .hwch :global(.hwch-tip b) { font-size: 0.86rem; }
+  .hwch :global(.hwch-tip span) { color: var(--text-dim); font-family: var(--font-mono); font-size: 0.74rem; }
+  .hwch :global(.hwch-tip em) { color: var(--text-faint); font-size: 0.7rem; margin-top: 3px; font-style: normal; }
+</style>
