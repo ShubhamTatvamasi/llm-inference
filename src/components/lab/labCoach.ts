@@ -27,13 +27,14 @@ export const toInput = (st: St): LabIn => ({
 
 export function summarize(st: St) {
   const inp = toInput(st);
-  const r = evaluate(inp);
-  const fits = r.mem.fits && r.mem.maxSeqs >= 1;
-  const over = fits && st.b > r.mem.maxSeqs; // more requests than KV slots: the extra ones queue
-  const total = over ? r.mem.maxSeqs / r.tpot : r.total;
-  const cost = over ? (r.costPerM * st.b) / r.mem.maxSeqs : r.costPerM;
+  const asked = evaluate(inp);
+  const fits = asked.mem.fits && asked.mem.maxSeqs >= 1;
+  const over = fits && st.b > asked.mem.maxSeqs; // more requests than KV slots: the extra ones queue
+  // only the requests that fit actually run, so speed and cost are those of the running batch
+  const running = over ? asked.mem.maxSeqs : st.b;
+  const r = over ? evaluate({ ...inp, batch: running }) : asked;
   const meetsSlo = st.s === 0 || r.perUser >= st.s;
-  return { inp, r, fits, over, total, cost, perUser: r.perUser, ttft: r.ttft, tpot: r.tpot, reqPerS: total / st.o, maxSeqs: r.mem.maxSeqs, meetsSlo, ok: fits && !over && meetsSlo };
+  return { inp, r, fits, over, running, total: r.total, cost: r.costPerM, perUser: r.perUser, ttft: r.ttft, tpot: r.tpot, reqPerS: r.reqPerS, maxSeqs: asked.mem.maxSeqs, meetsSlo, ok: fits && !over && meetsSlo };
 }
 export type Summary = ReturnType<typeof summarize>;
 
@@ -132,11 +133,11 @@ export const EXERCISES: Exercise[] = [
   },
   {
     id: 'batch', title: 'Nearly free throughput', ch: 'batching',
-    goal: 'On one H100 with Llama 3 8B, reach 5,000 tok/s in total while every user still gets at least 40 tok/s.',
+    goal: 'On one H100 with Llama 3 8B, reach 2,500 tok/s in total while every user still gets at least 40 tok/s.',
     hint: 'At batch 1 the GPU reads all the weights to make one token. Raise the batch and watch which of the two numbers moves faster.',
     lesson: 'A decode step costs about the same whether it produces 1 token or 100, because the weight read dominates. Batching is why serving is affordable; the KV cache and your latency target set where it stops.',
     start: { m: 'llama3-8b', g: 'h100', tp: 1, w: 'bf16', kv: 'bf16', p: 2048, o: 512, b: 1, s: 0 },
-    check: (st, s) => st.m === 'llama3-8b' && st.g === 'h100' && st.tp === 1 && s.fits && !s.over && s.total >= 5000 && s.perUser >= 40,
+    check: (st, s) => st.m === 'llama3-8b' && st.g === 'h100' && st.tp === 1 && s.fits && !s.over && s.total >= 2500 && s.perUser >= 40,
   },
   {
     id: 'context', title: 'The long-context squeeze', ch: 'kv-cache',
@@ -148,18 +149,18 @@ export const EXERCISES: Exercise[] = [
   },
   {
     id: 'cost', title: 'Cut the bill', ch: 'capacity-planning',
-    goal: 'Serve Llama 3 70B on H100s for under $0.50 per million output tokens, with at least 30 tok/s per user.',
-    hint: 'The starting point costs over $11. Three knobs each help a lot: how many tokens share a step, how many bytes a step reads, and how many GPUs you pay for.',
+    goal: 'Serve Llama 3 70B on H100s for under $1.50 per million output tokens, with at least 30 tok/s per user.',
+    hint: 'The starting point costs about $13. Three knobs each help a lot: how many tokens share a step, how many bytes a step reads, and how many GPUs you pay for.',
     lesson: 'Cost per token is GPU price divided by throughput. Batch size moves it most, precision next, and extra GPUs only pay off when they let the batch grow.',
     start: { m: 'llama3-70b', g: 'h100', tp: 4, w: 'bf16', kv: 'bf16', p: 2048, o: 512, b: 8, s: 30 },
-    check: (st, s) => st.m === 'llama3-70b' && st.g === 'h100' && s.fits && !s.over && s.cost <= 0.5 && s.perUser >= 30,
+    check: (st, s) => st.m === 'llama3-70b' && st.g === 'h100' && s.fits && !s.over && s.cost <= 1.5 && s.perUser >= 30,
   },
   {
     id: 'hardware', title: 'Shop around', ch: 'gpu',
-    goal: 'Serve Llama 3 70B for under $0.20 per million output tokens with at least 20 tok/s per user. Any hardware.',
+    goal: 'Serve Llama 3 70B for under $0.80 per million output tokens with at least 20 tok/s per user. Any hardware.',
     hint: 'Decode is bound by memory bandwidth and by how many requests fit. Which chips give the most of both per dollar? The suggestions under the stats will point at one.',
     lesson: 'For decode-heavy serving, what matters is memory capacity and bandwidth per dollar, not peak FLOPs. A chip that holds the whole model on one device also avoids paying for tensor parallelism.',
     start: { m: 'llama3-70b', g: 'h100', tp: 4, w: 'fp8', kv: 'fp8', p: 2048, o: 512, b: 64, s: 20 },
-    check: (st, s) => st.m === 'llama3-70b' && s.fits && !s.over && s.cost <= 0.2 && s.perUser >= 20,
+    check: (st, s) => st.m === 'llama3-70b' && s.fits && !s.over && s.cost <= 0.8 && s.perUser >= 20,
   },
 ];

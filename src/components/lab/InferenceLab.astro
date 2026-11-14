@@ -13,7 +13,7 @@
 
 
   const PRESETS: { name: string; st: St; look: string }[] = [
-    { name: 'Chatbot · 8B on 1×H100', st: { ...DEFAULT }, look: 'Decode is memory-bound: each step re-reads all 16 GB of weights. Drag the batch up and watch total throughput climb while per-user speed barely moves.' },
+    { name: 'Chatbot · 8B on 1×H100', st: { ...DEFAULT }, look: 'Decode is memory-bound: each step re-reads all 16 GB of weights. Drag the batch up and watch total throughput climb much faster than per-user speed falls.' },
     { name: '70B on 4×H100 · FP8', st: { m: 'llama3-70b', g: 'h100', tp: 4, w: 'fp8', kv: 'fp8', p: 2048, o: 512, b: 64, s: 0 }, look: 'Tensor parallelism splits the weights four ways, so each step reads ¼ of them per GPU, plus a little all-reduce time (teal).' },
     { name: 'Long-context RAG · 32k prompts', st: { m: 'llama3-8b', g: 'h100', tp: 1, w: 'bf16', kv: 'bf16', p: 32768, o: 512, b: 8, s: 0 }, look: 'Now the KV cache dominates both memory and step time. Only a handful of requests fit, and TTFT is mostly attention FLOPs. Try KV = FP8.' },
     { name: 'Will not fit · 70B on 1×4090', st: { m: 'llama3-70b', g: 'rtx4090', tp: 1, w: 'bf16', kv: 'bf16', p: 1024, o: 256, b: 1, s: 0 }, look: '141 GB of weights cannot fit in 24 GB. Try INT4 weights and more GPUs, and see how much is left for KV.' },
@@ -121,16 +121,16 @@
       return p;
     };
     const pMem = panel('1 · Where the HBM goes', 'Total memory across the GPUs in this replica. Whatever the weights and overhead leave becomes KV-cache space, and that caps how many requests can run at once.', learn('kv-cache', 'KV cache'));
-    const svgMem = svgRoot(pMem, 460, 210, { 'aria-label': 'GPU memory breakdown' });
+    const svgMem = svgRoot(pMem, 460, 224, { 'aria-label': 'GPU memory breakdown' });
     const pStep = panel('2 · Anatomy of one decode step', 'Memory reads and tensor-core math overlap, so the longer lane sets the step time. Communication and fixed overhead are added on top.', learn('roofline', 'Roofline'));
-    const svgStep = svgRoot(pStep, 460, 210, { 'aria-label': 'Decode step time breakdown' });
+    const svgStep = svgRoot(pStep, 460, 224, { 'aria-label': 'Decode step time breakdown' });
     const pRoof = panel('3 · On the roofline', 'Arithmetic intensity is FLOPs per byte moved. Left of the ridge, a kernel waits on memory; right of it, on compute. Batching moves decode to the right.', learn('roofline', 'Roofline'));
     const svgRoof = svgRoot(pRoof, 460, 250, { 'aria-label': 'Roofline with prefill and decode operating points' });
     const pCurve = panel('4 · The serving trade-off', 'Each dot is a batch size. Moving right means more total tokens/s (cheaper); moving up means faster for each user. Click the curve to pick a batch.', learn('batching', 'Batching'));
     const svgCurve = svgRoot(pCurve, 460, 250, { 'aria-label': 'Throughput versus per-user speed as batch grows' });
     const pTime = h('section', { class: 'lab-panel lab-wide' }, grid);
     { const hd = h('header', {}, pTime); h('h3', { text: '5 · One request, start to finish' }, hd); h('span', { class: 'lab-learnwrap', html: learn('prefill-decode', 'Prefill vs decode') + learn('metrics', 'Metrics') }, hd); }
-    h('p', { class: 'lab-sub', text: 'The prefill pass emits the first token, so TTFT is prefill time. Every later token costs one decode step. Bars are drawn to scale; queueing time is not included.' }, pTime);
+    h('p', { class: 'lab-sub', text: 'The prefill pass emits the first token, so TTFT is prefill time. Every later token costs one decode step, plus a share of the pauses while other requests prefill. Bars are drawn to scale; queueing time is not included.' }, pTime);
     const svgTime = svgRoot(pTime, 940, 96, { 'aria-label': 'Timeline of one request' });
 
     /* ---------- exercises ---------- */
@@ -164,7 +164,7 @@
 
     const share = h('div', { class: 'lab-foot' }, root);
     const shareBtn = h('button', { type: 'button', class: 'btn', text: 'Copy link to this setup' }, share);
-    h('span', { class: 'lab-note', html: 'First-order model: 75% of peak bandwidth, 50% of peak FLOPs, 2 ms per-step overhead, 90% memory utilisation. Real engines differ by tens of percent, so use it for intuition and confirm with a <a href="' + chapterUrl('benchmarking') + '">benchmark</a>.' }, share);
+    h('span', { class: 'lab-note', html: 'First-order model: 75% of peak bandwidth, 50% of peak FLOPs, 2 ms per-step overhead, 90% memory utilisation. Prefill and decode take turns on the GPU, so throughput and cost include the time spent reading prompts. Real engines differ by tens of percent, so use it for intuition and confirm with a <a href="' + chapterUrl('benchmarking') + '">benchmark</a>.' }, share);
     shareBtn.addEventListener('click', async () => { try { await navigator.clipboard.writeText(location.href); shareBtn.textContent = 'Copied ✓'; setTimeout(() => (shareBtn.textContent = 'Copy link to this setup'), 1600); } catch {} });
 
     const hatch = hatchDefs(svgMem, 'lab-hatch', C.waste);
@@ -182,15 +182,15 @@
       try { history.replaceState(null, '', '#' + new URLSearchParams(hash)); } catch {}
       root.classList.toggle('lab-nofit', !fits);
       sts.set('TTFT', fits ? ms(r.ttft) : '—', fits ? `prefill of ${tok(st.p)} tokens` : 'does not fit');
-      sts.set('TPOT', fits ? ms(r.tpot) : '—', 'time per output token');
+      sts.set('TPOT', fits ? ms(r.tpot) : '—', !fits ? '' : r.pfShare >= 0.03 ? `${ms(r.step)} step + ${fmt.pct(r.pfShare)} prefill share` : 'time per output token');
       sts.set('Per-user speed', fits ? `${r.perUser.toFixed(0)} tok/s` : '—', !fits ? '' : st.s ? (sum.meetsSlo ? `meets your ≥ ${st.s} target` : `below your ≥ ${st.s} target`) : r.perUser > 20 ? 'faster than reading' : 'below reading speed', fits && (r.perUser < 20 || !sum.meetsSlo) ? C.waste : undefined);
       sts.set('Requests / s', fits ? (sum.reqPerS >= 10 ? sum.reqPerS.toFixed(0) : sum.reqPerS.toFixed(sum.reqPerS >= 1 ? 1 : 2)) : '—', fits ? `completing ${tok(st.o)}-token replies` : '');
-      sts.set('Total throughput', fits ? `${fmt.int(over ? r.mem.maxSeqs / r.tpot : r.total)} tok/s` : '—', !fits ? '' : over ? `capped at ${r.mem.maxSeqs} running` : `${st.b} stream${st.b > 1 ? 's' : ''}`);
-      sts.set('Fits in KV', fits ? `${fmt.int(r.mem.maxSeqs)} req` : '0', `of ${tok(st.p + st.o)} tokens each`, over || !fits ? C.waste : C.kv);
-      sts.set('Cost / 1M output tok', fits ? `$${(over ? r.costPerM * st.b / r.mem.maxSeqs : r.costPerM).toFixed(r.costPerM < 1 ? 3 : 2)}` : '—', `${st.tp} × $${gpu.pricePerHr}/h`);
+      sts.set('Total throughput', fits ? `${fmt.int(sum.total)} tok/s` : '—', !fits ? '' : over ? `capped at ${sum.maxSeqs} running` : `${st.b} stream${st.b > 1 ? 's' : ''}, prefill included`);
+      sts.set('Fits in KV', fits ? `${fmt.int(sum.maxSeqs)} req` : '0', `of ${tok(st.p + st.o)} tokens each`, over || !fits ? C.waste : C.kv);
+      sts.set('Cost / 1M output tok', fits ? `$${sum.cost.toFixed(sum.cost < 1 ? 3 : 2)}` : '—', `${st.tp} × $${gpu.pricePerHr}/h, prompts included`);
 
       drawMem(inp, r, fits, over);
-      drawStep(r, fits);
+      drawStep(r, fits, sum.running);
       drawRoof(inp, r, fits);
       drawCurve(inp, r, fits);
       drawTime(r, fits);
@@ -306,7 +306,7 @@
     }
 
     /* ---- 2 step anatomy ---- */
-    function drawStep(r: ReturnType<typeof evaluate>, fits: boolean) {
+    function drawStep(r: ReturnType<typeof evaluate>, fits: boolean, running: number) {
       clear(svgStep);
       if (!fits) { text(svgStep, 230, 105, 'Fit the model in memory first.', { 'text-anchor': 'middle', class: 't-dim' }); return; }
       const d = r.d; const X = 96, Wd = 340;
@@ -329,11 +329,12 @@
       lane(84, 'step', [[Math.max(d.tMem, d.tCompute), d.bound === 'compute' ? C.compute : d.bound === 'kv' ? C.kv : C.weight, 'overlap'], [d.tComm, C.comm, 'all-reduce'], [d.tOverhead, C.mem, 'overhead']]);
       line(svgStep, lanesEnd, 10, lanesEnd, 114, C.text, { 'stroke-dasharray': '3 3', 'stroke-width': 1 });
       const who = d.bound === 'compute' ? ['compute-bound', C.compute, 'Tensor cores are saturated.'] : d.bound === 'kv' ? ['KV-bandwidth-bound', C.kv, 'Reading the cache costs more than reading the weights.'] : ['weight-bandwidth-bound', C.weight, 'Mostly waiting on HBM to stream the weights.'];
-      text(svgStep, 14, 140, `Step = ${ms(d.step)} for ${st.b} tokens  →  `, { class: 't-small' }).appendChild(s('tspan', { class: 't-bold', style: `fill:${who[1]}`, text: who[0] }));
+      text(svgStep, 14, 140, `Step = ${ms(d.step)} for ${running} token${running > 1 ? 's' : ''}  →  `, { class: 't-small' }).appendChild(s('tspan', { class: 't-bold', style: `fill:${who[1]}`, text: who[0] }));
       text(svgStep, 14, 158, who[2], { class: 't-small t-dim' });
       const memShare = d.tMem / (d.tMem + d.tCompute);
       text(svgStep, 14, 182, `Bytes read: ${gb(d.wB)} weights + ${gb(d.kvB)} KV per step`, { class: 't-small t-faint t-mono' });
       text(svgStep, 14, 198, `Tensor cores busy ≈ ${fmt.pct(Math.min(1, d.tCompute / d.step))} of the step${memShare > 0.8 ? ' (mostly idle)' : ''}`, { class: 't-small t-faint t-mono' });
+      text(svgStep, 14, 214, `Prefill of new requests takes ${fmt.pct(r.pfShare)} of GPU time  →  average TPOT ${ms(r.tpot)}`, { class: 't-small t-mono', style: `fill:${C.prefill}` });
     }
 
     /* ---- 3 roofline ---- */
@@ -405,7 +406,7 @@
         c.style.cursor = 'pointer';
         s('title', { text: `B=${p.B}: ${p.total.toFixed(0)} tok/s total, ${p.perUser.toFixed(0)} tok/s each${ok ? '' : ' (does not fit in KV)'}` }, c);
         c.addEventListener('click', () => { st.b = p.B; slB.set(B_STEPS.indexOf(p.B), false); update(); });
-        if (on || p.B === 1 || p.B === B_STEPS.at(-1)) text(svgCurve, xp(p.total) + (xp(p.total) > 380 ? -10 : 10), yp(p.perUser) - 10, `B=${p.B}`, { class: 't-small t-mono t-bold', 'text-anchor': xp(p.total) > 380 ? 'end' : 'start' });
+        if (on || p.B === 1 || p.B === B_STEPS.at(-1)) text(svgCurve, xp(p.total) + (xp(p.total) > 380 ? -10 : 10), yp(p.perUser) + (p.B === B_STEPS.at(-1) && !on ? 14 : -10), `B=${p.B}`, { class: 't-small t-mono t-bold', 'text-anchor': xp(p.total) > 380 ? 'end' : 'start' });
       });
       if (r.mem.maxSeqs < B_STEPS.at(-1)!) text(svgCurve, X1, Y1 + 4, 'dashed red = KV cache full', { 'text-anchor': 'end', class: 't-small', style: `fill:${C.waste}` });
     }
@@ -426,7 +427,7 @@
       line(svgTime, ttx, 6, ttx, 50, C.text, { 'stroke-width': 1.5 });
       text(svgTime, ttx + (ttx > 700 ? -6 : 6), 60, `first token at ${ms(r.ttft)}`, { class: 't-small t-bold', 'text-anchor': ttx > 700 ? 'end' : 'start' });
       text(svgTime, X, 80, `prefill ${ms(r.pf.t)} (${fmt.pct(r.pf.attnShare)} of it attention)`, { class: 't-small', style: `fill:${C.prefill}` });
-      text(svgTime, X + Wd, 80, `${st.o} decode steps × ${ms(r.tpot)} = done at ${ms(r.e2e)}`, { 'text-anchor': 'end', class: 't-small', style: `fill:${C.decode}` });
+      text(svgTime, X + Wd, 80, `${st.o} tokens × ${ms(r.tpot)} average gap = done at ${ms(r.e2e)}`, { 'text-anchor': 'end', class: 't-small', style: `fill:${C.decode}` });
     }
 
     /* ---- insight ---- */
@@ -435,13 +436,14 @@
       if (!r.mem.fits) return `<b>Does not fit.</b> ${m.name} needs ${gb(r.mem.weights)} for weights alone at ${st.w.toUpperCase()}, but ${st.tp}× ${inp.gpu.name} gives ${gb(r.mem.budget)} usable. Quantize (${learn('quantization', 'Quantization')}) or shard across more GPUs (${learn('parallelism', 'Parallelism')}).`;
       if (!fits) return `<b>Weights fit, but there is no room for even one ${tok(st.p + st.o)}-token request's KV cache.</b> Shorten the context, quantize the KV cache, or add GPUs. ${learn('kv-cache', 'KV cache')}`;
       const parts: string[] = [];
-      const d = r.d;
+      const d = r.d; const running = Math.min(st.b, r.mem.maxSeqs);
       if (over) parts.push(`<b>Only ${r.mem.maxSeqs} of your ${st.b} requests fit in the KV cache.</b> The rest wait in the queue or get preempted, so throughput is capped at the KV limit. ${learn('scheduler', 'Scheduler')}`);
-      if (d.bound === 'weights') parts.push(`<b>Weight-bandwidth-bound.</b> Every step streams ${gb(d.wB)} of weights through HBM to produce just ${st.b} token${st.b > 1 ? 's' : ''}. ${st.b < 64 ? 'More batch is nearly free: each step costs about the same but yields more tokens.' : 'Batching has amortized most of it.'} ${learn('batching', 'Batching')}`);
+      if (d.bound === 'weights') parts.push(`<b>Weight-bandwidth-bound.</b> Every step streams ${gb(d.wB)} of weights through HBM to produce just ${running} token${running > 1 ? 's' : ''}. ${running < 64 ? 'A decode step costs about the same at any batch size, so more batch mostly adds throughput.' : 'Batching has amortized most of the weight read.'}${r.pfShare >= 0.15 && running < 64 ? ' The per-user slowdown on the curve comes from the extra prompts that more streams bring in, not from the decode step.' : ''} ${learn('batching', 'Batching')}`);
       if (d.bound === 'kv') parts.push(`<b>KV-bandwidth-bound.</b> Reading ${gb(d.kvB)} of cached keys and values now costs more than reading the weights. Long contexts make decode scale with context length. FP8 KV, GQA/MLA or prefix sharing help. ${learn('attention', 'GQA & MLA')}`);
       if (d.bound === 'compute') parts.push(`<b>Compute-bound.</b> The batch is big enough that tensor cores are the bottleneck. From here, more concurrency lowers every user's speed roughly in proportion. ${learn('roofline', 'Roofline')}`);
       if (m.attn === 'MLA' && st.tp > 1) parts.push(`MLA’s compressed KV is shared by every head, so each of the ${st.tp} GPUs keeps a full copy: TP=${st.tp} multiplies KV memory by ${st.tp}. Production DeepSeek deployments use data-parallel attention for this reason. ${learn('moe', 'MoE')}`);
       else if (st.tp > m.kvHeads) parts.push(`TP=${st.tp} exceeds the ${m.kvHeads} KV heads, so KV heads are replicated across GPUs. ${learn('parallelism', 'Parallelism')}`);
+      if (r.pfShare >= 0.3) parts.push(`<b>Prefill takes ${fmt.pct(r.pfShare)} of GPU time.</b> With ${tok(st.p)}-token prompts and ${tok(st.o)}-token replies the engine spends ${r.pfShare >= 0.5 ? 'more time reading prompts than writing answers' : 'a large part of its time reading prompts'}, which stretches every stream from ${ms(r.step)} to ${ms(r.tpot)} per token. Reusing shared prompt prefixes removes that work. ${learn('prefix-caching', 'Prefix caching')}`);
       if (r.pf.attnShare > 0.3) parts.push(`Prefill is ${fmt.pct(r.pf.attnShare)} attention at ${tok(st.p)} tokens, the quadratic term. ${learn('flash-attention', 'FlashAttention')}`);
       if (d.tComm / d.step > 0.15) parts.push(`All-reduce is ${fmt.pct(d.tComm / d.step)} of each step at TP=${st.tp}. ${learn('interconnects', 'Interconnects')}`);
       if (r.perUser < 20) parts.push(`<span style="color:${C.waste}">Each user gets ${r.perUser.toFixed(0)} tok/s, slower than people read.</span>`);
@@ -469,7 +471,8 @@
   .lab :global(.lab-cg select) { min-width: 0; max-width: 62%; }
   .lab :global(.lab-cg input[type='range']) { width: 150px; }
   .lab :global(.lab-batch) { accent-color: var(--c-decode) !important; }
-  .lab :global(.stats) { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
+  .lab :global(.stats) { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  @media (max-width: 760px) { .lab :global(.stats) { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .lab :global(.lab-insight) { font-size: 0.92rem; }
   .lab :global(.lab-delta) { font-size: 0.72rem; font-family: var(--font-mono); color: var(--text-faint); min-height: 1.2em; margin-top: 2px; }
   .lab :global(.lab-delta[data-dir='good']) { color: var(--c-good); }
@@ -520,6 +523,12 @@
   .lab:global(.lab-nofit) :global(.stat .v) { color: var(--text-faint); }
   @media (max-width: 900px) {
     .lab :global(.lab-ctl), .lab :global(.lab-grid) { grid-template-columns: 1fr; }
+  }
+  /* phones: keep chart text legible and let the panel scroll sideways, as chapter diagrams do */
+  @media (max-width: 640px) {
+    .lab :global(.lab-panel) { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
+    .lab :global(.lab-panel > svg) { min-width: 460px; }
+    .lab :global(.lab-wide > svg) { min-width: 720px; }
   }
   @media (max-width: 480px) {
     .lab :global(.lab-cg .field) { flex-wrap: wrap; }

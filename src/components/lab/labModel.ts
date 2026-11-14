@@ -2,6 +2,7 @@
    Same assumptions as the capacity-planning chapter (src/components/viz/capacityModel.ts):
    decode reads every touched weight + the batch's KV cache once per step, prefill is
    compute-bound, and achieved efficiency is a fixed fraction of the spec sheet.
+   Throughput and cost include the GPU time spent prefilling newly arriving requests.
    Every term is returned separately so the Lab can draw *why* a step takes as long as it does. */
 import { kvBytesPerToken, kvReplication, type GPU, type Model } from '../../data/hardware';
 
@@ -100,19 +101,28 @@ export function evaluate(p: LabIn) {
   const d = decodeStep(p);
   const pf = prefill(p);
   const ttft = pf.t; // prefill's last position emits the first token (queueing not modelled)
-  const tpot = d.step;
+  // Steady state: each finished request is replaced by a new one, and its prefill takes the GPU
+  // for pf.t. So the average gap between a user's tokens is longer than one decode step.
+  // Same treatment as capacityModel.plan(): prefill and decode time-share the GPU.
+  // Engines fold new prompts into decode steps (chunked prefill), so the weights are already being
+  // streamed and a prompt's marginal cost is its FLOPs, not another full weight read.
+  const pfCost = pf.tCompute;
+  const cycle = (p.output * d.step) / p.batch + pfCost; // GPU-seconds per completed request
+  const pfShare = Math.min(0.95, pfCost / cycle);       // fraction of GPU time spent on prefill
+  const tpot = d.step / (1 - pfShare);
   const e2e = ttft + (p.output - 1) * tpot;
   const perUser = 1 / tpot;
-  const total = p.batch / tpot;
+  const total = p.batch / tpot; // output tokens/s, prefill time included
+  const reqPerS = total / p.output;
   const gpus = p.tp;
   const costPerM = (gpus * p.gpu.pricePerHr) / (total * 3600) * 1e6;
-  return { mem, d, pf, ttft, tpot, e2e, perUser, total, costPerM };
+  return { mem, d, pf, ttft, tpot, step: d.step, pfShare, e2e, perUser, total, reqPerS, costPerM };
 }
 
 /** Throughput vs per-user speed as the batch grows: the serving trade-off curve. */
 export function sweep(p: LabIn, Bs: number[]) {
   return Bs.map((B) => {
-    const d = decodeStep(p, B);
-    return { B, perUser: 1 / d.step, total: B / d.step, bound: d.bound };
+    const r = evaluate({ ...p, batch: B });
+    return { B, perUser: r.perUser, total: r.total, bound: r.d.bound };
   });
 }
