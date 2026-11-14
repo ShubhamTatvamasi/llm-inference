@@ -6,3 +6,9 @@ export function u(path = '') {
 
 /** URL of a chapter page. */
 export const chapterUrl = (slug: string) => u(`${slug}/`);
+
+/** Stable id fragment from free text: 'KV cache growth' → 'kv-cache-growth'. */
+export const slugify = (s: string) => s.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+/** Anchor id of a `<Viz title="…">` frame, so search and other pages can deep-link to a diagram. */
+export const vizId = (title: string) => `viz-${slugify(title)}`;

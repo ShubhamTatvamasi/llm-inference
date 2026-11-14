@@ -59,7 +59,7 @@ Engines have hundreds of options, but a handful decide memory, concurrency and l
 
 A practical tuning order:
 
-1. **`--max-model-len`**: set it to what your product really needs. A 128K default reserves room you will never use.
+1. **`--max-model-len`**: set it to what your product really needs. The model's 128K default can fail the startup check (one max-length sequence must fit in the KV pool) and lets a single request claim most of the pool.
 2. **`--gpu-memory-utilization`**: as high as is stable (0.90–0.95), so KV gets everything left over.
 3. **`--tensor-parallel-size`**: the smallest value that leaves healthy KV room.
 4. **`--kv-cache-dtype fp8`** and **`--quantization`**: once you have evals that show quality holds.

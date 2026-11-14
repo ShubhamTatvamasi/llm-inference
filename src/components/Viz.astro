@@ -5,10 +5,11 @@
  * The ⤢ button opens the diagram full-screen (Esc to close): handy on phones (rotate to landscape)
  * and for dense diagrams on laptops.
  */
+import { vizId } from '../lib/url';
 interface Props { label?: string; title: string; live?: boolean }
 const { label = 'Interactive', title, live = true } = Astro.props;
 ---
-<figure class="viz">
+<figure class="viz" id={vizId(title)}>
   <div class="viz-head">
     <span class="viz-label">{live && <span class="live" />}{label}</span>
     <span class="viz-title">{title}</span>

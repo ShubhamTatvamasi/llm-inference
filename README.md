@@ -19,6 +19,7 @@ npm install
 npm run dev        # http://localhost:4321/llm-inference/
 npm run build      # outputs to dist/
 npm run preview
+npm run check      # after a build: fails on broken links, bad #anchors, duplicate ids, dead search results
 ```
 
 ## Project layout
@@ -49,7 +50,9 @@ src/
 - **`/hardware/`, Inference Hardware** (`src/components/hw/`): 76 GPUs and accelerators (NVIDIA, AMD, TPU, Trainium, Gaudi, Ascend, SRAM chips, Apple silicon and desktop boxes) with a sortable explorer, per-chip spec sheets, side-by-side compare, a capacity × bandwidth map, a ridge-point-by-year chart and a "what should I run this on" calculator that runs the Lab's model on every priced chip. View state lives in the query string (`?gpu=…&cmp=…`).
 - **`/map/`, the Concept Map**: built automatically from the `../<slug>/` cross-links in the chapter MDX (`src/data/graph.ts`). The same graph powers the "Builds on / Comes up again in" box at the end of every chapter. To connect two chapters, just link one from the other.
 - **`/glossary/`** (`src/data/glossary.ts`): each term is linked to the chapter that teaches it. The first mention of each term in a chapter gets a hover/tap definition, and terms are searchable from ⌘K. Mark very common words `hover: false`.
-- Every `<Viz>` frame has a full-screen button (Esc closes it).
+- **⌘K search** (`src/data/search.ts` → `/search.json`): chapters, every section heading, every diagram, the tools and the glossary. The index is one cached file, fetched the first time the palette opens; chapters reuse it for the glossary hover definitions. Nothing to register: a new `##` heading or `<Viz title="…">` is searchable after the next build.
+- Every `<Viz>` frame has a full-screen button (Esc closes it) and a stable anchor (`#viz-<slugified-title>`), so a diagram can be linked directly. Renaming a diagram changes its anchor.
+- Chapters show a reading time (`src/data/content.ts`), a collapsible "On this page" list on screens too narrow for the side contents, and a `#` link on each section heading. The home page button resumes the last chapter read.
 
 ### Colour language
 
@@ -57,7 +60,7 @@ Use the semantic tokens (`C.prefill`, `C.decode`, `C.kv`, `C.weight`, `C.token`,
 
 ## Deploy
 
-`.github/workflows/deploy.yml` builds and publishes to GitHub Pages on every push to `main`.
+`.github/workflows/deploy.yml` builds, runs `npm run check`, and publishes to GitHub Pages on every push to `main`. A broken link or anchor stops the deploy.
 
 1. Repository → **Settings → Pages → Source: GitHub Actions**.
 2. The site is served under `/llm-inference/` because `base` in `astro.config.mjs` matches the repository name. If you rename the repo, update `BASE` there.

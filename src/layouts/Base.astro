@@ -3,29 +3,16 @@ import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
 import 'katex/dist/katex.min.css';
 import '../styles/global.css';
-import { chapters, parts } from '../data/chapters';
-import { glossary, termId } from '../data/glossary';
-import { u, chapterUrl } from '../lib/url';
+import { u } from '../lib/url';
 import { tools, toolSvg } from '../data/tools';
 
-interface Props { title?: string; description?: string; wide?: boolean }
+interface Props { title?: string; description?: string; wide?: boolean; ogType?: 'website' | 'article' }
 const SITE = 'Token by Token';
-const { title, description = 'LLM inference and serving, visualized: interactive, technical diagrams of every stage of an LLM request — from tokenization to GPU kernels to production serving.' } = Astro.props;
+const { title, ogType = 'website', description = 'LLM inference and serving, visualized: interactive, technical diagrams of every stage of an LLM request — from tokenization to GPU kernels to production serving.' } = Astro.props;
 const here = Astro.url.pathname.replace(/\/$/, '').split('/').pop();
 const fullTitle = title ? `${title} · ${SITE}` : `${SITE} — LLM inference & serving, visualized`;
 const canonical = new URL(Astro.url.pathname, Astro.site);
 const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×630 social preview card
-const searchIndex = [
-  ...chapters.map((c, i) => ({
-    n: String(i + 1).padStart(2, '0'), t: c.title, s: c.short, b: c.blurb,
-    p: parts.find((p) => p.id === c.part)!.title, h: chapterUrl(c.slug),
-  })),
-  { n: '◆', t: 'Inference Lab', s: 'lab playground simulator calculator', b: 'Model + GPU + workload → memory, step time, roofline, throughput–latency, cost.', p: 'Tool', h: u('lab/') },
-  { n: '◆', t: 'Inference Hardware', s: 'hardware gpu gpus accelerator tpu trainium mi300x mi355x h100 h200 b200 b300 gb200 rubin rtx 4090 5090 spec specs compare buy', b: 'Every inference GPU and accelerator: specs, charts, compare, and what to run your model on.', p: 'Tool', h: u('hardware/') },
-  { n: '◆', t: 'Concept Map', s: 'map graph prerequisites path', b: 'How every chapter connects; get a reading path to any topic.', p: 'Tool', h: u('map/') },
-  { n: '◆', t: 'Glossary', s: 'glossary terms definitions', b: `${glossary.length} short definitions, each linked to its chapter.`, p: 'Tool', h: u('glossary/') },
-  ...glossary.map((g) => ({ n: 'Aa', t: g.term, s: (g.aliases ?? []).join(' '), b: g.def, p: 'Glossary', h: u(`glossary/#${termId(g.term)}`) })),
-];
 ---
 <!doctype html>
 <html lang="en">
@@ -38,7 +25,7 @@ const searchIndex = [
     <link rel="icon" type="image/svg+xml" href={u('favicon.svg')} />
     <meta property="og:title" content={fullTitle} />
     <meta property="og:description" content={description} />
-    <meta property="og:type" content="website" />
+    <meta property="og:type" content={ogType} />
     <meta property="og:url" content={canonical} />
     <meta property="og:site_name" content={SITE} />
     <meta property="og:image" content={ogImage} />
@@ -51,6 +38,9 @@ const searchIndex = [
     <meta name="twitter:image" content={ogImage} />
     <link rel="sitemap" type="application/xml" href={u('sitemap.xml')} />
     <meta name="theme-color" content="#06070d" />
+    <slot name="head" />
+    <!-- prefetch a page when a link to it is hovered or pressed, so chapter-to-chapter navigation is instant -->
+    <script is:inline type="speculationrules" set:html={JSON.stringify({ prefetch: [{ where: { href_matches: `${u()}*` }, eagerness: 'moderate' }] })} />
     <script is:inline>
       (() => {
         try {
@@ -61,10 +51,11 @@ const searchIndex = [
     </script>
   </head>
   <body>
+    <a class="skip-link" href="#main">Skip to content</a>
     <div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
     <header class="topbar">
       <div class="topbar-in">
-        <button class="icon-btn nav-toggle" type="button" aria-label="Open navigation" data-nav-toggle>
+        <button class="icon-btn nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" data-nav-toggle>
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 6h14M3 10h14M3 14h14"/></svg>
         </button>
         <a class="brand" href={u()}>
@@ -81,9 +72,9 @@ const searchIndex = [
           ))}
         </nav>
         <div class="spacer"></div>
-        <button class="search-btn" type="button" data-palette-open aria-label="Search chapters">
+        <button class="search-btn" type="button" data-palette-open aria-label="Search chapters, sections, diagrams and terms" aria-keyshortcuts="Meta+K Control+K /">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="9" cy="9" r="5.5"/><path d="m13.2 13.2 3.3 3.3"/></svg>
-          <span class="sb-label">Search chapters…</span>
+          <span class="sb-label">Search the guide…</span>
           <kbd class="sb-kbd">⌘K</kbd>
         </button>
         <div class="theme-switch" role="radiogroup" aria-label="Colour theme" data-theme-switch>
@@ -104,20 +95,21 @@ const searchIndex = [
     <slot />
 
     <!-- command palette -->
-    <div class="palette" data-palette hidden>
+    <div class="palette" data-palette data-search-src={u('search.json')} hidden>
       <div class="palette-backdrop" data-palette-close></div>
-      <div class="palette-box" role="dialog" aria-modal="true" aria-label="Search chapters">
+      <div class="palette-box" role="dialog" aria-modal="true" aria-label="Search the guide">
         <div class="palette-input">
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="9" cy="9" r="5.5"/><path d="m13.2 13.2 3.3 3.3"/></svg>
-          <input type="text" placeholder="Chapters, tools and terms — try “kv”, “ttft”, “lab”…" data-palette-input autocomplete="off" spellcheck="false" />
+          <input type="text" placeholder="Chapters, sections, diagrams and terms — try “kv”, “ttft”, “roofline”…" data-palette-input autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true" aria-controls="palette-list" aria-autocomplete="list" aria-label="Search the guide" />
           <kbd>esc</kbd>
         </div>
-        <ul class="palette-list" data-palette-list></ul>
+        <ul class="palette-list" id="palette-list" role="listbox" aria-label="Results" data-palette-list></ul>
+        <div class="palette-foot" aria-hidden="true"><span><kbd>↑</kbd><kbd>↓</kbd> move</span><span><kbd>↵</kbd> open</span><span><kbd>[</kbd><kbd>]</kbd> previous / next chapter</span></div>
       </div>
     </div>
-    <script is:inline type="application/json" id="search-index" set:html={JSON.stringify(searchIndex)} />
 
     <script>
+      import { loadSearchIndex, searchItems, type SearchItem } from '../lib/search';
       // theme: system | light | dark
       const root = document.documentElement;
       const applyTheme = (mode: string) => {
@@ -157,44 +149,68 @@ const searchIndex = [
       addEventListener('scroll', onScroll, { passive: true }); onScroll();
 
       // mobile nav
-      document.querySelectorAll('[data-nav-toggle]').forEach((b) => b.addEventListener('click', () => document.body.classList.toggle('nav-open')));
-      document.querySelectorAll('[data-nav-close]').forEach((b) => b.addEventListener('click', () => document.body.classList.remove('nav-open')));
+      const navToggles = document.querySelectorAll<HTMLElement>('[data-nav-toggle]');
+      const setNav = (open: boolean) => {
+        document.body.classList.toggle('nav-open', open);
+        navToggles.forEach((b) => b.setAttribute('aria-expanded', String(open)));
+      };
+      navToggles.forEach((b) => b.addEventListener('click', () => setNav(!document.body.classList.contains('nav-open'))));
+      document.querySelectorAll('[data-nav-close]').forEach((b) => b.addEventListener('click', () => setNav(false)));
+      addEventListener('keydown', (e) => { if (e.key === 'Escape' && document.body.classList.contains('nav-open')) { setNav(false); navToggles[0]?.focus(); } });
 
-      // command palette
-      type Item = { n: string; t: string; s: string; b: string; p: string; h: string };
-      const items: Item[] = JSON.parse(document.getElementById('search-index')!.textContent || '[]');
+      // command palette: the index is one shared, cached JSON file, fetched the first time it is needed
       const pal = document.querySelector<HTMLElement>('[data-palette]')!;
       const input = pal.querySelector<HTMLInputElement>('[data-palette-input]')!;
       const list = pal.querySelector<HTMLUListElement>('[data-palette-list]')!;
-      let sel = 0; let shown: Item[] = items;
+      let items: SearchItem[] | null = null; let failed = false;
+      let sel = 0; let shown: SearchItem[] = []; let opener: HTMLElement | null = null;
       const esc = (x: string) => x.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+      const mark = () => {
+        list.querySelectorAll<HTMLElement>('[role="option"]').forEach((a, i) => { a.classList.toggle('sel', i === sel); a.setAttribute('aria-selected', String(i === sel)); });
+        if (shown.length) input.setAttribute('aria-activedescendant', `pal-${sel}`); else input.removeAttribute('aria-activedescendant');
+      };
       const render = () => {
-        list.innerHTML = shown.map((it, i) => `<li><a href="${it.h}" class="${i === sel ? 'sel' : ''}"><span class="pn">${it.n}</span><span class="pt"><b>${esc(it.t)}</b><small>${esc(it.b)}</small></span><span class="pp">${esc(it.p)}</span></a></li>`).join('')
-          || '<li class="empty">No chapters match.</li>';
+        list.innerHTML = !items
+          ? `<li class="empty">${failed ? 'Search could not load. Check your connection and try again.' : 'Loading…'}</li>`
+          : shown.map((it, i) => `<li role="presentation"><a href="${esc(it.h)}" id="pal-${i}" role="option" data-i="${i}" data-kind="${it.k}"><span class="pn">${esc(it.n)}</span><span class="pt"><b>${esc(it.t)}</b><small>${esc(it.b)}</small></span><span class="pp">${esc(it.p)}</span></a></li>`).join('')
+            || '<li class="empty">Nothing matches. Try a shorter word.</li>';
+        mark();
         list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
       };
-      const filter = () => {
-        const q = input.value.trim().toLowerCase();
-        const terms = q.split(/\s+/).filter(Boolean);
-        shown = !terms.length ? items.filter((it) => it.p !== 'Glossary') : items.filter((it) => {
-          const hay = `${it.t} ${it.s} ${it.b} ${it.p}`.toLowerCase();
-          return terms.every((t) => hay.includes(t));
-        });
-        sel = 0; render();
+      const filter = () => { shown = items ? searchItems(items, input.value) : []; sel = 0; render(); };
+      const ensure = () => {
+        if (items) return;
+        failed = false;
+        loadSearchIndex().then((d) => { items = d; filter(); }, () => { failed = true; render(); });
       };
-      const open = () => { pal.hidden = false; input.value = ''; filter(); requestAnimationFrame(() => input.focus()); };
-      const close = () => { pal.hidden = true; };
-      document.querySelectorAll('[data-palette-open]').forEach((b) => b.addEventListener('click', open));
+      const open = () => {
+        opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        pal.hidden = false; input.value = ''; ensure(); filter(); requestAnimationFrame(() => input.focus());
+      };
+      const close = () => { pal.hidden = true; opener?.focus(); opener = null; };
+      const move = (d: number) => { if (!shown.length) return; sel = (sel + d + shown.length) % shown.length; mark(); list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' }); };
+      document.querySelectorAll<HTMLElement>('[data-palette-open]').forEach((b) => {
+        b.addEventListener('click', open);
+        b.addEventListener('pointerenter', ensure, { once: true }); // warm the index before the click lands
+      });
       pal.querySelectorAll('[data-palette-close]').forEach((b) => b.addEventListener('click', close));
       input.addEventListener('input', filter);
+      list.addEventListener('pointermove', (e) => {
+        const a = (e.target as HTMLElement).closest<HTMLElement>('[data-i]');
+        if (a && Number(a.dataset.i) !== sel) { sel = Number(a.dataset.i); mark(); }
+      });
+      // a result on the page you are already on only changes the hash, so close the palette ourselves
+      list.addEventListener('click', (e) => { if ((e.target as HTMLElement).closest('a')) pal.hidden = true; });
       addEventListener('keydown', (e) => {
         if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); pal.hidden ? open() : close(); return; }
-        if (e.key === '/' && pal.hidden && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)) { e.preventDefault(); open(); return; }
+        const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement;
+        if (e.key === '/' && pal.hidden && !typing && !e.metaKey && !e.ctrlKey && !e.altKey) { e.preventDefault(); open(); return; }
         if (pal.hidden) return;
         if (e.key === 'Escape') close();
-        else if (e.key === 'ArrowDown') { e.preventDefault(); sel = Math.min(shown.length - 1, sel + 1); render(); }
-        else if (e.key === 'ArrowUp') { e.preventDefault(); sel = Math.max(0, sel - 1); render(); }
-        else if (e.key === 'Enter' && shown[sel]) { location.href = shown[sel].h; }
+        else if (e.key === 'ArrowDown') { e.preventDefault(); move(1); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); move(-1); }
+        else if (e.key === 'Tab') { e.preventDefault(); input.focus(); } // keep focus inside the dialog
+        else if (e.key === 'Enter' && shown[sel]) { e.preventDefault(); list.querySelector<HTMLAnchorElement>('.sel')?.click(); }
       });
     </script>
 
@@ -248,7 +264,13 @@ const searchIndex = [
       .palette-input input { flex: 1; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; font-size: 1rem; }
       .palette-list { list-style: none; margin: 0; padding: 6px; max-height: 56vh; overflow-y: auto; }
       .palette-list a { display: flex; align-items: center; gap: 12px; padding: 9px 10px; border-radius: 10px; color: var(--text); background: none; }
-      .palette-list a.sel, .palette-list a:hover { background: var(--accent-soft); }
+      .palette-list a.sel { background: var(--accent-soft); }
+      .palette-list a[data-kind='s'] .pn, .palette-list a[data-kind='d'] .pn { color: var(--accent); }
+      .palette-foot { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 8px 14px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 0.72rem; }
+      .palette-foot kbd { margin-right: 3px; }
+      @media (max-width: 600px), (pointer: coarse) { .palette-foot { display: none; } }
+      .skip-link { position: fixed; top: 8px; left: 8px; z-index: 200; padding: 8px 14px; border-radius: 10px; background: var(--surface-solid); border: 1px solid var(--accent); color: var(--text); font-size: 0.9rem; font-weight: 600; transform: translateY(-200%); }
+      .skip-link:focus { transform: none; outline: 2px solid var(--accent); outline-offset: 2px; }
       .palette-list .pn { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-faint); width: 22px; }
       .palette-list .pt { flex: 1; display: flex; flex-direction: column; min-width: 0; line-height: 1.35; }
       .palette-list .pt b { font-weight: 600; font-size: 0.92rem; }

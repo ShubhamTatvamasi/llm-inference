@@ -27,7 +27,7 @@ const partIcons: Record<string, string> = {
 };
 ---
 <Base>
-  <main class="home">
+  <main class="home" id="main">
     <section class="hero">
       <div class="hero-glow" aria-hidden="true"></div>
       <div class="pill"><span class="dot"></span>{chapters.length} chapters · live, interactive diagrams</div>
@@ -36,7 +36,7 @@ const partIcons: Record<string, string> = {
         A visual, hands-on guide to LLM inference and serving. It follows a prompt through tokenization, attention, KV caches and GPU kernels, then through batching, schedulers, parallelism and the production stack that streams the answer back.
       </p>
       <div class="cta">
-        <a class="btn primary big" href={chapterUrl(chapters[0].slug)}>Start the journey <span aria-hidden="true">→</span></a>
+        <a class="btn primary big" href={chapterUrl(chapters[0].slug)} data-start>Start the journey <span aria-hidden="true">→</span></a>
         <a class="btn big" href={u('lab/')}>Open the Inference Lab</a>
         <button class="btn big ghost" type="button" data-palette-open><kbd>⌘K</kbd> Search</button>
       </div>
@@ -136,7 +136,19 @@ const partIcons: Record<string, string> = {
     <footer class="home-foot">Token by Token · LLM inference &amp; serving, visualized</footer>
   </main>
 
+  <script is:inline type="application/json" id="home-chapters" set:html={JSON.stringify(chapters.map((c) => [c.slug, c.short, chapterUrl(c.slug)]))} />
   <script>
+    // returning readers: the main button resumes the chapter they were last on
+    try {
+      const last = localStorage.getItem('tbt-last');
+      const list: [string, string, string][] = JSON.parse(document.getElementById('home-chapters')!.textContent || '[]');
+      const i = list.findIndex((c) => c[0] === last);
+      const btn = document.querySelector<HTMLAnchorElement>('[data-start]');
+      if (btn && i >= 0) {
+        btn.href = list[i][2];
+        btn.textContent = `Continue: ${String(i + 1).padStart(2, '0')} · ${list[i][1]} →`;
+      }
+    } catch {}
     // scroll reveal
     const io = new IntersectionObserver((es) => es.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } }), { threshold: 0.12 });
     document.querySelectorAll('.reveal').forEach((el) => io.observe(el));

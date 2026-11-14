@@ -359,6 +359,26 @@ body.viz-full-open { overflow: hidden; }
   ::view-transition-old(root), ::view-transition-new(root) { animation: none; }
 }
 
+/* a diagram opened from search or a shared link: brief highlight so the eye lands on it */
+.viz:target { animation: viz-target 1.6s ease-out 1; }
+@keyframes viz-target { 0%, 35% { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft), var(--shadow); } }
+
+/* print / save as PDF: content only, on a white page, with every diagram kept whole */
+@media print {
+  :root, :root[data-theme='dark'] { --bg: #fff; --bg-elev: #fff; --surface: #fff; --surface-solid: #fff; --surface-2: #f3f4f8; --surface-3: #e8eaf1; --border: #d5d8e2; --border-strong: #b8bccb; --text: #0d1020; --text-dim: #3c4257; --text-faint: #6c7591; --accent: #4b35e0; --link: #4b35e0; --accent-soft: #eeecff; --shadow: none; color-scheme: light; }
+  body::before, body::after, .topbar, .progress, .sidebar, .nav-scrim, .toc, .toc-inline, .pager, .conn-map, .skip-link, .palette, .viz-full-btn, .h-anchor, .ctrl, .gl-pop { display: none !important; }
+  body { font-size: 11pt; background: #fff; }
+  .shell { display: block !important; max-width: none !important; }
+  .main, .page-main { padding: 0 !important; max-width: none !important; }
+  .prose { max-width: none; }
+  .viz { width: 100% !important; backdrop-filter: none; break-inside: avoid; box-shadow: none; }
+  .prose h2, .prose h3 { break-after: avoid; }
+  .prose table, pre, .katex-display, .interview { break-inside: avoid; }
+  .prose a[href^='http']::after { content: ' (' attr(href) ')'; font-size: 0.8em; color: var(--text-faint); word-break: break-all; }
+  .gl { text-decoration: none; }
+  details > :not(summary) { display: block !important; }
+}
+
 /* responsive helpers */
 .scroll-x { overflow-x: auto; }
 @media (max-width: 640px) {

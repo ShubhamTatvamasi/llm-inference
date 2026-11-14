@@ -85,7 +85,7 @@ Since the cache is the bottleneck, model architects and engine builders attack e
 
 | Technique | Which term shrinks | Typical saving | Trade-off |
 |---|---|---|---|
-| **GQA** (grouped-query attention) | $n_\text{kv\_heads}$: groups of query heads share one K/V head | 4–8× vs MHA | Tiny quality cost; now standard |
+| **GQA** (grouped-query attention) | $n_\text{kv\_heads}$: groups of query heads share one K/V head | 4–16× vs MHA | Tiny quality cost; now standard |
 | **MQA** (multi-query attention) | $n_\text{kv\_heads} = 1$ | up to 32–64× | Larger quality cost |
 | **MLA** (multi-head latent attention) | Caches one compressed latent instead of K and V | ~4× vs GQA-8, ~50× vs MHA | Extra up/down projections |
 | **KV quantization** (FP8 / INT8 / INT4) | bytes per element | 2–4× | Can hurt long-context recall |

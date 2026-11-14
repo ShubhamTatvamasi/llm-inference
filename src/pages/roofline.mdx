@@ -64,7 +64,7 @@ Batching shares **weights**, which are the same for every sequence. It cannot sh
 
 ## The ridge keeps moving right
 
-Memory bandwidth improves with each GPU generation, but compute at the **newest precision** improves faster. Compare each chip running at its best format: A100 in BF16 has a ridge around **150**, H100 in FP8 about **590**, B200 in FP4 about **1,100**, and Rubin in FP4 about **1,800** FLOPs per byte. In BF16 alone the ridge has barely moved since A100. Lower precisions double or quadruple the FLOPs while only halving the bytes. So the batch needed to saturate the tensor cores keeps **growing**. Switch the precision below and watch the bars stretch, or see [every chip's ridge by year](../hardware/#wall).
+Memory bandwidth improves with each GPU generation, but compute at the **newest precision** improves faster. Compare each chip running at its best format: A100 in BF16 has a ridge around **150**, H100 in FP8 about **590**, B200 in FP4 about **1,100**, and Rubin in FP4 about **1,800** FLOPs per byte. In BF16 alone the ridge roughly doubled from A100 (≈150) to H100 (≈295) and has not risen since (B200 ≈ 280). Lower precisions double or quadruple the FLOPs while only halving the bytes. So the batch needed to saturate the tensor cores keeps **growing**. Switch the precision below and watch the bars stretch, or see [every chip's ridge by year](../hardware/#wall).
 
 <Viz title="How much reuse each GPU demands" label="Explore">
   <RooflineRidges />

@@ -38,7 +38,7 @@ The first term is the normal, expensive matmul. The second goes through an $r$-d
 
 ## Many adapters, one batch
 
-The naive way to serve adapters is to **merge** each one into its own model copy: $W' = W + BA$. That gives zero runtime overhead, but costs a full copy of the weights per adapter and a separate deployment. Multi-LoRA serving keeps one shared $W$ and applies each request's own $A_i, B_i$ on the fly:
+The naive way to serve adapters is to **merge** each one into its own model copy: $W' = W + \frac{\alpha}{r} BA$. That gives zero runtime overhead, but costs a full copy of the weights per adapter and a separate deployment. Multi-LoRA serving keeps one shared $W$ and applies each request's own $A_i, B_i$ on the fly:
 
 <Viz title="Different adapters in the same forward pass" label="Live">
   <LoraBatch />

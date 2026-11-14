@@ -4,7 +4,7 @@ import Sidebar from '../components/Sidebar.astro';
 import { chapters, parts, chapterIndex } from '../data/chapters';
 import { chapterUrl, u } from '../lib/url';
 import { connections } from '../data/graph';
-import { glossary } from '../data/glossary';
+import { readingMinutes, vizTitles } from '../data/content';
 
 interface Props {
   frontmatter?: { title?: string; description?: string };
@@ -22,22 +22,58 @@ const next = chapters[idx + 1];
 const num = String(idx + 1).padStart(2, '0');
 const toc = headings.filter((h) => h.depth === 2);
 const conn = connections(slug);
-// glossary terms for in-prose hover definitions; skip the ones this chapter itself teaches
-const gl = glossary.filter((g) => g.ch !== slug && g.hover !== false).map((g) => ({ t: g.term, a: g.aliases ?? [], d: g.def, h: chapterUrl(g.ch), c: chapters[chapterIndex(g.ch)]?.short ?? '' }));
+const minutes = readingMinutes(slug);
+const nViz = vizTitles(slug).length;
+const title = frontmatter.title ?? ch.title;
+const description = frontmatter.description ?? ch.blurb;
+const pageUrl = new URL(chapterUrl(slug), Astro.site).href;
+const jsonLd = {
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'TechArticle', headline: title, description, url: pageUrl, inLanguage: 'en',
+      articleSection: part.title, position: idx + 1, timeRequired: `PT${minutes}M`,
+      image: new URL(u('og.png'), Astro.site).href,
+      isPartOf: { '@type': 'WebSite', name: 'Token by Token', url: new URL(u(), Astro.site).href },
+    },
+    {
+      '@type': 'BreadcrumbList',
+      itemListElement: [
+        { '@type': 'ListItem', position: 1, name: 'Token by Token', item: new URL(u(), Astro.site).href },
+        { '@type': 'ListItem', position: 2, name: `Part ${part.num} · ${part.title}` },
+        { '@type': 'ListItem', position: 3, name: title, item: pageUrl },
+      ],
+    },
+  ],
+};
+// short chapter labels for the glossary pop-over's "Learn more" link
+const shorts = Object.fromEntries(chapters.map((c) => [c.slug, c.short]));
 ---
-<Base title={frontmatter.title ?? ch.title} description={frontmatter.description ?? ch.blurb}>
+<Base title={title} description={description} ogType="article">
+  <Fragment slot="head">
+    {prev && <link rel="prev" href={chapterUrl(prev.slug)} />}
+    {next && <link rel="next" href={chapterUrl(next.slug)} />}
+    <script is:inline type="application/ld+json" set:html={JSON.stringify(jsonLd).replace(/</g, '\\u003c')} />
+  </Fragment>
   <div class="shell">
     <Sidebar current={slug} />
-    <main class="main" data-chapter={slug}>
+    <main class="main" id="main" data-chapter={slug}>
       <article class="prose">
         <header class="ch-head">
           <div class="ch-meta">
             <span class="ch-part">Part {part.num} · {part.title}</span>
             <span class="ch-num">Chapter {num} / {chapters.length}</span>
+            <span class="ch-num ch-time" title="Reading time, including time to try the diagrams">{minutes} min{nViz > 0 && ` · ${nViz} interactive diagram${nViz > 1 ? 's' : ''}`}</span>
           </div>
           <h1>{ch.title}</h1>
-          <p class="ch-lede">{frontmatter.description ?? ch.blurb}</p>
+          <p class="ch-lede">{description}</p>
         </header>
+        {toc.length > 2 && (
+          <details class="toc-inline">
+            <summary>On this page <span>{toc.length} sections</span></summary>
+            <ol>{toc.map((h) => <li><a href={`#${h.slug}`}>{h.text}</a></li>)}</ol>
+          </details>
+        )}
         <slot />
       </article>
 
@@ -76,14 +112,23 @@ const gl = glossary.filter((g) => g.ch !== slug && g.hover !== false).map((g) =>
       </aside>
     )}
   </div>
-  <script is:inline type="application/json" id="gl-data" set:html={JSON.stringify(gl)} />
+  <script is:inline type="application/json" id="gl-data" set:html={JSON.stringify({ slug, base: u(), shorts })} />
   <div class="gl-pop" role="tooltip" id="gl-pop" hidden></div>
   <script>
+    import { loadSearchIndex } from '../lib/search';
     // Glossary: wrap the first mention of each term in the prose with a hover/tap definition.
+    // The definitions come from the shared search index (one cached download for the whole site).
     type G = { t: string; a: string[]; d: string; h: string; c: string };
-    const terms: G[] = JSON.parse(document.getElementById('gl-data')?.textContent || '[]');
+    const cfg: { slug: string; base: string; shorts: Record<string, string> } = JSON.parse(document.getElementById('gl-data')?.textContent || '{}');
     const prose = document.querySelector<HTMLElement>('.prose');
-    if (prose && terms.length) {
+    const idle = (cb: () => void) => ('requestIdleCallback' in window ? requestIdleCallback(cb, { timeout: 1500 }) : setTimeout(cb, 200));
+    if (prose) idle(() => loadSearchIndex().then((idx) => {
+      // skip the terms this chapter itself teaches, and the very common words marked hover: false
+      const terms: G[] = idx.filter((it) => it.k === 'g' && it.c !== cfg.slug && !it.x)
+        .map((it) => ({ t: it.t, a: it.a ?? [], d: it.b, h: `${cfg.base}${it.c}/`, c: cfg.shorts[it.c!] ?? '' }));
+      if (terms.length) wrap(prose, terms);
+    }, () => {}));
+    function wrap(prose: HTMLElement, terms: G[]) {
       const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const forms: { re: RegExp; g: G }[] = [];
       for (const g of terms) for (const f of [g.t, ...g.a]) {
@@ -91,7 +136,7 @@ const gl = glossary.filter((g) => g.ch !== slug && g.hover !== false).map((g) =>
         forms.push({ re: new RegExp(`(^|[^\\w-])(${esc(f)})(?![\\w-])`, caps ? '' : 'i'), g });
       }
       forms.sort((x, y) => y.re.source.length - x.re.source.length); // prefer longer phrases
-      const SKIP = 'h1,h2,h3,h4,a,code,pre,kbd,.katex,.viz,.interview,summary,.chip,.gl,.conn,.ch-head,table th';
+      const SKIP = 'h1,h2,h3,h4,a,code,pre,kbd,.katex,.viz,.interview,summary,.chip,.gl,.conn,.ch-head,.toc-inline,table th';
       const done = new Set<G>();
       const walker = document.createTreeWalker(prose, NodeFilter.SHOW_TEXT, {
         acceptNode: (n) => (n.parentElement?.closest(SKIP) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
@@ -145,7 +190,7 @@ const gl = glossary.filter((g) => g.ch !== slug && g.hover !== false).map((g) =>
     }
   </script>
   <script>
-    // mark visited + highlight current heading in TOC
+    // mark visited + remember where the reader is, so the home page can offer "Continue reading"
     const main = document.querySelector<HTMLElement>('[data-chapter]');
     if (main) {
       try {
@@ -153,8 +198,21 @@ const gl = glossary.filter((g) => g.ch !== slug && g.hover !== false).map((g) =>
         const set = new Set<string>(JSON.parse(localStorage.getItem(k) || '[]'));
         set.add(main.dataset.chapter!);
         localStorage.setItem(k, JSON.stringify([...set]));
+        localStorage.setItem('tbt-last', main.dataset.chapter!);
       } catch {}
     }
+    // a "#" link on every section heading: click to put a shareable link in the address bar
+    document.querySelectorAll<HTMLElement>('.prose h2[id], .prose h3[id]').forEach((hd) => {
+      const a = document.createElement('a');
+      a.className = 'h-anchor'; a.href = `#${hd.id}`; a.textContent = '#';
+      a.setAttribute('aria-label', `Link to section “${hd.textContent}”`);
+      hd.appendChild(a);
+    });
+    // the inline contents list closes after a jump so it does not sit open above the reader
+    document.querySelector<HTMLDetailsElement>('.toc-inline')?.addEventListener('click', (e) => {
+      if ((e.target as HTMLElement).closest('a')) (e.currentTarget as HTMLDetailsElement).open = false;
+    });
+    // highlight current heading in TOC
     const links = new Map<string, HTMLElement>();
     document.querySelectorAll<HTMLElement>('[data-toc]').forEach((a) => links.set(a.dataset.toc!, a));
     if (links.size) {
@@ -179,6 +237,22 @@ const gl = glossary.filter((g) => g.ch !== slug && g.hover !== false).map((g) =>
     .ch-meta { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; font-size: 0.78rem; }
     .ch-part { color: var(--accent); font-weight: 600; padding: 3px 10px; border-radius: 999px; background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent); }
     .ch-num { color: var(--text-faint); font-family: var(--font-mono); font-size: 0.72rem; }
+    .ch-time::before { content: '·'; margin-right: 10px; }
+    .toc-inline { margin: -0.8rem 0 2rem; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); font-size: 0.9rem; }
+    .toc-inline summary { cursor: pointer; padding: 10px 14px; font-weight: 600; color: var(--text-dim); list-style: none; display: flex; align-items: center; gap: 10px; }
+    .toc-inline summary::-webkit-details-marker { display: none; }
+    .toc-inline summary::before { content: ''; width: 7px; height: 7px; border-right: 1.6px solid currentColor; border-bottom: 1.6px solid currentColor; transform: rotate(-45deg); transition: transform 0.15s; }
+    .toc-inline[open] summary::before { transform: rotate(45deg); }
+    .toc-inline summary:hover { color: var(--text); }
+    .toc-inline summary span { font-family: var(--font-mono); font-size: 0.7rem; font-weight: 450; color: var(--text-faint); }
+    .toc-inline ol { margin: 0; padding: 2px 14px 12px 38px; columns: 2 240px; column-gap: 28px; color: var(--text-faint); font-size: 0.86rem; }
+    .toc-inline li { margin: 0; padding: 3px 0; break-inside: avoid; }
+    .toc-inline a { color: var(--text-dim); }
+    .toc-inline a:hover { color: var(--text); }
+    :global(.h-anchor) { margin-left: 0.4em; color: var(--text-faint); font-weight: 450; opacity: 0; background: none; transition: opacity 0.15s, color 0.15s; }
+    :global(.prose :is(h2, h3):hover .h-anchor), :global(.h-anchor:focus-visible) { opacity: 1; }
+    :global(.h-anchor:hover) { color: var(--accent); background: none; }
+    @media (hover: none) { :global(.h-anchor) { opacity: 0.55; } }
     .ch-lede { font-size: 1.16rem; color: var(--text-dim) !important; line-height: 1.6; margin: 0 !important; max-width: 640px; }
     :global(.gl) { text-decoration: underline dotted color-mix(in srgb, var(--accent) 70%, transparent); text-underline-offset: 3px; text-decoration-thickness: 1.5px; cursor: help; border-radius: 3px; }
     :global(.gl:hover), :global(.gl:focus-visible) { background: var(--accent-soft); outline: none; }
@@ -204,6 +278,7 @@ const gl = glossary.filter((g) => g.ch !== slug && g.hover !== false).map((g) =>
     .toc { display: none; }
     @media (min-width: 1700px) {
       .shell { grid-template-columns: var(--sidebar-w) minmax(0, 1fr) 220px; max-width: 1840px; }
+      .toc-inline { display: none; }
       .toc { display: block; position: sticky; top: calc(var(--header-h) + 36px); align-self: start; padding: 8px 20px 0 0; max-height: calc(100vh - 120px); overflow-y: auto; }
       .toc-h { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-faint); font-weight: 650; margin-bottom: 10px; }
       .toc ul { list-style: none; margin: 0; padding: 0; border-left: 1px solid var(--border); }

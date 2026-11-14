@@ -9,7 +9,7 @@ const { title, description, current, eyebrow, lede } = Astro.props;
 <Base title={title} description={description}>
   <div class="shell">
     <Sidebar current={current} />
-    <main class="page-main">
+    <main class="page-main" id="main">
       <header class="pg-head">
         <span class="pg-eyebrow">{eyebrow}</span>
         <h1>{title}</h1>

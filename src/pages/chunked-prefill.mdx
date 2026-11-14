@@ -52,7 +52,7 @@ The budget is a direct trade-off between the two latencies users feel:
 <Viz title="Token budget: ITL vs TTFT" label="Explore">
   <ChunkedBudget />
   <Fragment slot="caption">
-    <p>Simple cost model: each iteration costs a fixed 8 ms (reading the weights) plus 0.07 ms per token processed, roughly an 8B model on an H100. Notice that with many decoding sequences and a tiny budget, almost nothing is left for prefill, and long prompts starve.</p>
+    <p>Simple cost model: each iteration costs a fixed 8 ms (the weight read plus per-step overhead) plus 0.07 ms per token processed, a conservative figure for an 8B model on an H100. Notice that with many decoding sequences and a tiny budget, almost nothing is left for prefill, and long prompts starve.</p>
   </Fragment>
 </Viz>
 
