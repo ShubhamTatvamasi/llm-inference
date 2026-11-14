@@ -59,9 +59,9 @@ const { current } = Astro.props;
   .sb-home svg { width: 16px; height: 16px; color: var(--accent); }
   .sb-home:hover, .sb-home.on { border-color: var(--accent); background: var(--accent-soft); }
   .sb-tools { display: none; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px; }
-  .sb-tools a { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 7px 4px 6px; border-radius: 10px; border: 1px solid var(--border); color: var(--text-dim); font-size: 0.74rem; font-weight: 560; background: none; transition: all 0.15s; }
+  .sb-tools a { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 7px 2px 6px; text-align: center; line-height: 1.2; border-radius: 10px; border: 1px solid var(--border); color: var(--text-dim); font-size: 0.74rem; font-weight: 560; background: none; transition: all 0.15s; }
   .sb-tools a:hover, .sb-tools a.on { color: var(--text); border-color: var(--accent); background: var(--accent-soft); }
-  .sb-tools svg { width: 16px; height: 16px; color: var(--accent); }
+  .sb-tools :global(svg) { width: 16px; height: 16px; color: var(--accent); }
   .sb-progress { display: flex; align-items: center; gap: 10px; margin: 14px 4px 6px; font-size: 0.72rem; color: var(--text-faint); font-family: var(--font-mono); }
   .sb-pbar { flex: 1; height: 4px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
   .sb-pbar i { display: block; height: 100%; width: 0; background: var(--accent-grad); border-radius: 4px; transition: width 0.6s; }
@@ -79,8 +79,8 @@ const { current } = Astro.props;
   .sb-dot { width: 6px; height: 6px; border-radius: 50%; flex: none; }
   li a.seen .sb-dot { background: var(--c-kv); box-shadow: 0 0 8px var(--c-kv); opacity: 0.8; }
   .nav-scrim { display: none; }
+  @media (max-width: 1080px) { .sb-tools { display: grid; } }
   @media (max-width: 960px) {
-    .sb-tools { display: grid; }
     .sidebar { position: fixed; z-index: 70; top: 0; left: 0; bottom: 0; height: 100vh; width: min(310px, 86vw); background: var(--surface-solid); transform: translateX(-102%); transition: transform 0.25s cubic-bezier(.2,.8,.2,1); box-shadow: 20px 0 60px rgba(0,0,0,0.4); }
     :global(body.nav-open) .sidebar { transform: none; }
     :global(body.nav-open) .nav-scrim { display: block; position: fixed; inset: 0; z-index: 65; background: rgba(4,6,12,0.55); backdrop-filter: blur(3px); }

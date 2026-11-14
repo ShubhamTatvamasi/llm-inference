@@ -1,0 +1,126 @@
+---
+/* Learning paths: curated reading orders (src/data/paths.ts) with time estimates and progress.
+   "Follow" stores the path id in localStorage (`tbt-path`); chapters in that path then show
+   where you are and what comes next. */
+import Page from '../layouts/Page.astro';
+import { paths } from '../data/paths';
+import { chapters, chapterIndex } from '../data/chapters';
+import { readingMinutes } from '../data/content';
+import { chapterUrl, u } from '../lib/url';
+
+const fmtTime = (m: number) => (m >= 60 ? `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')} min` : `${m} min`);
+const view = paths.map((p) => ({
+  ...p,
+  minutes: p.steps.reduce((a, s) => a + readingMinutes(s), 0),
+  items: p.steps.map((s) => ({ slug: s, n: String(chapterIndex(s) + 1).padStart(2, '0'), title: chapters[chapterIndex(s)].title, blurb: chapters[chapterIndex(s)].blurb, min: readingMinutes(s) })),
+}));
+const all = chapters.reduce((a, c) => a + readingMinutes(c.slug), 0);
+---
+<Page
+  title="Learning Paths"
+  current="paths"
+  eyebrow={`${paths.length} paths · ${chapters.length} chapters`}
+  description="Curated reading orders through LLM inference and serving for your goal: the essentials, interview preparation, platform and SRE work on Kubernetes, performance engineering, or building apps and agents."
+  lede={`Reading all ${chapters.length} chapters in order takes about ${fmtTime(all)}. If you have a specific goal, follow one of these shorter routes instead. Each chapter you open is ticked off automatically.`}
+>
+  <div class="paths">
+    {view.map((p) => (
+      <section class="path" id={p.id} data-path={p.id}>
+        <header class="path-head">
+          <div>
+            <h2>{p.title}</h2>
+            <p class="path-who">{p.who}</p>
+          </div>
+          <div class="path-side">
+            <span class="path-time">{p.steps.length} chapters · {fmtTime(p.minutes)}</span>
+            <button class="btn" type="button" data-follow aria-pressed="false">Follow this path</button>
+          </div>
+        </header>
+        <p class="path-out"><b>You will be able to:</b> {p.outcome}</p>
+        <div class="path-prog"><div class="path-bar"><i data-fill></i></div><span data-ptext>0 / {p.steps.length}</span></div>
+        <ol class="path-steps">
+          {p.items.map((it) => (
+            <li>
+              <a href={chapterUrl(it.slug)} data-step={it.slug}>
+                <span class="st-tick" aria-hidden="true"></span>
+                <span class="st-n">{it.n}</span>
+                <span class="st-t"><b>{it.title}</b><small>{it.blurb}</small></span>
+                <span class="st-m">{it.min} min</span>
+              </a>
+            </li>
+          ))}
+        </ol>
+        <div class="path-cta">
+          <a class="btn primary" href={chapterUrl(p.steps[0])} data-continue>Start: {p.items[0].title} →</a>
+          <a class="btn" href={`${u('review/')}`} data-done-link hidden>Path complete. Review the questions →</a>
+        </div>
+      </section>
+    ))}
+  </div>
+  <p class="paths-foot">Want to see how the ideas depend on each other instead? Open the <a href={u('map/')}>concept map</a> and click any chapter for the shortest route to it.</p>
+
+  <script>
+    let seen = new Set<string>(); let following = '';
+    try { seen = new Set(JSON.parse(localStorage.getItem('tbt-visited') || '[]')); following = localStorage.getItem('tbt-path') || ''; } catch {}
+    const sections = [...document.querySelectorAll<HTMLElement>('[data-path]')];
+    const paint = () => sections.forEach((sec) => {
+      const on = sec.dataset.path === following;
+      sec.classList.toggle('following', on);
+      const b = sec.querySelector<HTMLButtonElement>('[data-follow]')!;
+      b.setAttribute('aria-pressed', String(on)); b.textContent = on ? 'Following ✓' : 'Follow this path';
+    });
+    sections.forEach((sec) => {
+      const steps = [...sec.querySelectorAll<HTMLAnchorElement>('[data-step]')];
+      let n = 0; let first: HTMLAnchorElement | undefined;
+      steps.forEach((a) => { if (seen.has(a.dataset.step!)) { a.classList.add('seen'); n++; } else first ??= a; });
+      sec.querySelector<HTMLElement>('[data-fill]')!.style.width = `${(n / steps.length) * 100}%`;
+      sec.querySelector<HTMLElement>('[data-ptext]')!.textContent = `${n} / ${steps.length}`;
+      const cta = sec.querySelector<HTMLAnchorElement>('[data-continue]')!;
+      if (!first) { cta.hidden = true; sec.querySelector<HTMLElement>('[data-done-link]')!.hidden = false; }
+      else if (n > 0) { cta.href = first.href; cta.textContent = `Continue: ${first.querySelector('b')!.textContent} →`; }
+      // starting or continuing a path also follows it
+      cta.addEventListener('click', () => { try { localStorage.setItem('tbt-path', sec.dataset.path!); } catch {} });
+      sec.querySelector('[data-follow]')!.addEventListener('click', () => {
+        following = following === sec.dataset.path ? '' : sec.dataset.path!;
+        try { following ? localStorage.setItem('tbt-path', following) : localStorage.removeItem('tbt-path'); } catch {}
+        paint();
+      });
+    });
+    paint();
+  </script>
+
+  <style>
+    .paths { display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; max-width: 980px; }
+    .path { min-width: 0; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); padding: 20px 22px; scroll-margin-top: calc(var(--header-h) + 16px); transition: border-color 0.2s; }
+    .path.following { border-color: color-mix(in srgb, var(--accent) 60%, transparent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .path:target { border-color: var(--accent); }
+    .path-head { display: flex; flex-wrap: wrap; gap: 10px 20px; align-items: flex-start; justify-content: space-between; }
+    h2 { margin: 0; font-size: 1.3rem; letter-spacing: -0.02em; }
+    .path-who { margin: 2px 0 0; color: var(--text-dim); font-size: 0.95rem; }
+    .path-side { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .path-time { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-faint); white-space: nowrap; }
+    .path-out { margin: 12px 0 0; font-size: 0.93rem; color: var(--text-dim); line-height: 1.6; }
+    .path-out b { color: var(--text); font-weight: 600; }
+    .path-prog { display: flex; align-items: center; gap: 10px; margin: 14px 0 8px; font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-faint); }
+    .path-bar { flex: 1; height: 4px; border-radius: 4px; background: var(--surface-3); overflow: hidden; }
+    .path-bar i { display: block; height: 100%; width: 0; background: var(--accent-grad); transition: width 0.6s; }
+    .path-steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 400px), 1fr)); gap: 2px 18px; }
+    .path-steps li { min-width: 0; }
+    .path-steps a { min-width: 0; display: flex; align-items: center; gap: 10px; padding: 8px 8px; border-radius: 10px; color: var(--text); background: none; }
+    .path-steps a:hover { background: var(--surface-2); }
+    .st-tick { flex: none; width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid var(--border-strong); display: grid; place-items: center; font-size: 10px; line-height: 1; }
+    a.seen .st-tick { border-color: var(--c-kv); background: var(--c-kv-soft); color: var(--c-kv); }
+    a.seen .st-tick::before { content: '✓'; }
+    .st-n { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); flex: none; }
+    .st-t { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.35; }
+    .st-t b { font-weight: 600; font-size: 0.93rem; }
+    .st-t small { color: var(--text-dim); font-size: 0.8rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .st-m { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; }
+    .path-cta { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+    .path-cta a.btn { background-size: auto; padding: 8px 14px; }
+    .path-cta a.btn:not(.primary) { color: var(--text); }
+    .path-cta [hidden] { display: none; }
+    .paths-foot { color: var(--text-dim); font-size: 0.92rem; margin: 22px 0 0; }
+    @media (max-width: 640px) { .path { padding: 16px 14px; } }
+  </style>
+</Page>

@@ -9,32 +9,25 @@
   import { chapterUrl } from '../../lib/url';
   import { GPUS, MODELS, getGPU, getModel } from '../../data/hardware';
   import { evaluate, sweep, decodeStep, peakFlops, type LabIn } from './labModel';
+  import { B_STEPS, P_STEPS, O_STEPS, W_DT, KV_DT, TPS, SLO_STEPS, DEFAULT, EXERCISES, summarize, suggest, bestBatch, toInput, type St } from './labCoach';
 
-  const B_STEPS = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512];
-  const P_STEPS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
-  const O_STEPS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384];
-  const W_DT = [{ value: 'bf16', label: 'BF16', b: 2 }, { value: 'fp8', label: 'FP8 / INT8', b: 1 }, { value: 'int4', label: 'INT4 / FP4', b: 0.5 }];
-  const KV_DT = [{ value: 'bf16', label: 'BF16', b: 2 }, { value: 'fp8', label: 'FP8', b: 1 }];
-  const TPS = [1, 2, 4, 8];
-
-  interface St { m: string; g: string; tp: number; w: string; kv: string; p: number; o: number; b: number }
-  const DEFAULT: St = { m: 'llama3-8b', g: 'h100', tp: 1, w: 'bf16', kv: 'bf16', p: 2048, o: 512, b: 32 };
 
   const PRESETS: { name: string; st: St; look: string }[] = [
     { name: 'Chatbot · 8B on 1×H100', st: { ...DEFAULT }, look: 'Decode is memory-bound: each step re-reads all 16 GB of weights. Drag the batch up and watch total throughput climb while per-user speed barely moves.' },
-    { name: '70B on 4×H100 · FP8', st: { m: 'llama3-70b', g: 'h100', tp: 4, w: 'fp8', kv: 'fp8', p: 2048, o: 512, b: 64 }, look: 'Tensor parallelism splits the weights four ways, so each step reads ¼ of them per GPU, plus a little all-reduce time (teal).' },
-    { name: 'Long-context RAG · 32k prompts', st: { m: 'llama3-8b', g: 'h100', tp: 1, w: 'bf16', kv: 'bf16', p: 32768, o: 512, b: 8 }, look: 'Now the KV cache dominates both memory and step time. Only a handful of requests fit, and TTFT is mostly attention FLOPs. Try KV = FP8.' },
-    { name: 'Will not fit · 70B on 1×4090', st: { m: 'llama3-70b', g: 'rtx4090', tp: 1, w: 'bf16', kv: 'bf16', p: 1024, o: 256, b: 1 }, look: '141 GB of weights cannot fit in 24 GB. Try INT4 weights and more GPUs, and see how much is left for KV.' },
-    { name: 'MoE · DeepSeek-V3 on 8×H200', st: { m: 'deepseek-v3', g: 'h200', tp: 8, w: 'fp8', kv: 'bf16', p: 2048, o: 1024, b: 64 }, look: '671B parameters, but only 37B are active per token. At batch 1 a step reads only the chosen experts. As the batch grows, more experts are touched, so weight reads grow too. MLA keeps each token’s KV tiny, but under tensor parallelism every GPU stores the full latent, so 8 GPUs give no more KV room per token than one.' },
-    { name: 'Compute-bound · huge batch', st: { m: 'llama3-8b', g: 'h100', tp: 1, w: 'fp8', kv: 'fp8', p: 128, o: 64, b: 512 }, look: 'With 512 very short sequences the tensor cores finally become the bottleneck (the orange lane is longest). Now raise the prompt to 512 tokens: the KV reads take over again before compute does. Reaching compute-bound decode is harder than it looks.' },
+    { name: '70B on 4×H100 · FP8', st: { m: 'llama3-70b', g: 'h100', tp: 4, w: 'fp8', kv: 'fp8', p: 2048, o: 512, b: 64, s: 0 }, look: 'Tensor parallelism splits the weights four ways, so each step reads ¼ of them per GPU, plus a little all-reduce time (teal).' },
+    { name: 'Long-context RAG · 32k prompts', st: { m: 'llama3-8b', g: 'h100', tp: 1, w: 'bf16', kv: 'bf16', p: 32768, o: 512, b: 8, s: 0 }, look: 'Now the KV cache dominates both memory and step time. Only a handful of requests fit, and TTFT is mostly attention FLOPs. Try KV = FP8.' },
+    { name: 'Will not fit · 70B on 1×4090', st: { m: 'llama3-70b', g: 'rtx4090', tp: 1, w: 'bf16', kv: 'bf16', p: 1024, o: 256, b: 1, s: 0 }, look: '141 GB of weights cannot fit in 24 GB. Try INT4 weights and more GPUs, and see how much is left for KV.' },
+    { name: 'MoE · DeepSeek-V3 on 8×H200', st: { m: 'deepseek-v3', g: 'h200', tp: 8, w: 'fp8', kv: 'bf16', p: 2048, o: 1024, b: 64, s: 0 }, look: '671B parameters, but only 37B are active per token. At batch 1 a step reads only the chosen experts. As the batch grows, more experts are touched, so weight reads grow too. MLA keeps each token’s KV tiny, but under tensor parallelism every GPU stores the full latent, so 8 GPUs give no more KV room per token than one.' },
+    { name: 'Compute-bound · huge batch', st: { m: 'llama3-8b', g: 'h100', tp: 1, w: 'fp8', kv: 'fp8', p: 128, o: 64, b: 512, s: 0 }, look: 'With 512 very short sequences the tensor cores finally become the bottleneck (the orange lane is longest). Now raise the prompt to 512 tokens: the KV reads take over again before compute does. Reaching compute-bound decode is harder than it looks.' },
   ];
 
   const nearest = (arr: number[], v: number) => arr.reduce((a, x) => (Math.abs(x - v) < Math.abs(a - v) ? x : a), arr[0]);
 
-  function readHash(): St {
+  const KEYS = ['m', 'g', 'tp', 'w', 'kv', 'p', 'o', 'b', 's'] as const;
+  const pack = (st: St) => KEYS.map((k) => st[k]).join('.');
+  function parse(q: URLSearchParams): St {
     const st = { ...DEFAULT };
     try {
-      const q = new URLSearchParams(location.hash.slice(1));
       if (q.get('m') && MODELS.some((m) => m.id === q.get('m'))) st.m = q.get('m')!;
       if (q.get('g') && GPUS.some((g) => g.id === q.get('g'))) st.g = q.get('g')!;
       if (q.get('w') && W_DT.some((d) => d.value === q.get('w'))) st.w = q.get('w')!;
@@ -43,8 +36,17 @@
       if (q.get('p')) st.p = nearest(P_STEPS, Number(q.get('p')));
       if (q.get('o')) st.o = nearest(O_STEPS, Number(q.get('o')));
       if (q.get('b')) st.b = nearest(B_STEPS, Number(q.get('b')));
+      if (q.get('s')) st.s = nearest(SLO_STEPS, Number(q.get('s')));
     } catch {}
     return st;
+  }
+  const readHash = () => parse(new URLSearchParams(location.hash.slice(1)));
+  /** A pinned baseline travels in the link as vs=<m.g.tp.w.kv.p.o.b.s> */
+  function readBase(): St | null {
+    const v = new URLSearchParams(location.hash.slice(1)).get('vs');
+    if (!v) return null;
+    const parts = v.split('.');
+    return parts.length === KEYS.length ? parse(new URLSearchParams(KEYS.map((k, i) => [k, parts[i]]))) : null;
   }
 
   const gb = (b: number) => (b >= 1e12 ? (b / 1e12).toFixed(2) + ' TB' : b >= 1e9 ? (b / 1e9).toFixed(b >= 100e9 ? 0 : 1) + ' GB' : (b / 1e6).toFixed(0) + ' MB');
@@ -53,6 +55,9 @@
 
   mountAll('inference-lab', (root) => {
     let st = readHash();
+    let base: St | null = readBase();
+    let solved = new Set<string>();
+    try { solved = new Set(JSON.parse(localStorage.getItem('tbt-lab-done') || '[]')); } catch {}
     const learn = (slug: string, label: string) => `<a class="lab-learn" href="${chapterUrl(slug)}">${label} →</a>`;
 
     /* ---------- presets ---------- */
@@ -81,15 +86,29 @@
     const slO = slider(g2, { label: 'Output', min: 0, max: O_STEPS.length - 1, value: O_STEPS.indexOf(st.o), format: (i) => tok(O_STEPS[i]) + ' tok', onInput: (i) => { st.o = O_STEPS[i]; update(); } });
     const slB = slider(g2, { label: 'Batch (concurrent requests)', min: 0, max: B_STEPS.length - 1, value: B_STEPS.indexOf(st.b), format: (i) => String(B_STEPS[i]), onInput: (i) => { st.b = B_STEPS[i]; update(); } });
     slB.input.classList.add('lab-batch');
+    const slS = slider(g2, { label: 'Target per-user speed', min: 0, max: SLO_STEPS.length - 1, value: SLO_STEPS.indexOf(st.s), format: (i) => (SLO_STEPS[i] ? `≥ ${SLO_STEPS[i]} tok/s` : 'none'), onInput: (i) => { st.s = SLO_STEPS[i]; update(); } });
+    slS.input.title = 'Your latency target. The trade-off curve marks it, and suggestions respect it.';
 
     function syncControls() {
       selM.value = st.m; selG.value = st.g; selTP.value = String(st.tp); selW.value = st.w; selKV.value = st.kv;
-      slP.set(P_STEPS.indexOf(st.p), false); slO.set(O_STEPS.indexOf(st.o), false); slB.set(B_STEPS.indexOf(st.b), false);
+      slP.set(P_STEPS.indexOf(st.p), false); slO.set(O_STEPS.indexOf(st.o), false); slB.set(B_STEPS.indexOf(st.b), false); slS.set(SLO_STEPS.indexOf(st.s), false);
     }
 
     /* ---------- headline stats + insight ---------- */
-    const sts = stats(root, ['TTFT', 'TPOT', 'Per-user speed', 'Total throughput', 'Fits in KV', 'Cost / 1M output tok']);
+    const TILES = ['TTFT', 'TPOT', 'Per-user speed', 'Total throughput', 'Requests / s', 'Fits in KV', 'Cost / 1M output tok'];
+    const sts = stats(root, TILES);
+    // a line under each tile for the change against the pinned baseline
+    const deltaEls = new Map(TILES.map((k, i) => [k, h('div', { class: 'lab-delta' }, sts.el.children[i])]));
+    const tools = h('div', { class: 'lab-tools' }, root);
+    const pinBtn = h('button', { type: 'button', class: 'btn', title: 'Keep this setup as a reference, then change something and compare' }, tools);
+    const batchBtn = h('button', { type: 'button', class: 'btn', text: 'Set best batch', title: 'Largest batch that fits in the KV cache and keeps your per-user target' }, tools);
+    const resetBtn = h('button', { type: 'button', class: 'btn', text: 'Reset' }, tools);
+    const baseNote = h('span', { class: 'lab-note' }, tools);
+    pinBtn.addEventListener('click', () => { base = base ? null : { ...st }; update(false); });
+    batchBtn.addEventListener('click', () => { const b = bestBatch(st); if (b) { st.b = b; syncControls(); update(); } });
+    resetBtn.addEventListener('click', () => { st = { ...DEFAULT }; base = null; syncControls(); update(); });
     const insight = h('div', { class: 'narr lab-insight', 'aria-live': 'polite' }, root);
+    const coach = h('div', { class: 'lab-coach' }, root);
 
     /* ---------- panels ---------- */
     const grid = h('div', { class: 'lab-grid' }, root);
@@ -114,6 +133,35 @@
     h('p', { class: 'lab-sub', text: 'The prefill pass emits the first token, so TTFT is prefill time. Every later token costs one decode step. Bars are drawn to scale; queueing time is not included.' }, pTime);
     const svgTime = svgRoot(pTime, 940, 96, { 'aria-label': 'Timeline of one request' });
 
+    /* ---------- exercises ---------- */
+    const exWrap = h('section', { class: 'lab-ex' }, root);
+    const exHead = h('header', {}, exWrap);
+    h('h3', { text: 'Exercises' }, exHead);
+    const exCount = h('span', { class: 'lab-note' }, exHead);
+    h('p', { class: 'lab-sub', text: 'Five goals you can reach with the knobs above. Load a starting point, then change the setup until the goal is met; it is checked as you go.' }, exWrap);
+    const exItems = EXERCISES.map((ex) => {
+      const li = h('div', { class: 'lab-exi' }, exWrap);
+      const tick = h('span', { class: 'ex-tick', 'aria-hidden': 'true' }, li);
+      const body = h('div', { class: 'ex-body' }, li);
+      h('b', { text: ex.title }, body);
+      h('p', { text: ex.goal }, body);
+      const hint = h('p', { class: 'ex-hint', hidden: true }, body);
+      hint.textContent = `Hint: ${ex.hint}`;
+      const lesson = h('p', { class: 'ex-lesson', hidden: true }, body);
+      lesson.innerHTML = `<b>Solved.</b> ${ex.lesson} ${learn(ex.ch, 'Read the chapter')}`;
+      const act = h('div', { class: 'ex-act' }, li);
+      const go = h('button', { type: 'button', class: 'btn', text: 'Load starting point' }, act);
+      go.addEventListener('click', () => { st = { ...ex.start }; base = { ...ex.start }; armed.add(ex.id); syncControls(); update(); root.scrollIntoView({ block: 'start', behavior: 'smooth' }); });
+      const hb = h('button', { type: 'button', class: 'btn', text: 'Hint', 'aria-expanded': 'false' }, act);
+      hb.addEventListener('click', () => { hint.hidden = !hint.hidden; hb.setAttribute('aria-expanded', String(!hint.hidden)); });
+      return { ex, li, tick, lesson };
+    });
+    const armed = new Set<string>(); // exercises the reader has started in this visit
+    const paintEx = () => {
+      exItems.forEach(({ ex, li, lesson }) => { const d = solved.has(ex.id); li.classList.toggle('done', d); lesson.hidden = !d; });
+      exCount.textContent = `${solved.size} / ${EXERCISES.length} solved`;
+    };
+
     const share = h('div', { class: 'lab-foot' }, root);
     const shareBtn = h('button', { type: 'button', class: 'btn', text: 'Copy link to this setup' }, share);
     h('span', { class: 'lab-note', html: 'First-order model: 75% of peak bandwidth, 50% of peak FLOPs, 2 ms per-step overhead, 90% memory utilisation. Real engines differ by tens of percent, so use it for intuition and confirm with a <a href="' + chapterUrl('benchmarking') + '">benchmark</a>.' }, share);
@@ -126,16 +174,17 @@
       const model = getModel(st.m), gpu = getGPU(st.g);
       // clamp prompt to the model's context window
       if (st.p + st.o > model.maxCtx) { st.p = [...P_STEPS].reverse().find((x) => x + st.o <= model.maxCtx) ?? P_STEPS[0]; slP.set(P_STEPS.indexOf(st.p), false); }
-      const inp: LabIn = { model, gpu, tp: st.tp, wBytes: W_DT.find((d) => d.value === st.w)!.b, kvBytes: KV_DT.find((d) => d.value === st.kv)!.b, prompt: st.p, output: st.o, batch: st.b };
-      const r = evaluate(inp);
-      try { history.replaceState(null, '', '#' + new URLSearchParams({ m: st.m, g: st.g, tp: String(st.tp), w: st.w, kv: st.kv, p: String(st.p), o: String(st.o), b: String(st.b) })); } catch {}
-
-      const fits = r.mem.fits && r.mem.maxSeqs >= 1;
-      const over = fits && st.b > r.mem.maxSeqs;
+      const sum = summarize(st);
+      const { inp, r, fits, over } = sum;
+      const hash: Record<string, string> = { m: st.m, g: st.g, tp: String(st.tp), w: st.w, kv: st.kv, p: String(st.p), o: String(st.o), b: String(st.b) };
+      if (st.s) hash.s = String(st.s);
+      if (base) hash.vs = pack(base);
+      try { history.replaceState(null, '', '#' + new URLSearchParams(hash)); } catch {}
       root.classList.toggle('lab-nofit', !fits);
       sts.set('TTFT', fits ? ms(r.ttft) : '—', fits ? `prefill of ${tok(st.p)} tokens` : 'does not fit');
       sts.set('TPOT', fits ? ms(r.tpot) : '—', 'time per output token');
-      sts.set('Per-user speed', fits ? `${r.perUser.toFixed(0)} tok/s` : '—', !fits ? '' : r.perUser > 20 ? 'faster than reading' : 'below reading speed', fits && r.perUser < 20 ? C.waste : undefined);
+      sts.set('Per-user speed', fits ? `${r.perUser.toFixed(0)} tok/s` : '—', !fits ? '' : st.s ? (sum.meetsSlo ? `meets your ≥ ${st.s} target` : `below your ≥ ${st.s} target`) : r.perUser > 20 ? 'faster than reading' : 'below reading speed', fits && (r.perUser < 20 || !sum.meetsSlo) ? C.waste : undefined);
+      sts.set('Requests / s', fits ? (sum.reqPerS >= 10 ? sum.reqPerS.toFixed(0) : sum.reqPerS.toFixed(sum.reqPerS >= 1 ? 1 : 2)) : '—', fits ? `completing ${tok(st.o)}-token replies` : '');
       sts.set('Total throughput', fits ? `${fmt.int(over ? r.mem.maxSeqs / r.tpot : r.total)} tok/s` : '—', !fits ? '' : over ? `capped at ${r.mem.maxSeqs} running` : `${st.b} stream${st.b > 1 ? 's' : ''}`);
       sts.set('Fits in KV', fits ? `${fmt.int(r.mem.maxSeqs)} req` : '0', `of ${tok(st.p + st.o)} tokens each`, over || !fits ? C.waste : C.kv);
       sts.set('Cost / 1M output tok', fits ? `$${(over ? r.costPerM * st.b / r.mem.maxSeqs : r.costPerM).toFixed(r.costPerM < 1 ? 3 : 2)}` : '—', `${st.tp} × $${gpu.pricePerHr}/h`);
@@ -146,6 +195,63 @@
       drawCurve(inp, r, fits);
       drawTime(r, fits);
       insight.innerHTML = explain(inp, r, fits, over);
+
+      // baseline comparison
+      const bs = base ? summarize(base) : null;
+      const same = !!base && pack(base) === pack(st);
+      pinBtn.textContent = base ? 'Clear baseline' : 'Pin as baseline';
+      pinBtn.setAttribute('aria-pressed', String(!!base));
+      baseNote.textContent = !base ? 'Pin this setup, change one thing, and every number shows its change.' : same ? 'Baseline pinned. Now change something.' : `Comparing with: ${describe(base)}`;
+      batchBtn.disabled = !fits || bestBatch(st) === st.b || bestBatch(st) === null;
+      const delta = (k: string, now: number, was: number, lowerIsBetter: boolean) => {
+        const el = deltaEls.get(k)!;
+        if (!bs || same || !fits || !bs.fits || !Number.isFinite(now) || !Number.isFinite(was) || was === 0) { el.textContent = ''; return; }
+        const d = now / was - 1;
+        if (Math.abs(d) < 0.005) { el.textContent = 'same as baseline'; el.dataset.dir = ''; return; }
+        const big = Math.abs(d) >= 1;
+        el.textContent = `${big ? `${(now / was).toFixed(now / was >= 10 ? 0 : 1)}×` : `${d > 0 ? '+' : '−'}${Math.abs(d * 100).toFixed(0)}%`} vs baseline`;
+        el.dataset.dir = (d < 0) === lowerIsBetter ? 'good' : 'bad';
+      };
+      delta('TTFT', sum.ttft, bs?.ttft ?? NaN, true);
+      delta('TPOT', sum.tpot, bs?.tpot ?? NaN, true);
+      delta('Per-user speed', sum.perUser, bs?.perUser ?? NaN, false);
+      delta('Total throughput', sum.total, bs?.total ?? NaN, false);
+      delta('Requests / s', sum.reqPerS, bs?.reqPerS ?? NaN, false);
+      delta('Fits in KV', sum.maxSeqs, bs?.maxSeqs ?? NaN, false);
+      delta('Cost / 1M output tok', sum.cost, bs?.cost ?? NaN, true);
+      if (bs && !same && fits && !bs.fits) deltaEls.get('Fits in KV')!.textContent = 'baseline did not fit';
+
+      drawCoach(sum);
+
+      // exercises: a goal counts once the reader has loaded its starting point
+      let news = false;
+      for (const { ex } of exItems) if (armed.has(ex.id) && !solved.has(ex.id) && ex.check(st, sum)) { solved.add(ex.id); news = true; }
+      if (news) { try { localStorage.setItem('tbt-lab-done', JSON.stringify([...solved])); } catch {} }
+      paintEx();
+    }
+
+    const describe = (x: St) => `${getModel(x.m).name} on ${x.tp}× ${getGPU(x.g).name}, ${W_DT.find((d) => d.value === x.w)!.label} weights, ${KV_DT.find((d) => d.value === x.kv)!.label} KV, ${tok(x.p)} in / ${tok(x.o)} out, batch ${x.b}`;
+
+    /* ---- coach: what would help ---- */
+    function drawCoach(sum: ReturnType<typeof summarize>) {
+      clear(coach);
+      const list = suggest(st);
+      const head = h('div', { class: 'lab-k' }, coach);
+      head.textContent = sum.ok ? 'What would lower the cost' : !sum.fits ? 'What would make it fit' : sum.over ? 'What would fit every request' : 'What would meet your target';
+      if (!list.length) {
+        h('span', { class: 'lab-note', text: sum.ok ? 'No single change makes this more than 3% cheaper while keeping your target. This setup is well tuned.' : 'No one or two changes fix this. Try a smaller model, a shorter context or a larger GPU.' }, coach);
+        return;
+      }
+      const pct = (d: number) => `${d > 0 ? '+' : '−'}${Math.abs(d * 100).toFixed(0)}%`;
+      for (const sg of list) {
+        const b = h('button', { type: 'button', class: 'lab-sg', title: 'Apply this change' }, coach);
+        h('b', { text: sg.label }, b);
+        const facts = Number.isFinite(sg.dCost) && sum.fits
+          ? `cost ${pct(sg.dCost)} · throughput ${pct(sg.dTotal)} · per user ${pct(sg.dUser)}`
+          : `$${sg.cost.toFixed(sg.cost < 1 ? 3 : 2)} per 1M tokens`;
+        h('span', { text: facts }, b);
+        b.addEventListener('click', () => { st = { ...sg.st }; syncControls(); update(); });
+      }
     }
 
     /* ---- 1 memory ---- */
@@ -269,7 +375,10 @@
       if (!fits) { text(svgCurve, 230, 125, 'Fit the model in memory first.', { 'text-anchor': 'middle', class: 't-dim' }); return; }
       const pts = sweep(inp, B_STEPS);
       const X0 = 56, X1 = 446, Y0 = 210, Y1 = 14;
-      const maxT = Math.max(...pts.map((p) => p.total)) * 1.08, maxU = Math.max(...pts.map((p) => p.perUser)) * 1.12;
+      // the pinned baseline's curve, drawn faintly behind for comparison
+      const bsum = base && pack(base) !== pack({ ...st, b: base.b }) ? summarize(base) : null;
+      const bpts = bsum?.fits ? sweep(bsum.inp, B_STEPS).filter((p) => p.B <= bsum.maxSeqs) : [];
+      const maxT = Math.max(...pts.map((p) => p.total), ...bpts.map((p) => p.total)) * 1.08, maxU = Math.max(...pts.map((p) => p.perUser), ...bpts.map((p) => p.perUser)) * 1.12;
       const xp = (v: number) => X0 + (v / maxT) * (X1 - X0), yp = (v: number) => Y0 - (v / maxU) * (Y0 - Y1);
       for (let i = 0; i <= 4; i++) {
         const vx = (maxT * i) / 4, vy = (maxU * i) / 4;
@@ -280,6 +389,13 @@
       text(svgCurve, 12, (Y0 + Y1) / 2, 'per-user tok/s → snappier', { 'text-anchor': 'middle', class: 't-dim t-small', transform: `rotate(-90 12 ${(Y0 + Y1) / 2})` });
       // reading speed line
       if (20 < maxU) { line(svgCurve, X0, yp(20), X1, yp(20), C.waste, { 'stroke-dasharray': '4 4', 'stroke-width': 1, opacity: 0.6 }); text(svgCurve, X0 + 6, yp(20) + 11, '~20 tok/s: human reading speed', { class: 't-small', style: `fill:${C.waste}` }); }
+      if (st.s && st.s < maxU) { line(svgCurve, X0, yp(st.s), X1, yp(st.s), C.accent, { 'stroke-dasharray': '6 3', 'stroke-width': 1.2 }); text(svgCurve, X0 + 6, yp(st.s) - 8, `your target: ≥ ${st.s} tok/s`, { class: 't-small', style: `fill:${C.accent}` }); }
+      if (bpts.length > 1) {
+        s('polyline', { points: bpts.map((p) => `${xp(p.total)},${yp(p.perUser)}`).join(' '), fill: 'none', stroke: C.faint, 'stroke-width': 1.6, 'stroke-dasharray': '2 3' }, svgCurve);
+        const bp = bpts.find((p) => p.B === base!.b) ?? bpts.at(-1)!;
+        s('circle', { cx: xp(bp.total), cy: yp(bp.perUser), r: 5, fill: 'none', stroke: C.faint, 'stroke-width': 1.6 }, svgCurve);
+        text(svgCurve, xp(bp.total) + (xp(bp.total) > 380 ? -9 : 9), yp(bp.perUser) + 12, 'baseline', { class: 't-small t-faint', 'text-anchor': xp(bp.total) > 380 ? 'end' : 'start' });
+      }
       const okPts = pts.filter((p) => p.B <= r.mem.maxSeqs), badPts = pts.filter((p) => p.B >= (okPts.at(-1)?.B ?? 0));
       if (okPts.length > 1) s('polyline', { points: okPts.map((p) => `${xp(p.total)},${yp(p.perUser)}`).join(' '), fill: 'none', stroke: C.decode, 'stroke-width': 2.2 }, svgCurve);
       if (badPts.length > 1) s('polyline', { points: badPts.map((p) => `${xp(p.total)},${yp(p.perUser)}`).join(' '), fill: 'none', stroke: C.waste, 'stroke-width': 1.5, 'stroke-dasharray': '4 4' }, svgCurve);
@@ -334,7 +450,7 @@
 
     syncControls();
     update(false);
-    addEventListener('hashchange', () => { st = readHash(); syncControls(); update(false); });
+    addEventListener('hashchange', () => { st = readHash(); base = readBase(); syncControls(); update(false); });
   });
 </script>
 
@@ -353,8 +469,37 @@
   .lab :global(.lab-cg select) { min-width: 0; max-width: 62%; }
   .lab :global(.lab-cg input[type='range']) { width: 150px; }
   .lab :global(.lab-batch) { accent-color: var(--c-decode) !important; }
-  .lab :global(.stats) { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .lab :global(.stats) { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
   .lab :global(.lab-insight) { font-size: 0.92rem; }
+  .lab :global(.lab-delta) { font-size: 0.72rem; font-family: var(--font-mono); color: var(--text-faint); min-height: 1.2em; margin-top: 2px; }
+  .lab :global(.lab-delta[data-dir='good']) { color: var(--c-good); }
+  .lab :global(.lab-delta[data-dir='bad']) { color: var(--c-waste); }
+  .lab :global(.lab-delta:empty) { display: none; }
+  .lab :global(.lab-tools) { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin-top: 12px; }
+  .lab :global(.lab-tools .btn:disabled) { opacity: 0.45; cursor: default; }
+  .lab :global(.lab-coach) { display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch; margin-top: 12px; }
+  .lab :global(.lab-coach .lab-k) { flex-basis: 100%; }
+  .lab :global(.lab-sg) { appearance: none; font: inherit; text-align: left; display: flex; flex-direction: column; gap: 1px; padding: 8px 12px; border-radius: 11px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+  .lab :global(.lab-sg:hover) { border-color: var(--accent); background: var(--accent-soft); }
+  .lab :global(.lab-sg:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .lab :global(.lab-sg b) { font-size: 0.86rem; font-weight: 620; }
+  .lab :global(.lab-sg span) { font-size: 0.74rem; font-family: var(--font-mono); color: var(--text-dim); }
+  .lab :global(.lab-ex) { margin-top: 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); padding: 14px 16px 6px; }
+  .lab :global(.lab-ex header) { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+  .lab :global(.lab-ex h3) { margin: 0; font-size: 0.98rem; font-weight: 650; }
+  .lab :global(.lab-exi) { display: flex; gap: 12px; align-items: flex-start; padding: 12px 0; border-top: 1px solid var(--border); }
+  .lab :global(.ex-tick) { flex: none; width: 20px; height: 20px; margin-top: 2px; border-radius: 50%; border: 1.5px solid var(--border-strong); display: grid; place-items: center; font-size: 12px; }
+  .lab :global(.lab-exi.done .ex-tick) { border-color: var(--c-kv); background: var(--c-kv-soft); color: var(--c-kv); }
+  .lab :global(.lab-exi.done .ex-tick::before) { content: '✓'; }
+  .lab :global(.ex-body) { flex: 1; min-width: 0; }
+  .lab :global(.ex-body b) { font-size: 0.94rem; }
+  .lab :global(.ex-body p) { margin: 2px 0 0; font-size: 0.88rem; color: var(--text-dim); line-height: 1.55; }
+  .lab :global(.ex-body p[hidden]) { display: none; }
+  .lab :global(.ex-hint) { color: var(--c-token) !important; }
+  .lab :global(.ex-lesson) { color: var(--text) !important; }
+  .lab :global(.ex-lesson b) { color: var(--c-kv); }
+  .lab :global(.ex-act) { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+  @media (max-width: 640px) { .lab :global(.lab-exi) { flex-wrap: wrap; } .lab :global(.ex-act) { flex-basis: 100%; justify-content: flex-start; padding-left: 32px; } }
   .lab :global(.lab-insight a), .lab :global(.lab-learn) { white-space: nowrap; font-size: 0.85em; }
   .lab :global(.lab-grid) { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
   .lab :global(.lab-panel) { border: 1px solid var(--border); border-radius: 14px; background: var(--surface); padding: 14px 16px 12px; min-width: 0; }

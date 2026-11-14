@@ -1,0 +1,273 @@
+---
+/* Review: spaced-repetition flashcards built from every chapter's interview questions.
+   Questions are read from the chapter MDX at build time; each answer is pulled from the rendered
+   chapter page when its card is flipped, so maths, links and wording always match the chapter.
+   Progress (a Leitner box and a due day per card) lives in localStorage under `tbt-review`. */
+import Page from '../layouts/Page.astro';
+import { chapters, parts } from '../data/chapters';
+import { questions } from '../data/content';
+import { chapterUrl } from '../lib/url';
+
+const cards = chapters.flatMap((c) => questions(c.slug).map((q) => ({ i: q.id, c: c.slug, q: q.q, l: q.level })));
+const data = {
+  cards,
+  chapters: chapters.map((c, i) => ({ s: c.slug, n: String(i + 1).padStart(2, '0'), t: c.short, p: c.part, u: chapterUrl(c.slug) })),
+  parts: parts.map((p) => ({ id: p.id, num: p.num, title: p.title })),
+};
+---
+<Page
+  title="Review"
+  current="review"
+  eyebrow={`${cards.length} questions · spaced repetition`}
+  description={`Practise LLM inference and serving with ${cards.length} interview questions as spaced-repetition flashcards: answer from memory, grade yourself, and see each card again just before you would forget it.`}
+  lede="Answer from memory, then grade yourself. Cards you find hard come back soon and cards you know come back after days or weeks. Progress is saved in this browser."
+>
+  <div class="rv" data-review>
+    <div class="rv-bar">
+      <label class="field"><span>Deck</span><select data-scope aria-label="Which chapters to review"></select></label>
+      <div class="seg" role="group" aria-label="Level" data-levels>
+        <button type="button" data-level="all" aria-pressed="true">All levels</button>
+        <button type="button" data-level="core" aria-pressed="false">Core</button>
+        <button type="button" data-level="mid" aria-pressed="false">Mid</button>
+        <button type="button" data-level="senior" aria-pressed="false">Senior</button>
+      </div>
+      <button class="btn" type="button" data-reset title="Forget all review progress in this browser">Reset progress</button>
+    </div>
+
+    <div class="stats rv-stats" aria-live="polite">
+      <div class="stat"><div class="k">Due now</div><div class="v" data-st="due">–</div><div class="s">seen before, ready again</div></div>
+      <div class="stat"><div class="k">New</div><div class="v" data-st="new">–</div><div class="s">not seen yet</div></div>
+      <div class="stat"><div class="k">Learning</div><div class="v" data-st="learning">–</div><div class="s">next review within a week</div></div>
+      <div class="stat"><div class="k">Known</div><div class="v" data-st="known">–</div><div class="s">next review in 2+ weeks</div></div>
+    </div>
+
+    <div class="rv-prog" aria-hidden="true"><i data-prog></i></div>
+
+    <article class="rv-card" data-card tabindex="-1">
+      <header class="rv-meta">
+        <a class="rv-ch" data-ch></a>
+        <span class="rv-lv" data-lv></span>
+        <span class="rv-count" data-count></span>
+      </header>
+      <h2 class="rv-q" data-q></h2>
+      <div class="rv-ans" data-ans hidden></div>
+      <div class="rv-actions" data-front>
+        <button class="btn primary rv-big" type="button" data-show>Show answer <kbd>Space</kbd></button>
+        <button class="btn rv-big" type="button" data-skip title="Put this card at the end of the session">Skip</button>
+      </div>
+      <div class="rv-actions rv-grade" data-back hidden>
+        <span class="rv-how">How well did you know it?</span>
+        <button class="btn g-again" type="button" data-grade="0"><kbd>1</kbd> Again <small data-iv="0"></small></button>
+        <button class="btn g-hard" type="button" data-grade="1"><kbd>2</kbd> Hard <small data-iv="1"></small></button>
+        <button class="btn g-good" type="button" data-grade="2"><kbd>3</kbd> Good <small data-iv="2"></small></button>
+        <button class="btn g-easy" type="button" data-grade="3"><kbd>4</kbd> Easy <small data-iv="3"></small></button>
+      </div>
+    </article>
+
+    <div class="rv-done" data-done hidden>
+      <h2 data-done-title>Session complete</h2>
+      <p data-done-text></p>
+      <div class="rv-actions">
+        <button class="btn primary rv-big" type="button" data-again>Start another session</button>
+      </div>
+    </div>
+    <p class="rv-hint">Each session is up to 20 cards: the ones that are due first, then new ones in chapter order. <kbd>Space</kbd> shows the answer, <kbd>1</kbd>–<kbd>4</kbd> grade it.</p>
+  </div>
+
+  <script is:inline type="application/json" id="review-data" set:html={JSON.stringify(data)} />
+  <script>
+    type Card = { i: string; c: string; q: string; l: 'core' | 'mid' | 'senior' };
+    type Ch = { s: string; n: string; t: string; p: string; u: string };
+    type Prog = Record<string, { b: number; d: number }>;
+    const data: { cards: Card[]; chapters: Ch[]; parts: { id: string; num: string; title: string }[] } = JSON.parse(document.getElementById('review-data')!.textContent!);
+    const root = document.querySelector<HTMLElement>('[data-review]')!;
+    const $ = <T extends HTMLElement>(sel: string) => root.querySelector<T>(sel)!;
+    const chOf = new Map(data.chapters.map((c) => [c.s, c]));
+
+    // Leitner boxes: days until the next review after landing in box n
+    const INTERVAL = [0, 1, 3, 7, 16, 35, 80];
+    const SESSION = 20;
+    const today = () => { const d = new Date(); return Math.floor((d.getTime() - d.getTimezoneOffset() * 60000) / 864e5); };
+    const KEY = 'tbt-review';
+    let prog: Prog = {};
+    try { prog = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch {}
+    const save = () => { try { localStorage.setItem(KEY, JSON.stringify(prog)); } catch {} };
+    let visited = new Set<string>();
+    try { visited = new Set(JSON.parse(localStorage.getItem('tbt-visited') || '[]')); } catch {}
+
+    // deck controls
+    const scopeSel = $<HTMLSelectElement>('[data-scope]');
+    const opt = (v: string, label: string) => { const o = document.createElement('option'); o.value = v; o.textContent = label; scopeSel.appendChild(o); };
+    opt('all', `All chapters (${data.cards.length})`);
+    const readCount = data.cards.filter((c) => visited.has(c.c)).length;
+    if (readCount) opt('read', `Chapters I have read (${readCount})`);
+    for (const p of data.parts) opt(`p:${p.id}`, `Part ${p.num} · ${p.title}`);
+    const og = document.createElement('optgroup'); og.label = 'One chapter'; scopeSel.appendChild(og);
+    for (const c of data.chapters) { const o = document.createElement('option'); o.value = `c:${c.s}`; o.textContent = `${c.n} · ${c.t}`; og.appendChild(o); }
+    let scope = 'all'; let level = 'all';
+    try { const s = JSON.parse(localStorage.getItem('tbt-review-deck') || '{}'); if (s.scope && [...scopeSel.options].some((o) => o.value === s.scope)) scope = s.scope; if (s.level) level = s.level; } catch {}
+    const wanted = new URLSearchParams(location.search).get('chapter'); // /review/?chapter=kv-cache
+    if (wanted && chOf.has(wanted)) scope = `c:${wanted}`;
+    scopeSel.value = scope;
+    const levelBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-level]')];
+    const paintLevels = () => levelBtns.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.level === level)));
+    paintLevels();
+
+    const deck = () => data.cards.filter((c) => {
+      if (level !== 'all' && c.l !== level) return false;
+      if (scope === 'all') return true;
+      if (scope === 'read') return visited.has(c.c);
+      if (scope.startsWith('p:')) return chOf.get(c.c)!.p === scope.slice(2);
+      return c.c === scope.slice(2);
+    });
+
+    // answers come from the rendered chapter page (one fetch per chapter, kept for the session)
+    const pages = new Map<string, Promise<Document>>();
+    const answer = async (card: Card) => {
+      const ch = chOf.get(card.c)!;
+      if (!pages.has(card.c)) pages.set(card.c, fetch(ch.u).then((r) => (r.ok ? r.text() : Promise.reject(new Error(String(r.status))))).then((t) => new DOMParser().parseFromString(t, 'text/html')));
+      const doc = await pages.get(card.c)!;
+      const el = doc.getElementById(card.i)?.querySelector('.ans');
+      if (!el) throw new Error('answer not found');
+      return el.innerHTML;
+    };
+
+    let queue: Card[] = []; let done = 0; let total = 0; let shown = false; let cur: Card | undefined;
+    const stats = () => {
+      const t = today(); const d = deck();
+      let due = 0, fresh = 0, learning = 0, known = 0;
+      for (const c of d) {
+        const p = prog[c.i];
+        if (!p) { fresh++; continue; }
+        if (p.d <= t) due++;
+        if (p.b >= 4) known++; else learning++;
+      }
+      $('[data-st="due"]').textContent = String(due); $('[data-st="new"]').textContent = String(fresh);
+      $('[data-st="learning"]').textContent = String(learning); $('[data-st="known"]').textContent = String(known);
+      return { due, fresh, size: d.length };
+    };
+    const build = () => {
+      const t = today(); const d = deck();
+      const due = d.filter((c) => prog[c.i] && prog[c.i].d <= t).sort((a, b) => prog[a.i].d - prog[b.i].d);
+      const fresh = d.filter((c) => !prog[c.i]);
+      queue = [...due, ...fresh].slice(0, SESSION);
+      done = 0; total = queue.length;
+      next();
+    };
+    const fmtIv = (days: number) => (days <= 0 ? 'in a few cards' : days === 1 ? 'tomorrow' : days < 14 ? `in ${days} days` : `in ${Math.round(days / 7)} weeks`);
+    const nextBox = (b: number, g: number) => (g === 0 ? 0 : g === 1 ? Math.max(1, b) : Math.min(INTERVAL.length - 1, b + (g === 2 ? 1 : 2)));
+
+    function next() {
+      const st = stats();
+      cur = queue[0]; shown = false;
+      $('[data-prog]').style.width = `${total ? (done / total) * 100 : 0}%`;
+      const cardEl = $('[data-card]'); const doneEl = $('[data-done]');
+      if (!cur) {
+        cardEl.hidden = true; doneEl.hidden = false;
+        const more = st.due + st.fresh;
+        $('[data-done-title]').textContent = !st.size ? 'No cards in this deck' : total ? 'Session complete' : 'Nothing due right now';
+        $('[data-done-text]').textContent = !st.size
+          ? 'Pick another deck or level above.'
+          : more
+            ? `${done ? `You reviewed ${done} card${done > 1 ? 's' : ''}. ` : ''}${more} more ${more > 1 ? 'are' : 'is'} ready in this deck.`
+            : `${done ? `You reviewed ${done} card${done > 1 ? 's' : ''}. ` : ''}Every card in this deck is scheduled for a later day. Come back tomorrow, or pick another deck.`;
+        $<HTMLButtonElement>('[data-again]').hidden = !more;
+        return;
+      }
+      cardEl.hidden = false; doneEl.hidden = true;
+      const ch = chOf.get(cur.c)!;
+      const a = $<HTMLAnchorElement>('[data-ch]'); a.href = `${ch.u}#${cur.i}`; a.textContent = `${ch.n} · ${ch.t}`; a.title = 'Open this question in its chapter';
+      const lv = $('[data-lv]'); lv.textContent = cur.l; lv.className = `rv-lv ${cur.l}`;
+      $('[data-count]').textContent = `${done + 1} / ${total}`;
+      $('[data-q]').textContent = cur.q;
+      $('[data-ans]').hidden = true; $('[data-ans]').innerHTML = '';
+      $('[data-front]').hidden = false; $('[data-back]').hidden = true;
+      void answer(cur).catch(() => {}); // warm the answer while the reader thinks
+    }
+    async function show() {
+      if (!cur || shown) return;
+      shown = true; const card = cur;
+      const box = $('[data-ans]'); box.hidden = false; box.textContent = 'Loading the answer…';
+      $('[data-front]').hidden = true; $('[data-back]').hidden = false;
+      const b = prog[card.i]?.b ?? 0;
+      root.querySelectorAll<HTMLElement>('[data-iv]').forEach((el) => { el.textContent = fmtIv(INTERVAL[nextBox(b, Number(el.dataset.iv))]); });
+      try { const html = await answer(card); if (cur === card) box.innerHTML = html; }
+      catch { pages.delete(card.c); if (cur === card) box.innerHTML = `<p>The answer could not be loaded. <a href="${chOf.get(card.c)!.u}#${card.i}">Open it in the chapter →</a></p>`; }
+      $<HTMLElement>('[data-grade="2"]').focus({ preventScroll: true });
+    }
+    function grade(g: number) {
+      if (!cur || !shown) return;
+      const b = nextBox(prog[cur.i]?.b ?? 0, g);
+      prog[cur.i] = { b, d: today() + INTERVAL[b] };
+      save();
+      const card = queue.shift()!;
+      if (g === 0) queue.splice(Math.min(3, queue.length), 0, card); // see it again in a few cards
+      else done++;
+      next();
+      $<HTMLElement>('[data-show]').focus({ preventScroll: true });
+    }
+    function skip() { if (!cur || queue.length < 2) return; queue.push(queue.shift()!); next(); }
+
+    const remember = () => { try { localStorage.setItem('tbt-review-deck', JSON.stringify({ scope, level })); } catch {} };
+    scopeSel.addEventListener('change', () => { scope = scopeSel.value; remember(); build(); });
+    levelBtns.forEach((b) => b.addEventListener('click', () => { level = b.dataset.level!; paintLevels(); remember(); build(); }));
+    $('[data-show]').addEventListener('click', show);
+    $('[data-skip]').addEventListener('click', skip);
+    root.querySelectorAll<HTMLElement>('[data-grade]').forEach((b) => b.addEventListener('click', () => grade(Number(b.dataset.grade))));
+    $('[data-again]').addEventListener('click', build);
+    $('[data-reset]').addEventListener('click', () => {
+      if (!Object.keys(prog).length || !confirm('Forget review progress for all cards in this browser?')) return;
+      prog = {}; save(); build();
+    });
+    addEventListener('keydown', (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || !document.querySelector('[data-palette]')?.hasAttribute('hidden')) return;
+      const el = e.target as HTMLElement;
+      if (el instanceof HTMLInputElement || el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement) return;
+      if ((e.key === ' ' || e.key === 'Enter') && !shown && cur && !(el instanceof HTMLButtonElement) && !(el instanceof HTMLAnchorElement)) { e.preventDefault(); void show(); }
+      else if (shown && e.key >= '1' && e.key <= '4') { e.preventDefault(); grade(Number(e.key) - 1); }
+    });
+    build();
+  </script>
+
+  <style>
+    .rv { max-width: 860px; }
+    .rv-bar { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+    .rv-bar .btn { margin-left: auto; }
+    .rv-bar select { max-width: min(320px, 70vw); }
+    .rv-stats { margin-top: 16px; }
+    .rv-prog { height: 4px; border-radius: 4px; background: var(--surface-3); margin: 18px 0 14px; overflow: hidden; }
+    .rv-prog i { display: block; height: 100%; width: 0; background: var(--accent-grad); border-radius: 4px; transition: width 0.3s; }
+    .rv-card, .rv-done { border: 1px solid var(--border); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); padding: 22px 24px 20px; }
+    .rv-card[hidden], .rv-done[hidden] { display: none; }
+    .rv-card:focus { outline: none; }
+    .rv-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 0.8rem; }
+    .rv-ch { font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-dim); padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); }
+    .rv-ch:hover { color: var(--accent); border-color: var(--accent); background-size: 0 0; }
+    .rv-lv { font-family: var(--font-mono); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.08em; padding: 3px 7px; border-radius: 6px; }
+    .rv-lv.core { background: var(--c-kv-soft); color: var(--c-kv); }
+    .rv-lv.mid { background: var(--c-decode-soft); color: var(--c-decode); }
+    .rv-lv.senior { background: var(--c-token-soft); color: var(--c-token); }
+    .rv-count { margin-left: auto; font-family: var(--font-mono); font-size: 0.74rem; color: var(--text-faint); }
+    .rv-q { font-size: clamp(1.25rem, 2.6vw, 1.6rem); line-height: 1.3; letter-spacing: -0.02em; font-weight: 650; margin: 18px 0 6px; min-height: 2.6em; }
+    .rv-ans { margin: 14px 0 4px; padding: 14px 16px; border-radius: 12px; background: var(--surface-2); border: 1px solid var(--border); color: color-mix(in srgb, var(--text) 86%, var(--text-dim)); font-size: 0.98rem; line-height: 1.65; }
+    .rv-ans :global(p) { margin: 0 0 0.6rem; }
+    .rv-ans :global(p:last-child), .rv-ans :global(ul:last-child), .rv-ans :global(ol:last-child) { margin-bottom: 0; }
+    .rv-ans :global(strong) { color: var(--text); font-weight: 650; }
+    .rv-ans :global(.katex-display) { background: none; border: 0; padding: 4px 0; margin: 0.6rem 0; }
+    .rv-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 18px; }
+    .rv-actions[hidden] { display: none; }
+    .rv-big { padding: 10px 16px; font-size: 0.94rem; border-radius: 11px; }
+    .rv-big kbd { margin-left: 6px; background: rgba(255, 255, 255, 0.16); border-color: rgba(255, 255, 255, 0.3); color: inherit; }
+    .rv-how { flex-basis: 100%; font-size: 0.82rem; color: var(--text-faint); }
+    .rv-grade .btn { flex: 1 1 120px; flex-direction: column; align-items: flex-start; gap: 0; padding: 9px 12px; font-size: 0.92rem; }
+    .rv-grade .btn kbd { align-self: flex-end; margin-bottom: -1.2em; }
+    .rv-grade small { font-weight: 450; font-size: 0.74rem; color: var(--text-faint); }
+    .g-again:hover { border-color: var(--c-waste); } .g-hard:hover { border-color: var(--c-prefill); }
+    .g-good:hover { border-color: var(--c-decode); } .g-easy:hover { border-color: var(--c-kv); }
+    .rv-done h2 { margin: 0 0 6px; font-size: 1.3rem; letter-spacing: -0.02em; }
+    .rv-done p { margin: 0; color: var(--text-dim); }
+    .rv-hint { color: var(--text-faint); font-size: 0.82rem; margin: 14px 2px 0; }
+    @media (max-width: 640px) { .rv-card, .rv-done { padding: 16px 15px; } .rv-bar .btn { margin-left: 0; } }
+    @media (pointer: coarse) { .rv kbd { display: none; } }
+  </style>
+</Page>

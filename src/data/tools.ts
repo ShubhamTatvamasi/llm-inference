@@ -10,6 +10,12 @@ export const tools: Tool[] = [
     icon: '<circle cx="4.5" cy="10" r="2"/><circle cx="15.5" cy="4.5" r="2"/><circle cx="15.5" cy="15.5" r="2"/><path d="m6.3 9 7.4-3.6M6.3 11l7.4 3.6"/>' },
   { slug: 'glossary', label: 'Glossary', title: 'Short definitions of every term',
     icon: '<path d="M4 3.5h9.5a2 2 0 0 1 2 2v11H6a2 2 0 0 1-2-2z"/><path d="M4 14.5a2 2 0 0 1 2-2h9.5M7.5 7h5"/>' },
+  { slug: 'paths', label: 'Paths', title: 'Learning paths: a reading order for your role',
+    icon: '<circle cx="4.5" cy="15.5" r="2"/><circle cx="15.5" cy="4.5" r="2"/><path d="M6.5 15.5H11a3 3 0 0 0 3-3v0a3 3 0 0 0-3-3H9a3 3 0 0 1-3-3v0a3 3 0 0 1 3-3h4.5"/>' },
+  { slug: 'review', label: 'Review', title: 'Review: spaced-repetition flashcards from every chapter',
+    icon: '<rect x="3" y="5.5" width="11" height="11" rx="2"/><path d="M6.5 3.5H15a2 2 0 0 1 2 2V14"/><path d="m6 11 2 2 3.5-4"/>' },
+  { slug: 'cheatsheet', label: 'Cheat sheet', title: 'Cheat sheet: the formulas and numbers worth memorising',
+    icon: '<path d="M5 2.5h7l4 4V16a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 4 16V3.5a1 1 0 0 1 1-1z"/><path d="M12 2.5v4h4M7 10.5h6M7 13.5h4"/>' },
 ];
 
 export const toolSvg = (t: Tool) =>

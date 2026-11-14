@@ -9,7 +9,7 @@
   import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, player, segmented, stats, legend, narration, C, SERIES, fmt } from '../../lib/viz';
 
   type Mode = 'off' | '2048' | '512';
-  const BASE = 8, PER_TOK = 0.07; // ms per iteration floor, ms per token processed
+  const BASE = 8, PER_TOK = 0.07; // ms per iteration floor, ms per token processed: roughly an 8B model on an A100 (16 GB ÷ 2 TB/s; ~14k prefill tok/s)
   const PROMPT = 6000, ARRIVE = 70, USERS = ['A', 'B', 'C', 'D'];
   const T_END = 1000;
 

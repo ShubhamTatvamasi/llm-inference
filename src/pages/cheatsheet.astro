@@ -1,0 +1,139 @@
+---
+/* Cheat sheet: the formulas and numbers worth memorising (src/data/cheatsheet.ts), each linked
+   to the chapter it comes from. KaTeX is rendered here at build time, so a bad expression
+   fails the build instead of reaching a reader. */
+import katex from 'katex';
+import Page from '../layouts/Page.astro';
+import { cheatsheet } from '../data/cheatsheet';
+import { chapters, chapterIndex } from '../data/chapters';
+import { chapterUrl } from '../lib/url';
+
+const ch = (slug: string) => {
+  const i = chapterIndex(slug);
+  if (i < 0) throw new Error(`cheatsheet.ts: "${slug}" is not a chapter slug`);
+  return { n: String(i + 1).padStart(2, '0'), short: chapters[i].short, url: chapterUrl(slug) };
+};
+const sections = cheatsheet.map((s) => ({
+  ...s,
+  formulas: s.formulas.map((f) => ({ ...f, html: katex.renderToString(f.tex, { displayMode: true, throwOnError: true }), src: ch(f.ch) })),
+  numbers: s.numbers.map((n) => ({ ...n, src: ch(n.ch) })),
+}));
+const nF = sections.reduce((a, s) => a + s.formulas.length, 0);
+const nN = sections.reduce((a, s) => a + s.numbers.length, 0);
+---
+<Page
+  title="Cheat Sheet"
+  current="cheatsheet"
+  eyebrow={`${nF} formulas · ${nN} numbers`}
+  description="The formulas and numbers behind LLM inference and serving on one page: KV cache size, decode step time, the roofline, batching, speculative decoding, latency metrics and cost per token, each linked to the chapter that derives it."
+  lede="Everything worth memorising, on one page. Each entry links to the chapter that derives it. Filter to find one, or print the page for a desk reference."
+>
+  <div class="cs-bar">
+    <input class="text-input cs-search" type="search" placeholder="Filter: try “kv”, “ttft”, “cost”, “h100”…" data-cs-filter aria-label="Filter formulas and numbers" />
+    <nav class="cs-jump" aria-label="Sections">
+      {sections.map((s) => <a href={`#${s.id}`}>{s.title.split(':')[0]}</a>)}
+    </nav>
+    <button class="btn" type="button" data-cs-print>Print</button>
+  </div>
+
+  {sections.map((s) => (
+    <section class="cs-sec" id={s.id} data-cs-sec>
+      <header><h2>{s.title}</h2><p>{s.blurb}</p></header>
+      {s.formulas.length > 0 && (
+        <div class="cs-formulas">
+          {s.formulas.map((f) => (
+            <article class="cs-f" data-cs-item data-hay={`${f.name} ${f.vars ?? ''} ${f.example ?? ''} ${f.src.short} ${f.tex}`.toLowerCase()}>
+              <div class="cs-fh"><b>{f.name}</b><a href={f.src.url} title={`Chapter ${f.src.n}: ${f.src.short}`}>{f.src.n} · {f.src.short}</a></div>
+              <div class="cs-tex" set:html={f.html} />
+              {f.vars && <p class="cs-vars">{f.vars}</p>}
+              {f.example && <p class="cs-ex"><span>Example</span>{f.example}</p>}
+            </article>
+          ))}
+        </div>
+      )}
+      {s.numbers.length > 0 && (
+        <table class="cs-nums">
+          <tbody>
+            {s.numbers.map((n) => (
+              <tr data-cs-item data-hay={`${n.label} ${n.value} ${n.note ?? ''} ${n.src.short}`.toLowerCase()}>
+                <th scope="row">{n.label}</th>
+                <td class="cs-v">{n.value}</td>
+                <td class="cs-n">{n.note}</td>
+                <td class="cs-s"><a href={n.src.url} title={`Chapter ${n.src.n}: ${n.src.short}`}>{n.src.n}</a></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
+  ))}
+  <p class="cs-none" data-cs-none hidden>Nothing matches.</p>
+
+  <script>
+    const input = document.querySelector<HTMLInputElement>('[data-cs-filter]')!;
+    const items = [...document.querySelectorAll<HTMLElement>('[data-cs-item]')];
+    const secs = [...document.querySelectorAll<HTMLElement>('[data-cs-sec]')];
+    const none = document.querySelector<HTMLElement>('[data-cs-none]')!;
+    input.addEventListener('input', () => {
+      const q = input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      let any = false;
+      items.forEach((it) => { const ok = q.every((t) => it.dataset.hay!.includes(t)); it.hidden = !ok; any ||= ok; });
+      secs.forEach((s) => {
+        s.hidden = !s.querySelector('[data-cs-item]:not([hidden])');
+        s.querySelectorAll<HTMLElement>('.cs-formulas, .cs-nums').forEach((b) => { b.hidden = !b.querySelector('[data-cs-item]:not([hidden])'); });
+      });
+      none.hidden = any;
+    });
+    document.querySelector('[data-cs-print]')!.addEventListener('click', () => print());
+  </script>
+
+  <style>
+    .cs-bar { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; position: sticky; top: var(--header-h); z-index: 5; padding: 10px 0; background: color-mix(in srgb, var(--bg) 86%, transparent); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+    .cs-search { max-width: 340px; padding: 8px 12px; font-size: 0.9rem; }
+    .cs-jump { display: flex; flex-wrap: wrap; gap: 4px 12px; flex: 1; font-size: 0.82rem; }
+    .cs-jump a { color: var(--text-dim); white-space: nowrap; }
+    .cs-jump a:hover { color: var(--accent); }
+    .cs-sec { margin-top: 2.2rem; scroll-margin-top: calc(var(--header-h) + 70px); }
+    .cs-sec[hidden], [data-cs-item][hidden], .cs-formulas[hidden], .cs-nums[hidden] { display: none; }
+    .cs-sec header { margin-bottom: 12px; }
+    h2 { font-size: 1.3rem; letter-spacing: -0.02em; margin: 0; }
+    h2::before { content: ''; display: block; width: 28px; height: 3px; border-radius: 3px; background: var(--accent-grad); margin-bottom: 12px; }
+    .cs-sec header p { margin: 2px 0 0; color: var(--text-dim); font-size: 0.93rem; }
+    .cs-formulas { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr)); gap: 12px; }
+    .cs-f { border: 1px solid var(--border); border-radius: 14px; background: var(--surface); padding: 12px 14px; min-width: 0; break-inside: avoid; }
+    .cs-fh { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+    .cs-fh b { font-size: 0.92rem; font-weight: 650; }
+    .cs-fh a, .cs-s a { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-faint); white-space: nowrap; }
+    .cs-fh a:hover, .cs-s a:hover { color: var(--accent); }
+    .cs-tex { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
+    .cs-tex :global(.katex-display) { margin: 0.5rem 0; padding: 0; background: none; border: 0; text-align: left; overflow: visible; }
+    .cs-tex :global(.katex-display > .katex) { text-align: left; }
+    .cs-tex :global(.katex) { font-size: 1em; }
+    .cs-vars, .cs-ex { margin: 4px 0 0; font-size: 0.82rem; line-height: 1.5; color: var(--text-dim); }
+    .cs-ex span { font-family: var(--font-mono); font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--c-kv); background: var(--c-kv-soft); padding: 2px 6px; border-radius: 5px; margin-right: 7px; }
+    .cs-nums { width: 100%; table-layout: fixed; border-collapse: separate; border-spacing: 0; margin-top: 14px; font-size: 0.88rem; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); overflow: hidden; }
+    .cs-nums th, .cs-nums td { padding: 8px 12px; text-align: left; vertical-align: baseline; border-bottom: 1px solid var(--border); }
+    .cs-nums tr:last-child th, .cs-nums tr:last-child td { border-bottom: 0; }
+    .cs-nums th { font-weight: 560; width: 27%; }
+    .cs-v { font-family: var(--font-mono); font-size: 0.84rem; font-weight: 600; color: var(--accent); width: 30%; overflow-wrap: anywhere; }
+    .cs-n { color: var(--text-dim); font-size: 0.84rem; }
+    .cs-s { width: 48px; text-align: right; }
+    .cs-none { color: var(--text-faint); margin-top: 2rem; }
+    @media (max-width: 700px) {
+      .cs-nums, .cs-nums tbody, .cs-nums tr { display: block; }
+      .cs-nums tr { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+      .cs-nums tr:last-child { border-bottom: 0; }
+      .cs-nums th, .cs-nums td { display: block; padding: 0; border: 0; width: auto; }
+      .cs-v { text-align: right; }
+      .cs-n { grid-column: 1 / -1; }
+      .cs-s { display: none !important; }
+      .cs-jump { display: none; }
+    }
+    @media print {
+      .cs-bar { display: none; }
+      .cs-sec { margin-top: 1.2rem; }
+      .cs-formulas { grid-template-columns: 1fr 1fr; gap: 8px; }
+      .cs-f, .cs-nums { border-color: #c8ccd8; }
+    }
+  </style>
+</Page>

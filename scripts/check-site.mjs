@@ -65,7 +65,11 @@ if (fs.existsSync(sitemap)) {
 }
 
 if (problems.length) {
-  console.error(`check-site: ${problems.length} problem${problems.length > 1 ? 's' : ''}\n` + problems.map((p) => `  ✗ ${p}`).join('\n'));
+  // the same broken target on every page (a nav link, say) is one problem, not forty
+  const byMsg = new Map();
+  for (const p of problems) { const [file, ...rest] = p.split(': '); const msg = rest.join(': '); byMsg.set(msg, [...(byMsg.get(msg) ?? []), file]); }
+  const lines = [...byMsg].map(([msg, where]) => `  ✗ ${msg}\n      in ${[...new Set(where)].slice(0, 3).join(', ')}${new Set(where).size > 3 ? ` and ${new Set(where).size - 3} more` : ''}`);
+  console.error(`check-site: ${byMsg.size} problem${byMsg.size > 1 ? 's' : ''}\n${lines.join('\n')}`);
   process.exit(1);
 }
 console.log(`check-site: ${pages.size} pages, ${searchCount} search entries, all links and anchors resolve.`);

@@ -8,7 +8,7 @@
 
   type Sc = 'shared' | 'multiturn' | 'tsfirst' | 'tslast';
   const BS = 16;
-  const PREFILL_TPS = 12000; // tokens/s prefill for an 8B model on one H100 (rough)
+  const PREFILL_TPS = 12000; // tokens/s prefill, roughly an 8B model on one A100 (2 × 8e9 FLOPs/token at ~55% of 312 TFLOPS ≈ 11k)
   const OVERHEAD = 0.015;    // s scheduling + first decode step
 
   mountAll('prefix-playground', (root) => {

@@ -115,7 +115,7 @@ vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
   --goodput ttft:500 tpot:50
 # ...the same, open loop: replace --max-concurrency with --request-rate 8
 
-# GuideLLM: automatic sweep from synchronous to max throughput
+# GuideLLM (v0.7+ syntax; older releases used `guidellm benchmark --target …`): automatic sweep from synchronous to max throughput
 guidellm run --backend kind=openai_http,target=http://llama-8b.serving.svc:8000 \
   --profile kind=sweep \
   --data kind=synthetic_text,prompt_tokens=1024,output_tokens=256 \

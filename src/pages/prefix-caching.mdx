@@ -75,7 +75,7 @@ Prefill cost grows with the number of **uncached** tokens, so time-to-first-toke
 <Viz title="Prompt structure → cache hits → TTFT" label="Explore">
   <PrefixPlayground />
   <Fragment slot="caption">
-    <p>Prefill speed is assumed to be a conservative 12k tokens/s for an 8B model on one H100. That is well below the roughly 30k tokens/s first-order ceiling from the Prefill vs Decode chapter, to allow for real-engine overhead. In <b>multi-turn chat</b> the prompt grows every turn, but almost all of it is cached from the previous turn. Compare <b>timestamp at start</b> with <b>timestamp at end</b>: the same information in a different place changes the hit rate from 0% to most of the prompt (only the first request and the uncached tail are computed).</p>
+    <p>Prefill speed is assumed to be 12k tokens/s, roughly an 8B model on one A100. An H100 is about 2.5× faster (see <a href="../prefill-decode/">Prefill vs Decode</a>), which shrinks every bar but not the ratios. In <b>multi-turn chat</b> the prompt grows every turn, but almost all of it is cached from the previous turn. Compare <b>timestamp at start</b> with <b>timestamp at end</b>: the same information in a different place changes the hit rate from 0% to most of the prompt (only the first request and the uncached tail are computed).</p>
   </Fragment>
 </Viz>
 

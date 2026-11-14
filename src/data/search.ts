@@ -4,12 +4,12 @@
    in-prose hover definitions, so there is one shared download for both features. */
 import { chapters, parts, chapterIndex } from './chapters';
 import { glossary, termId } from './glossary';
-import { vizTitles } from './content';
+import { vizTitles, questions } from './content';
 import { u, chapterUrl, vizId } from '../lib/url';
 
 export interface SearchItem {
-  /** kind: c chapter · t tool · s section · d diagram · g glossary term */
-  k: 'c' | 't' | 's' | 'd' | 'g';
+  /** kind: c chapter · t tool · s section · d diagram · g glossary term · q interview question */
+  k: 'c' | 't' | 's' | 'd' | 'g' | 'q';
   /** badge shown on the left (chapter number or a symbol) */
   n: string;
   /** title */
@@ -40,10 +40,16 @@ export function buildSearchIndex(headings: Record<string, Heading[]>): SearchIte
     { k: 't', n: '◆', t: 'Concept Map', s: 'map graph prerequisites path', b: 'How every chapter connects; get a reading path to any topic.', p: 'Tool', h: u('map/') },
     { k: 't', n: '◆', t: 'Glossary', s: 'glossary terms definitions', b: `${glossary.length} short definitions, each linked to its chapter.`, p: 'Tool', h: u('glossary/') },
   ];
+  out.push(
+    { k: 't', n: '◆', t: 'Learning Paths', s: 'paths path track role curriculum order sre platform interview', b: 'A reading order for your role, with time estimates and progress.', p: 'Tool', h: u('paths/') },
+    { k: 't', n: '◆', t: 'Review', s: 'review flashcards quiz spaced repetition interview questions practice test', b: 'Spaced-repetition flashcards built from every chapter’s interview questions.', p: 'Tool', h: u('review/') },
+    { k: 't', n: '◆', t: 'Cheat Sheet', s: 'cheat sheet cheatsheet formulas numbers reference equations', b: 'The formulas and numbers worth memorising, each linked to its chapter.', p: 'Tool', h: u('cheatsheet/') },
+  );
   for (const c of chapters) {
     for (const hd of headings[c.slug] ?? []) {
       if (hd.depth === 2 || hd.depth === 3) out.push({ k: 's', n: '§', t: hd.text, b: `${num(c.slug)} · ${c.title}`, p: 'Section', h: `${chapterUrl(c.slug)}#${hd.slug}` });
     }
+    for (const q of questions(c.slug)) out.push({ k: 'q', n: '?', t: q.q, s: `interview question ${q.level}`, b: `${num(c.slug)} · ${c.title} · ${q.level}`, p: 'Question', h: `${chapterUrl(c.slug)}#${q.id}` });
     for (const title of vizTitles(c.slug)) out.push({ k: 'd', n: '▶', t: title, s: 'diagram interactive', b: `${num(c.slug)} · ${c.title}`, p: 'Diagram', h: `${chapterUrl(c.slug)}#${vizId(title)}` });
   }
   for (const g of glossary) {

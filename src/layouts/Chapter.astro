@@ -5,6 +5,7 @@ import { chapters, parts, chapterIndex } from '../data/chapters';
 import { chapterUrl, u } from '../lib/url';
 import { connections } from '../data/graph';
 import { readingMinutes, vizTitles } from '../data/content';
+import { paths } from '../data/paths';
 
 interface Props {
   frontmatter?: { title?: string; description?: string };
@@ -46,6 +47,11 @@ const jsonLd = {
     },
   ],
 };
+// paths that include this chapter: the reader's chosen one shows "next in your path" above the pager
+const myPaths = paths.filter((p) => p.steps.includes(slug)).map((p) => {
+  const i = p.steps.indexOf(slug); const nx = p.steps[i + 1];
+  return { id: p.id, title: p.title, i: i + 1, n: p.steps.length, next: nx ? { t: chapters[chapterIndex(nx)].title, h: chapterUrl(nx) } : null };
+});
 // short chapter labels for the glossary pop-over's "Learn more" link
 const shorts = Object.fromEntries(chapters.map((c) => [c.slug, c.short]));
 ---
@@ -94,6 +100,9 @@ const shorts = Object.fromEntries(chapters.map((c) => [c.slug, c.short]));
           <a class="conn-map" href={u('map/')}>See it on the concept map →</a>
         </section>
       )}
+
+      <a class="path-next" data-path-next hidden></a>
+      <script is:inline type="application/json" id="path-data" set:html={JSON.stringify({ paths: myPaths, home: u('paths/') })} />
 
       <nav class="pager" aria-label="Chapter navigation">
         {prev ? (
@@ -201,6 +210,24 @@ const shorts = Object.fromEntries(chapters.map((c) => [c.slug, c.short]));
         localStorage.setItem('tbt-last', main.dataset.chapter!);
       } catch {}
     }
+    // following a learning path: show the position in it and its next chapter
+    try {
+      const pd: { paths: { id: string; title: string; i: number; n: number; next: { t: string; h: string } | null }[]; home: string } = JSON.parse(document.getElementById('path-data')!.textContent!);
+      const mine = pd.paths.find((p) => p.id === localStorage.getItem('tbt-path'));
+      const el = document.querySelector<HTMLAnchorElement>('[data-path-next]');
+      if (mine && el) {
+        el.href = mine.next ? mine.next.h : `${pd.home}#${mine.id}`;
+        const k = document.createElement('span'); k.className = 'pn-k'; k.textContent = `Your path: ${mine.title} · step ${mine.i} of ${mine.n}`;
+        const t = document.createElement('span'); t.className = 'pn-t'; t.textContent = mine.next ? `Next in path: ${mine.next.t} →` : 'Last chapter of this path. See your progress →';
+        el.append(k, t); el.hidden = false;
+      }
+    } catch {}
+    // a link straight to an interview question (from search or the Review deck) opens it
+    const openTarget = () => {
+      const el = location.hash.length > 1 ? document.getElementById(decodeURIComponent(location.hash.slice(1))) : null;
+      if (el instanceof HTMLDetailsElement) el.open = true;
+    };
+    openTarget(); addEventListener('hashchange', openTarget);
     // a "#" link on every section heading: click to put a shareable link in the address bar
     document.querySelectorAll<HTMLElement>('.prose h2[id], .prose h3[id]').forEach((hd) => {
       const a = document.createElement('a');
@@ -268,6 +295,12 @@ const shorts = Object.fromEntries(chapters.map((c) => [c.slug, c.short]));
     .conn-col a:hover { color: var(--text); }
     .conn .cn { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); }
     .conn-map { flex-basis: 100%; font-size: 0.82rem; }
+    .path-next { max-width: var(--prose-w); margin: 3rem 0 0; display: flex; flex-direction: column; gap: 3px; padding: 14px 18px; border-radius: 14px; border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-soft); color: var(--text); }
+    .path-next[hidden] { display: none; }
+    .path-next:hover { border-color: var(--accent); background-size: 0 0; }
+    .path-next :global(.pn-k) { font-size: 0.76rem; color: var(--text-dim); }
+    .path-next :global(.pn-t) { font-weight: 620; }
+    .path-next + script + .pager { margin-top: 14px; }
     .pager { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; max-width: var(--prose-w); margin: 3.5rem 0 0; }
     .pg { display: flex; flex-direction: column; gap: 4px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); color: var(--text); transition: border-color 0.2s, transform 0.2s; }
     .pg:hover { border-color: var(--accent); transform: translateY(-2px); background-size: 0 0; }

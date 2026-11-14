@@ -3,6 +3,8 @@ import Base from '../layouts/Base.astro';
 import Lifecycle from '../components/home/Lifecycle.astro';
 import { chapters, parts } from '../data/chapters';
 import { chapterUrl, u } from '../lib/url';
+import { paths } from '../data/paths';
+import { readingMinutes } from '../data/content';
 
 const colours = [
   ['Prefill', 'var(--c-prefill)', 'Processing the prompt: one wide, compute-bound pass'],
@@ -54,7 +56,7 @@ const partIcons: Record<string, string> = {
     <section class="tools reveal">
       <div class="sec-head">
         <span class="eyebrow">Learn by doing</span>
-        <h2>Four ways in</h2>
+        <h2>Six ways in</h2>
         <p>Experiment first and read later, or the other way round.</p>
       </div>
       <div class="tool-grid">
@@ -82,6 +84,38 @@ const partIcons: Record<string, string> = {
           <span>TTFT, GQA, MIG, goodput… Short definitions, also shown on hover inside every chapter.</span>
           <span class="tool-go">Browse terms →</span>
         </a>
+        <a class="tool" href={u('review/')} data-spot>
+          <span class="tool-k">Review</span>
+          <b>Make it stick</b>
+          <span>Every chapter’s interview questions as spaced-repetition flashcards. Answer from memory, grade yourself, and hard cards come back sooner.</span>
+          <span class="tool-go">Start a session →</span>
+        </a>
+        <a class="tool" href={u('cheatsheet/')} data-spot>
+          <span class="tool-k">Cheat Sheet</span>
+          <b>The numbers to remember</b>
+          <span>The formulas and figures behind every estimate on the site, on one printable page, each linked to the chapter that derives it.</span>
+          <span class="tool-go">Open the cheat sheet →</span>
+        </a>
+      </div>
+    </section>
+
+    <section class="hpaths reveal">
+      <div class="sec-head">
+        <span class="eyebrow">Short on time?</span>
+        <h2>Pick a path for your goal</h2>
+        <p>Curated routes through the chapters, each with a time estimate and progress tracking.</p>
+      </div>
+      <div class="hpath-grid">
+        {paths.map((p) => {
+          const m = p.steps.reduce((a, s) => a + readingMinutes(s), 0);
+          return (
+            <a class="hpath" href={`${u('paths/')}#${p.id}`} data-spot>
+              <b>{p.title}</b>
+              <span>{p.who}</span>
+              <span class="hpath-m">{p.steps.length} chapters · {m >= 60 ? `${Math.floor(m / 60)} h ${String(m % 60).padStart(2, '0')} min` : `${m} min`}</span>
+            </a>
+          );
+        })}
       </div>
     </section>
 
@@ -213,7 +247,13 @@ const partIcons: Record<string, string> = {
     .card-list a:hover .t { color: var(--accent); }
     .card-list a:hover .arr { opacity: 1; transform: none; color: var(--accent); }
 
-    .tool-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+    .tool-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .hpath-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+    .hpath { display: flex; flex-direction: column; gap: 5px; padding: 16px 18px; border-radius: 16px; border: 1px solid var(--border); background: var(--surface); color: var(--text); transition: border-color 0.25s, transform 0.25s; }
+    .hpath:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); transform: translateY(-2px); background-size: 0 0; }
+    .hpath b { font-size: 1.02rem; letter-spacing: -0.015em; }
+    .hpath span { color: var(--text-dim); font-size: 0.88rem; line-height: 1.5; flex: 1; }
+    .hpath .hpath-m { flex: none; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); margin-top: 4px; }
     @media (max-width: 1180px) { .tool-grid { grid-template-columns: repeat(2, 1fr); } }
     .tool { --mx: 50%; --my: 0%; position: relative; display: flex; flex-direction: column; gap: 6px; padding: 20px; border-radius: 18px; border: 1px solid var(--border); background: var(--surface); color: var(--text); overflow: hidden; isolation: isolate; transition: border-color 0.25s, transform 0.25s; }
     .tool::before { content: ''; position: absolute; inset: 0; z-index: -1; background: radial-gradient(360px circle at var(--mx) var(--my), var(--accent-soft), transparent 60%); opacity: 0; transition: opacity 0.3s; }

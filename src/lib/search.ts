@@ -16,7 +16,7 @@ export function loadSearchIndex(): Promise<SearchItem[]> {
 export function searchItems(items: SearchItem[], query: string): SearchItem[] {
   const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (!terms.length) return items.filter((it) => it.k === 'c' || it.k === 't');
-  const kindBoost: Record<SearchItem['k'], number> = { c: 14, t: 14, g: 3, s: 2, d: 1 };
+  const kindBoost: Record<SearchItem['k'], number> = { c: 14, t: 14, g: 3, s: 2, d: 1, q: 0 };
   const scored: { it: SearchItem; score: number; i: number }[] = [];
   items.forEach((it, i) => {
     const title = it.t.toLowerCase();

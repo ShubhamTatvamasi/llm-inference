@@ -1,13 +1,15 @@
 ---
 interface Props { q: string; level?: 'core' | 'mid' | 'senior' }
+import { qId } from '../lib/url';
 const { q, level = 'core' } = Astro.props;
 ---
-<details class="qa">
+<details class="qa" id={qId(q)}>
   <summary><span class={`lv ${level}`}>{level}</span><span class="qq">{q}</span><span class="chev" aria-hidden="true">›</span></summary>
   <div class="ans"><slot /></div>
 </details>
 <style>
-  .qa { border-top: 1px solid var(--border); }
+  .qa { border-top: 1px solid var(--border); scroll-margin-top: calc(var(--header-h) + 16px); }
+  .qa:target summary .qq { color: var(--accent); }
   .qa:first-child { border-top: 0; }
   summary { list-style: none; cursor: pointer; display: flex; align-items: flex-start; gap: 12px; padding: 13px 4px; font-weight: 560; }
   summary::-webkit-details-marker { display: none; }

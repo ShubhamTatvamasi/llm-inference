@@ -12,3 +12,6 @@ export const slugify = (s: string) => s.toLowerCase().normalize('NFKD').replace(
 
 /** Anchor id of a `<Viz title="…">` frame, so search and other pages can deep-link to a diagram. */
 export const vizId = (title: string) => `viz-${slugify(title)}`;
+
+/** Anchor id of an interview question (`<Q q="…">`), shared by the chapter, search and the Review deck. */
+export const qId = (q: string) => `q-${slugify(q).slice(0, 64).replace(/-$/, '')}`;
