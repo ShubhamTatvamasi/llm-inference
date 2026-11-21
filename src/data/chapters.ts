@@ -25,6 +25,7 @@ export const parts: Part[] = [
   { id: 'prod', num: 'VI', title: 'Production', blurb: 'Measuring, routing, scaling and paying for it.' },
   { id: 'beyond', num: 'VII', title: 'Beyond chat', blurb: 'Reasoning, agents, images and embeddings stress the engine differently.' },
   { id: 'k8s', num: 'VIII', title: 'Running on Kubernetes', blurb: 'Getting GPUs, weights and visibility into a cluster.' },
+  { id: 'frontier', num: 'IX', title: 'The frontier', blurb: 'Long context, sparse attention and the memory hierarchy.' },
 ];
 
 export const chapters: Chapter[] = [
@@ -80,6 +81,10 @@ export const chapters: Chapter[] = [
   { slug: 'gpu-sharing', part: 'k8s', title: 'Sharing a GPU', short: 'GPU sharing', blurb: 'Time-slicing, MPS, MIG and vGPU: isolation vs utilisation.' },
   { slug: 'model-loading', part: 'k8s', title: 'Model Weights & Loading', short: 'Weights & loading', blurb: 'File formats, where weights live, and how fast they reach HBM.' },
   { slug: 'observability', part: 'k8s', title: 'Observability & Troubleshooting', short: 'Observability', blurb: 'DCGM metrics, Xid errors and a symptom-first triage path.' },
+
+  // IX — The frontier
+  { slug: 'long-context', part: 'frontier', title: 'Long Context & Sparse Attention', short: 'Long context', blurb: 'MLA, DSA, CSA/HCA and the indexer: how million-token context changes attention, KV and serving.' },
+  { slug: 'kv-offload', part: 'frontier', title: 'KV Cache Offloading', short: 'KV offload', blurb: 'Host DRAM, NVMe, object stores and peers: when reloading a prefix beats recomputing it.' },
 ];
 
 export const chapterIndex = (slug: string) => chapters.findIndex((c) => c.slug === slug);

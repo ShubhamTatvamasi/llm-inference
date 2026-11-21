@@ -1,0 +1,144 @@
+---
+layout: ../layouts/Chapter.astro
+title: KV Cache Offloading
+description: How serving engines spill KV cache to host memory, NVMe, object stores and remote peers, and when reloading a prefix is cheaper than recomputing it.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Sources from '../components/Sources.astro';
+import Q from '../components/Q.astro';
+import OffloadFlow from '../components/viz/OffloadFlow.astro';
+import OffloadBreakEven from '../components/viz/OffloadBreakEven.astro';
+
+HBM is the fastest place for a KV cache and the smallest. When the working set outgrows it, an engine has four options:
+
+1. **Evict and recompute** the prefix when it is needed again.
+2. **Offload** the KV bytes to a lower tier and reload them later.
+3. **Compress** the cache (MLA, FP8/NVFP4, block compression) so it fits.
+4. **Reject or queue** the request.
+
+Most production systems do a mix. This chapter is about the second option: the memory hierarchy, the reload-versus-recompute decision, and the operational details that turn a demo into a cache.
+
+## The hierarchy
+
+KV data moves on a path, not a single swap file:
+
+- **HBM** — tens to hundreds of GB, TB/s. The only tier the attention kernel reads directly.
+- **Host DRAM** — hundreds of GB to a few TB, tens of GB/s over PCIe or NVLink-C2C. The **primary offload tier**.
+- **NVMe / object store** — TB to effectively unbounded, GB/s to sub-GB/s, with much higher latency. Secondary tiers for cold or shared prefixes.
+- **Remote peers** — another engine instance, reached over RDMA or a KV-transfer library such as NIXL. Used for disaggregation, load balancing and cross-replica prefix reuse.
+
+A crucial design choice in vLLM's tiered offloading is that **all KV data flows through host memory**. Offloading moves a chunk from the GPU to host DRAM, then cascades it to any configured secondary tiers. Reloading asks the host cache first; on a miss, it promotes the chunk from a secondary tier back into host memory and then into HBM.
+
+<Viz title="Where a KV chunk lives" label="Interactive">
+  <OffloadFlow />
+  <Fragment slot="caption">
+    <p>Choose where the chunk is found and press <b>Trace the reload</b>. A host-tier hit never touches NVMe or the network. A secondary-tier hit is promoted through host DRAM first, which is why the primary tier's capacity and hit rate matter so much.</p>
+  </Fragment>
+</Viz>
+
+## The break-even
+
+Reloading is a bet that moving bytes is cheaper than recomputing them.
+
+$$
+t_{\text{reload}} \approx \frac{\text{KV bytes}}{\text{effective tier bandwidth}}
+\qquad
+t_{\text{recompute}} \approx \frac{\text{prefill FLOPs}}{\text{achieved FLOPs}} + \text{attention}
+$$
+
+A host-DRAM reload of 10 GB at 50 GB/s costs about 200 ms. A 20K-token prefill on a busy node can cost several hundred milliseconds. At that point a host hit is a clear win. An object-store reload of the same 10 GB at 1 GB/s costs 10 seconds: recomputing may win unless the prefix is enormous or the recompute would be much slower under load.
+
+<Viz title="Reload vs recompute" label="Calculator">
+  <OffloadBreakEven />
+  <Fragment slot="caption">
+    <p>Pick a tier, a KV size, a recompute time and a hit rate. The effective bar is <code>hit × reload + (1 − hit) × recompute</code>. The verdict is about single-request latency; the note explains why a slower reload can still improve goodput by freeing HBM.</p>
+  </Fragment>
+</Viz>
+
+The comparison is not only latency. Offloading frees HBM, so the same GPU can hold more concurrent requests or a longer context. Even when a reload is slower than a recompute, it can raise **goodput** if it avoids a recompute storm or lets the scheduler admit more work. Measure both the request latency and the service-level outcome.
+
+<Callout type="key" title="A cache, not a swap file">
+Offload only pays when the data is **reused**. A low hit rate turns a tier into a slow, expensive copy of the GPU. Track hit rate, eviction rate and bytes moved, and size the primary tier before adding secondary tiers.
+</Callout>
+
+## How modern engines do it
+
+The 2026 vLLM tiering implementation is a useful reference design:
+
+- **Chunks** are the unit of movement, typically one accelerator block or several blocks (`blocks_per_chunk`). Larger chunks mean fewer, larger I/Os; smaller chunks mean finer eviction and faster first reuse.
+- **The host tier is a real cache**, with LRU/ARC-style eviction, not a staging buffer. A chunk can be evicted from host memory and still survive in a secondary tier.
+- **Reloads are asynchronous.** The scheduler can retry a request while a chunk is promoted; computation overlaps the transfer where possible.
+- **Peer-to-peer** transfers use a coordination layer plus RDMA/NIXL for bulk data. They let an instance pull a prefix from a peer instead of recomputing it, which is useful for disaggregated serving and load balancing.
+- **Disaggregated prefill/decode** uses the same machinery: the prefill instance publishes KV chunks; the decode instance pulls them. Chunked prefill makes completed chunks available early, overlapping transfer with the rest of the prompt.
+- **The router decides where to pull from.** A KV-aware router sends a request to the replica that already holds the prefix, or moves chunks between peers when a replica is overloaded.
+
+Push-based transfer is a newer refinement. Instead of the decode instance discovering and pulling blocks after prefill finishes, the producer pushes them as soon as they are ready. vLLM reports up to **3× better TTFT** and **30% better TPOT** than pull mode in a 1P1D Qwen3-32B test on AWS EFA. Bi-directional transfer goes further for multi-turn agents: the decode instance returns KV to the prefill side so the next turn does not recompute the whole conversation.
+
+## Where it pays
+
+- **Multi-turn chat and agents** — the system prompt, tool schemas and earlier turns are reused every turn.
+- **RAG and shared documents** — many users ask about the same long document; the prefix is hot.
+- **Shared system prompts** — a large fixed instruction block is a natural cached prefix.
+- **Warm starts and cold caches** — a new replica can load prefixes from object storage instead of starting cold.
+- **Disaggregated prefill/decode** — KV has to move anyway; tiering makes the move explicit and schedulable.
+- **Load balancing** — a router can shift KV to an idle replica rather than recomputing it there.
+
+## Where it does not
+
+- **Short prompts** — the KV is small and the recompute is cheap; the tier overhead dominates.
+- **Low reuse** — a cache with a low hit rate is just a slower memory path.
+- **Slow secondary tiers** — an object store at 1 GB/s is not a latency tier for interactive traffic.
+- **Strict TTFT SLOs** — a reload adds a serial step before the first token unless it overlaps prefill or decode.
+- **Tenant isolation and compliance** — KV can contain prompt and document content. Namespace cache keys per tenant, encrypt at rest and in transit, and never let a router cross a trust boundary.
+- **Cache invalidation** — a model, tokenizer or adapter change invalidates prefixes. Version the cache key with the weights and chat template.
+
+## Operating it
+
+Offloading adds a second memory system to operate. The useful signals are:
+
+- **Hit rate by tier** and **bytes moved per request**.
+- **Reload latency** at p50/p95, separated from prefill and decode time.
+- **Tier occupancy, eviction rate and fragmentation**; a full host cache with a low hit rate is a capacity smell.
+- **PCIe/NVLink, NVMe and network utilisation**; the bottleneck moves quickly.
+- **TTFT attribution**: queueing, prefill, KV transfer, decode. Without this, an offload regression looks like a model problem.
+
+Chunk size is the main tuning knob. Bigger chunks amortise metadata and I/O setup but can delay the first reuse and waste bandwidth on partially used blocks. Smaller chunks make eviction and reuse finer-grained but increase per-chunk overhead. Measure at the request mix you actually serve.
+
+<Callout type="warn" title="Do not offload your way out of a capacity plan">
+If every request needs a fresh 100K-token prefix and the hit rate is near zero, offload adds latency without saving compute. Fix the workload, the prefix design or the model size first. Offload is a cache for **reuse**, not a substitute for capacity.
+</Callout>
+
+<Sources
+  updated="November 2026"
+  items={[
+    { href: 'https://vllm.ai/blog/2026-09-10-tiered-kv-offloading', title: 'Tiered KV cache offloading', note: 'host primary tier, secondary filesystem/object/peer tiers and the reload path' },
+    { href: 'https://vllm.ai/blog/2026-10-14-nixl-push-connector', title: 'Push-based KV transfer', note: 'moving transfer setup off the TTFT path; reported 3× TTFT and 30% TPOT gains' },
+    { href: 'https://vllm.ai/blog/2026-10-12-bidirectional-kvxfer-multiturn-agentic-workload', title: 'Bi-directional KV transfer', note: 'returning KV to the prefill side for multi-turn agentic workloads' },
+    { href: 'https://docs.vllm.ai/en/stable/features/disagg_prefill/', title: 'vLLM disaggregated prefill', note: 'KV connectors and the P/D deployment shape' },
+    { href: 'https://arxiv.org/abs/2407.00079', title: 'Mooncake', note: 'a KV-cache-centric serving platform at Kimi scale' },
+    { href: 'https://arxiv.org/abs/2401.09670', title: 'DistServe', note: 'why prefill and decode pools are sized separately' },
+  ]}
+/>
+
+<Interview>
+  <Q q="When does reloading a KV prefix beat recomputing it? Write the inequality." level="core">
+    Reloading wins when <code>KV bytes / tier bandwidth &lt; prefill FLOPs / achieved FLOPs</code>, including the attention term and the transfer setup. A host-DRAM hit is usually faster than a long prefill; an object-store hit may not be. The hit rate tells you how often you pay the reload instead of the recompute.
+  </Q>
+  <Q q="Why does all KV data flow through host memory instead of moving directly from GPU to NVMe?" level="mid">
+    The host tier is the common, mappable staging point: GPU transfers use DMA into host memory, and secondary tiers are reached from there with ordinary filesystem or network I/O. It also gives one place for LRU/ARC eviction, chunk metadata and reuse across requests. Direct GPU-to-storage paths exist, but they complicate addressing, pinning and portability, and they bypass the shared cache.
+  </Q>
+  <Q q="What does chunk size trade off?" level="mid">
+    Larger chunks amortise per-I/O overhead and produce fewer, bigger transfers; they can delay the first reusable chunk and waste bandwidth on partially used blocks. Smaller chunks make eviction and prefix reuse finer-grained but add metadata and setup cost. The right size depends on block size, tier latency and the request mix.
+  </Q>
+  <Q q="How does offloading interact with prefix caching and KV-aware routing?" level="senior">
+    Prefix caching decides whether a prefix is worth keeping; offload extends where it can live; routing decides which replica should serve the request. A KV-aware router sends repeat prompts to the replica whose cache already holds the prefix, and can move chunks between peers under load. Without namespacing and model/tokenizer versioning, these three features can serve a stale or cross-tenant prefix.
+  </Q>
+  <Q q="When would offloading make performance worse even with a high hit rate?" level="senior">
+    When the reload is on the critical TTFT path and the tier is slow, when host memory or PCIe/NVMe bandwidth is already saturated, when chunk metadata and copying dominate for small KV, or when the cache evicts the working set faster than it can be reused. It can also hurt if it crowds out the host memory needed by other services on the node.
+  </Q>
+  <Q q="What would you monitor first after enabling tiered KV offload?" level="senior">
+    Hit rate and bytes moved per tier; reload latency at p50/p95; tier occupancy, evictions and fragmentation; PCIe/NVLink/NVMe/network utilisation; TTFT split into queueing, prefill, transfer and decode; and goodput against the SLO. Alert on a falling hit rate or a rising transfer share before users notice.
+  </Q>
+</Interview>

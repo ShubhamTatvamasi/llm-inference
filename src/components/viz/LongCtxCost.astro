@@ -1,0 +1,110 @@
+---
+/* Long-context economics: KV bytes vs attention work for dense and sparse attention.
+   First-order model. Sparse attention cuts attention work, not KV storage; MLA/CSA cut KV. */
+---
+<div data-viz="longctx-cost"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, select, segmented, slider, stats, legend, C, fmt } from '../../lib/viz';
+  import { getModel, kvBytesPerToken } from '../../data/hardware';
+
+  const CTX = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+  const KS = [256, 512, 1024, 2048, 4096, 8192];
+  const MODELS = ['llama3-8b', 'llama3-70b', 'deepseek-v3'];
+  const W = 940, H = 280;
+  const INDEXER_COST = 1 / 16; // a cheap indexer score, relative to a full attention score
+
+  mountAll('longctx-cost', (root) => {
+    let model = getModel('llama3-70b');
+    let ctxI = 3; // 32K
+    let kI = 3; // 2048
+    let sparse = true;
+
+    const bar = ctrlBar(root);
+    const g1 = group(bar);
+    select(g1, 'Model', MODELS.map((id) => ({ value: id, label: getModel(id).name })), model.id, (v) => { model = getModel(v); render(); });
+    segmented(g1, [{ value: 'dense', label: 'Dense' }, { value: 'sparse', label: 'Sparse (DSA)' }], 'sparse', (v) => { sparse = v === 'sparse'; kSlider.input.disabled = !sparse; render(); });
+    const g2 = group(bar);
+    const ctxSlider = slider(g2, {
+      label: 'Context', min: 0, max: CTX.length - 1, value: ctxI,
+      format: (i) => fmt.num(CTX[i], 0) + ' tokens',
+      onInput: (i) => { ctxI = i; render(); },
+    });
+    const kSlider = slider(g2, {
+      label: 'Top-k keys', min: 0, max: KS.length - 1, value: kI,
+      format: (i) => `${fmt.int(KS[i])} keys`,
+      onInput: (i) => { kI = i; render(); },
+    });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'KV cache bytes and attention work for dense and sparse attention at a chosen context' });
+    const st = stats(root, ['KV cache', 'KV per token', 'Attention work', 'Indexer share']);
+    legend(root, [['KV stored in HBM', C.kv], ['Full attention scores', C.prefill], ['Sparse attention + indexer', C.compute]]);
+    const note = document.createElement('div');
+    note.className = 'narr';
+    root.appendChild(note);
+    void ctxSlider;
+
+    function render() {
+      clear(svg);
+      const n = CTX[ctxI];
+      const k = Math.min(KS[kI], n); // top-k cannot exceed the number of cached tokens
+      const kvTok = kvBytesPerToken(model, 2);
+      const kv = kvTok * n;
+      const sparseWork = INDEXER_COST + k / n;
+      const work = sparse ? sparseWork : 1;
+      const indexerShare = sparse ? INDEXER_COST / (INDEXER_COST + k / n) : 0;
+
+      const X = 22, BW = W - 44;
+      text(svg, X, 22, `${model.name} · ${fmt.int(n)} tokens`, { class: 't-bold' });
+      text(svg, X + BW, 22, model.attn === 'MLA' ? 'MLA compressed KV' : 'GQA KV', { 'text-anchor': 'end', class: 't-small t-dim' });
+
+      // Row 1: KV cache on a log scale from 1 GB to 400 GB
+      const rowY = 58, rowH = 30;
+      const kmin = 1e9, kmax = 400e9;
+      const lx = (b: number) => X + (Math.log10(Math.max(b, kmin)) - 9) / (Math.log10(kmax) - 9) * BW;
+      text(svg, X, rowY - 10, 'KV cache', { class: 't-small t-bold t-dim' });
+      text(svg, X + BW, rowY - 10, fmt.num(kv / 1e9, 1) + ' GB', { 'text-anchor': 'end', class: 't-small t-mono', fill: C.kv });
+      rect(svg, X, rowY, BW, rowH, C.surface2, { rx: 6 });
+      rect(svg, X, rowY, Math.max(3, lx(kv) - X), rowH, C.kv, { rx: 6 });
+      [1e9, 1e10, 1e11, 4e11].forEach((v) => {
+        const x = lx(v);
+        s('line', { x1: x, y1: rowY + rowH, x2: x, y2: rowY + rowH + 5, stroke: C.borderStrong }, svg);
+        text(svg, x, rowY + rowH + 17, v >= 4e11 ? '400 GB' : `${v / 1e9} GB`, { 'text-anchor': 'middle', class: 't-small t-faint' });
+      });
+
+      // Row 2: relative attention work
+      const row2 = 140;
+      text(svg, X, row2 - 10, 'Attention work vs dense (same context)', { class: 't-small t-bold t-dim' });
+      text(svg, X + BW, row2 - 10, `${fmt.pct(work, 1)} of dense`, { 'text-anchor': 'end', class: 't-small t-mono', fill: sparse ? C.compute : C.prefill });
+      rect(svg, X, row2, BW, rowH, C.surface2, { rx: 6 });
+      rect(svg, X, row2, Math.max(3, Math.min(BW, BW * work)), rowH, sparse ? C.compute : C.prefill, { rx: 6 });
+      // dense baseline marker
+      s('line', { x1: X + BW, y1: row2 - 4, x2: X + BW, y2: row2 + rowH + 4, stroke: C.text, 'stroke-width': 1.5, 'stroke-dasharray': '4 3' }, svg);
+      text(svg, X + BW, row2 + rowH + 17, 'dense = 1.0×', { 'text-anchor': 'end', class: 't-small t-faint' });
+      text(svg, X, row2 + rowH + 17, sparse ? `indexer n + ${fmt.int(k)} full scores` : 'every query against every key', { class: 't-small t-dim' });
+
+      // Breakdown for sparse: indexer vs selected attention
+      if (sparse) {
+        const y = 216;
+        text(svg, X, y, 'Where the work goes', { class: 't-small t-bold t-dim' });
+        const iw = BW * (INDEXER_COST / Math.max(work, 1e-9));
+        rect(svg, X, y + 10, Math.max(2, iw), 18, C.mem, { rx: 4 });
+        rect(svg, X + iw, y + 10, Math.max(2, BW * (k / n) / Math.max(work, 1e-9)), 18, C.compute, { rx: 4 });
+        text(svg, X, y + 42, `Indexer scan: ${fmt.pct(indexerShare)} of sparse-attention work. It still scores every token, just more cheaply.`, { class: 't-small t-dim' });
+      } else {
+        text(svg, X, 216, 'Dense attention: every query scores every key. Sparse mode shows the indexer + top-k alternative.', { class: 't-small t-dim' });
+      }
+
+      st.set('KV cache', `${fmt.num(kv / 1e9, 1)} GB`, `${fmt.bytes(kvTok)} per token`);
+      st.set('KV per token', fmt.bytes(kvTok), model.attn === 'MLA' ? 'latent, not per-head K/V' : '2 × layers × kv-heads × head_dim × 2 B');
+      const speed = work < 0.999 ? `${(1 / Math.max(work, 1e-9)).toFixed(1)}× less` : work > 1.001 ? `${work.toFixed(2)}× more` : 'same as dense';
+      st.set('Attention work', speed, `${fmt.pct(work, 1)} of dense at ${fmt.num(n, 0)} tokens`, work < 0.5 ? C.good : undefined);
+      st.set('Indexer share', sparse ? fmt.pct(indexerShare) : '—', sparse ? 'of sparse-attention work' : 'dense has no indexer');
+
+      note.innerHTML = sparse
+        ? `Sparse attention cuts <b>attention work</b>, not KV storage: the cache still holds every token. The indexer costs ~1/16 of a full score per token in this model. Caveat: at short context, this overhead can be larger than the attention it replaces.`
+        : `Dense attention is the baseline. The KV number is independent of sparsity: look at the model’s attention type (GQA vs MLA) and KV precision first if memory is the constraint.`;
+    }
+    render();
+  });
+</script>

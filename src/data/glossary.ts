@@ -112,4 +112,12 @@ export const glossary: Term[] = [
   { term: 'NVL72', aliases: ['scale-up domain'], def: 'A rack of 72 Blackwell (or Rubin) GPUs joined by NVLink switches into one scale-up domain, so TP and EP can span the whole rack at NVLink speed.', ch: 'interconnects' },
   { term: 'llm-d', def: 'A Kubernetes-native distributed inference stack built on vLLM: KV-aware routing through the Gateway API inference extension, P/D disaggregation and wide expert parallelism.', ch: 'routing-autoscaling' },
   { term: 'Dynamo', aliases: ['NVIDIA Dynamo'], def: 'NVIDIA’s open-source orchestration layer above engines like vLLM, SGLang and TensorRT-LLM: disaggregated serving, KV-aware routing and a tiered KV block manager.', ch: 'disaggregation' },
+
+  // IX — the frontier
+  { term: 'DSA', aliases: ['DeepSeek Sparse Attention', 'sparse attention'], def: 'A sparse attention that uses a lightweight indexer to score every cached key, then runs full attention on only the top-k keys (typically a few thousand). It cuts attention work and KV reads, not KV storage.', ch: 'long-context' },
+  { term: 'CSA', aliases: ['Compressed Sparse Attention'], def: 'DeepSeek-V4’s Compressed Sparse Attention: compress the KV of every m tokens into one entry, then apply DSA over the compressed entries.', ch: 'long-context' },
+  { term: 'HCA', aliases: ['Heavily Compressed Attention'], def: 'A more aggressive KV compression with a much larger group than CSA. Interleaved with CSA so some layers keep a higher-resolution cache.', ch: 'long-context' },
+  { term: 'indexer', def: 'The cheap scoring network in sparse attention that ranks cached keys or blocks before the expensive attention runs. It still scans the whole cache.', ch: 'long-context' },
+  { term: 'KV offload', aliases: ['KV cache offloading', 'tiered KV offload', 'tiered KV cache offloading'], def: 'Moving KV blocks out of HBM to host DRAM, NVMe, object storage or a remote peer, then reloading them when a prefix is reused. A cache, not a swap file.', ch: 'kv-offload' },
+  { term: 'NIXL', aliases: ['NVIDIA Inference Xfer Library'], def: 'NVIDIA’s RDMA-capable KV transfer library, used by vLLM’s disaggregated serving and tiered KV paths to move blocks between instances.', ch: 'kv-offload' },
 ];

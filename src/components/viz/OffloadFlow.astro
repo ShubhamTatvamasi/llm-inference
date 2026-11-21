@@ -1,0 +1,114 @@
+---
+/* Where an offloaded KV chunk lives and how it comes back. The host DRAM tier is
+   mandatory: secondary tiers (NVMe/object, remote peers) are reached through it. */
+---
+<div data-viz="offload-flow"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, select, button, stats, legend, rafLoop, C, fmt } from '../../lib/viz';
+
+  type TierId = 'host' | 'nvme' | 'peer';
+  const TIERS: { id: TierId; label: string; bw: number; sub: string }[] = [
+    { id: 'host', label: 'Host DRAM', bw: 50, sub: 'primary tier · LRU/ARC' },
+    { id: 'nvme', label: 'NVMe / object', bw: 7, sub: 'secondary tier' },
+    { id: 'peer', label: 'Remote peer', bw: 50, sub: 'RDMA / NIXL' },
+  ];
+  const BOXES = [
+    { id: 'hbm', label: 'HBM', sub: 'GPU', x: 20, y: 100, color: C.kv },
+    { id: 'host', label: 'Host DRAM', sub: 'primary tier', x: 260, y: 100, color: C.decode },
+    { id: 'nvme', label: 'NVMe / object', sub: 'secondary tier', x: 500, y: 30, color: C.mem },
+    { id: 'peer', label: 'Remote peer', sub: 'RDMA / NIXL', x: 500, y: 178, color: C.comm },
+  ];
+  const W = 940, H = 300, BH = 88, BW = 180;
+  const center = (id: string) => {
+    const b = BOXES.find((x) => x.id === id)!;
+    return { x: b.x + BW / 2, y: b.y + BH / 2 };
+  };
+
+  mountAll('offload-flow', (root) => {
+    let hitTier: TierId = 'nvme';
+    let active = false; let anim = 0;
+
+    const bar = ctrlBar(root);
+    const g = group(bar);
+    select(g, 'Hit in', TIERS.map((t) => ({ value: t.id, label: t.label })), hitTier, (v) => { hitTier = v as TierId; active = false; anim = 0; render(); });
+    button(g, 'Trace the reload', () => { active = true; anim = 0; drawDot(); }, { primary: true, icon: 'play' });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'KV cache tiering: HBM, host DRAM, NVMe/object store and remote peers' });
+    const st = stats(root, ['Path', 'Tier bandwidth', '10 GB reload', 'What lives there']);
+    legend(root, [['HBM', C.kv], ['Host tier', C.decode], ['Secondary tier', C.mem], ['Remote peer', C.comm]]);
+    const note = document.createElement('div');
+    note.className = 'narr';
+    note.innerHTML = 'All KV data flows through host memory: on a miss the host tier promotes a chunk from a secondary tier, then the GPU loads it. Reload takes the first tier that holds the chunk.';
+    root.appendChild(note);
+    let dyn: SVGGElement;
+
+    const pathFor = (): string[] => hitTier === 'host' ? ['hbm', 'host', 'hbm'] : ['hbm', 'host', hitTier, 'host', 'hbm'];
+
+    function along(ids: string[], t: number) {
+      const pts = ids.map(center);
+      const segs = pts.slice(1).map((p, i) => Math.hypot(p.x - pts[i].x, p.y - pts[i].y));
+      const total = segs.reduce((a, b) => a + b, 0);
+      let d = Math.max(0, Math.min(1, t)) * total;
+      for (let i = 0; i < segs.length; i++) {
+        if (d <= segs[i]) { const u = segs[i] ? d / segs[i] : 0; return { x: pts[i].x + (pts[i + 1].x - pts[i].x) * u, y: pts[i].y + (pts[i + 1].y - pts[i].y) * u }; }
+        d -= segs[i];
+      }
+      return pts[pts.length - 1];
+    }
+
+    function drawDot() {
+      if (!dyn) return;
+      clear(dyn);
+      if (!active) return;
+      const p = along(pathFor(), anim);
+      s('circle', { cx: p.x, cy: p.y, r: 7, fill: C.accent }, dyn);
+      text(dyn, p.x, p.y - 14, anim < 0.5 ? 'offload / lookup' : 'promote / load', { 'text-anchor': 'middle', class: 't-small t-bold', fill: C.accent });
+    }
+
+    const loop = rafLoop(root, (dt) => {
+      if (!active) return;
+      anim = Math.min(1, anim + dt / 1.5);
+      drawDot();
+      if (anim >= 1) active = false;
+    });
+    void loop;
+
+    function render() {
+      clear(svg);
+      const t = TIERS.find((x) => x.id === hitTier)!;
+      const ids = pathFor();
+      text(svg, 20, 24, 'Where the KV cache lives', { class: 't-bold' });
+      text(svg, W - 20, 24, `${t.label} hit · ${t.bw} GB/s effective`, { 'text-anchor': 'end', class: 't-small t-dim' });
+
+      // boxes
+      BOXES.forEach((b) => {
+        const on = ids.includes(b.id);
+        rect(svg, b.x, b.y, BW, BH, on ? C.surface2 : C.surface, { rx: 12, stroke: on ? C.accent : C.border, 'stroke-width': on ? 2 : 1 });
+        rect(svg, b.x, b.y, 4, BH, b.color, { rx: 2 });
+        text(svg, b.x + 14, b.y + 26, b.label, { class: 't-bold', 'font-size': 13 });
+        text(svg, b.x + 14, b.y + 46, b.sub, { class: 't-small t-dim' });
+      });
+
+      // path arrows between consecutive tiers
+      const links: [string, string][] = [['hbm', 'host'], ['host', 'nvme'], ['nvme', 'host'], ['host', 'hbm'], ['host', 'peer'], ['peer', 'host']];
+      for (const [a, b] of links) {
+        const p = center(a), q = center(b);
+        const used = ids.some((id, i) => i < ids.length - 1 && id === a && ids[i + 1] === b);
+        const x1 = p.x + (q.x > p.x ? BW / 2 : -BW / 2), x2 = q.x + (q.x > p.x ? -BW / 2 : BW / 2);
+        s('line', { x1, y1: p.y, x2, y2: q.y, stroke: used ? C.accent : C.borderStrong, 'stroke-width': used ? 2 : 1.2, 'stroke-dasharray': used ? '' : '4 4' }, svg);
+        if (used) s('circle', { cx: (x1 + x2) / 2, cy: p.y, r: 2.5, fill: C.accent }, svg);
+      }
+
+      // dynamic layer last, so the moving dot sits above the boxes and arrows
+      dyn = s('g', {}, svg);
+      const reload = (10 / t.bw) * 1000;
+      st.set('Path', ids.map((id) => BOXES.find((b) => b.id === id)!.label).join(' → '), hitTier === 'host' ? 'primary tier hit' : 'promoted through host');
+      st.set('Tier bandwidth', `${t.bw} GB/s`, 'effective, illustrative');
+      st.set('10 GB reload', fmt.ms(reload), `vs recompute the same prefix`);
+      st.set('What lives there', hitTier === 'host' ? 'evicted KV, LRU/ARC' : hitTier === 'nvme' ? 'cold prefixes' : 'peers and P/D handoffs', hitTier === 'host' ? 'fast, volatile' : hitTier === 'nvme' ? 'durable, slower' : 'network-bound');
+      drawDot();
+    }
+    render();
+  });
+</script>

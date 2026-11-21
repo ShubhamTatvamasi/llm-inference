@@ -1,0 +1,73 @@
+---
+/* Sparse attention, visually: an indexer scores every cached token cheaply, then only
+   the top-k tokens get full attention. The KV cache itself does not shrink. */
+---
+<div data-viz="sparse-picker"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, slider, button, stats, legend, C, fmt, rng } from '../../lib/viz';
+
+  const N = 128, COLS = 32, CELL = 24, GAP = 4;
+  const X = 22, Y = 52, W = 940, H = 224;
+
+  function makeScores(seed: number) {
+    const r = rng(seed);
+    const out = Array.from({ length: N }, () => r() ** 2);
+    for (let i = 0; i < 4; i++) out[i] += 1.1; // attention sinks survive almost any budget
+    const hot = Math.floor(r() * N);
+    for (let i = 0; i < 9; i++) out[(hot + i) % N] += 0.75;
+    return out;
+  }
+
+  mountAll('sparse-picker', (root) => {
+    let k = 16; let seed = 7; let scores = makeScores(seed);
+
+    const bar = ctrlBar(root);
+    const g = group(bar);
+    const kSlider = slider(g, {
+      label: 'Top-k budget', min: 4, max: 96, step: 4, value: k,
+      format: (v) => `${v} tokens`,
+      onInput: (v) => { k = v; render(); },
+    });
+    button(g, 'New query', () => { seed += 1; scores = makeScores(seed); render(); }, { primary: true });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'A strip of 128 cached tokens; the indexer selects the top-k for full attention' });
+    const st = stats(root, ['Selected for attention', 'Attention work', 'Indexer scan', 'KV still stored']);
+    legend(root, [['top-k: full attention', C.token], ['rest: skipped by attention', C.surface3]]);
+    void kSlider;
+
+    function render() {
+      clear(svg);
+      const ranked = [...scores.keys()].sort((a, b) => scores[b] - scores[a]);
+      const top = new Set(ranked.slice(0, k));
+      const maxScore = Math.max(...scores);
+
+      text(svg, X, 24, 'One query · 128 cached tokens', { class: 't-bold' });
+      text(svg, X + (COLS * (CELL + GAP) - GAP), 24, `top-k = ${k}`, { 'text-anchor': 'end', class: 't-mono t-small', fill: C.token });
+
+      for (let i = 0; i < N; i++) {
+        const x = X + (i % COLS) * (CELL + GAP);
+        const y = Y + Math.floor(i / COLS) * (CELL + GAP);
+        const on = top.has(i);
+        const r = rect(svg, x, y, CELL, CELL, on ? C.token : C.surface3, {
+          rx: 3,
+          stroke: on ? C.token : C.border,
+          'stroke-width': on ? 1.5 : 1,
+          'fill-opacity': on ? 0.75 + 0.25 * (scores[i] / maxScore) : 0.9,
+        });
+        s('title', { text: `token ${i + 1} · indexer score ${scores[i].toFixed(2)}${on ? ' · selected' : ''}` }, r);
+      }
+
+      const indexerEq = N / 16;
+      const work = (k + indexerEq) / N;
+      text(svg, X, Y + 4 * (CELL + GAP) + 18, 'The indexer scans all 128 tokens cheaply; full attention runs only on the top-k. The KV cache still holds all 128.', { class: 't-small t-dim' });
+      text(svg, X, Y + 4 * (CELL + GAP) + 36, `Illustrative scores. Indexer ≈ 1/16 of a full score per token → ${fmt.pct(work, 0)} of dense attention work at this k.`, { class: 't-small t-faint' });
+
+      st.set('Selected for attention', `${k} / ${N}`, `${fmt.pct(k / N)} of the cache`, C.token);
+      st.set('Attention work', fmt.pct(work, 0), `vs dense (includes indexer)`);
+      st.set('Indexer scan', `${fmt.num(indexerEq, 0)} eq. scores`, 'all 128 tokens, cheap dot products');
+      st.set('KV still stored', `${N} / ${N}`, 'sparse attention saves compute, not memory', C.kv);
+    }
+    render();
+  });
+</script>

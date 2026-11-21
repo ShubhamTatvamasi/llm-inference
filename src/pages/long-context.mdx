@@ -1,0 +1,141 @@
+---
+layout: ../layouts/Chapter.astro
+title: Long Context & Sparse Attention
+description: Why million-token context is a memory and attention problem, and how MLA, DSA, CSA and HCA change the cost curve of inference.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Sources from '../components/Sources.astro';
+import Q from '../components/Q.astro';
+import LongCtxCost from '../components/viz/LongCtxCost.astro';
+import SparsePicker from '../components/viz/SparsePicker.astro';
+
+A context window is not a free feature. Every extra token has to be **stored** in the KV cache, **read** by every later decode step, and **attended to** during prefill. At 8K tokens those costs are tolerable. At 1M they decide the hardware, the latency SLO and the price per request.
+
+The industry is attacking the problem with two independent levers:
+
+1. **Store less per token**: GQA, MLA, KV quantization, and block compression.
+2. **Read and compute less per query**: sparse attention, where an indexer chooses a small set of keys and the expensive attention runs only on those.
+
+They are easy to confuse. **Sparse attention does not shrink the KV cache.** It cuts attention work and KV reads. Compression shrinks memory. A serious long-context design uses both.
+
+## Two costs that scale differently
+
+For one layer with context length *n*:
+
+- **Prefill** compares every query with every key: *n²* score pairs. Attention becomes a large share of prompt processing at long context, even though the linear projections still matter.
+- **Decode** has one query per step. It compares that query with *n* cached keys, so attention work is *O(n)*, and the bytes read from the KV cache also grow with *n*.
+- **KV capacity** grows with *n* per request. The weights are paid once; the cache is paid per user.
+
+That is why long context hurts different SLOs in different ways. Prefill length drives **TTFT**. KV size caps **concurrency**. Decode attention drives **ITL** and, at large batch, can turn a memory-bound step into a compute-bound one.
+
+<Viz title="KV bytes and attention work at long context" label="Calculator">
+  <LongCtxCost />
+  <Fragment slot="caption">
+    <p>Pick a GQA model and an MLA model and move the context slider. The KV bar is on a log scale because the range is enormous. Then switch on sparse attention: the attention bar falls, but the KV bar does not move. Sparse attention saves compute and KV reads; only compression or lower precision saves capacity.</p>
+  </Fragment>
+</Viz>
+
+## Compress what you store
+
+The first lever is the KV representation. The [attention](../attention/) and [KV cache](../kv-cache/) chapters derive the sizes; the long-context summary is:
+
+| Scheme | What is cached per token | What it buys |
+|---|---|---|
+| MHA | One K and one V per query head | The baseline, and the largest cache |
+| GQA | One K/V per group of query heads | 4–8× smaller cache at almost no quality cost |
+| MQA | One K/V for all query heads | The smallest cache, with a quality risk |
+| MLA | One low-rank latent per layer, plus a small RoPE key | Several times smaller than GQA, reconstructed by up-projections |
+| FP8 / NVFP4 KV | The same entries at lower precision | Roughly 2× / 4× less memory, with accuracy and kernel caveats |
+
+DeepSeek-V2 introduced **multi-head latent attention** (MLA) and DeepSeek-V3 kept it: the cache holds a compressed latent instead of per-head K and V. The up-projections are folded into the surrounding matmuls at inference time. That is a memory win, not a sparsity win: the attention still reads the compressed cache for every key it attends to.
+
+<Callout type="key" title="Compression and sparsity are orthogonal">
+MLA, GQA and FP8 KV change **how many bytes a token costs**. DSA and CSA/HCA change **how many tokens a query reads**. You can use both, and the strongest 2026 models do.
+</Callout>
+
+## Retrieve, then attend
+
+**DeepSeek Sparse Attention** (DSA) adds a small **indexer** in front of attention. For each query, the indexer scores the cached keys cheaply and keeps the top *k* (typically a few thousand). The expensive QKᵀ and softmax then run only over that selected set.
+
+The indexer does not make the scan disappear. It still looks at every key, which is the whole point: without scanning, you cannot know which keys matter. The saving comes from making each indexer score much cheaper than a full attention score. In practice the indexer is a small dot product over a compressed representation, and the selected blocks are attended at full precision.
+
+<Viz title="The indexer selects the top-k tokens" label="Live">
+  <SparsePicker />
+  <Fragment slot="caption">
+    <p>Each square is a cached token. The indexer scores all of them, then only the top <i>k</i> get full attention. Press <b>New query</b> to see the selection move, and lower the budget to watch the attention work fall while the cache stays the same size.</p>
+  </Fragment>
+</Viz>
+
+At long context the indexer and Top-k selection become part of the critical path. NVIDIA's 2026 kernel analysis found the indexer plus Top-k taking **47% of a DeepSeek V3.2 prefill layer at 128K tokens**. That changes the optimisation target: fusing Top-k into the indexer, reusing the previous decode step's selection, and sharing selections across adjacent layers can matter as much as the attention kernel itself.
+
+## Compress, then select: CSA and HCA
+
+DeepSeek-V4 (April 2026) stacks the two ideas. Its **Compressed Sparse Attention** (CSA) first compresses the KV entries of every *m* tokens into one entry, then applies DSA over the compressed entries. **Heavily Compressed Attention** (HCA) compresses even more aggressively, with a much larger *m*. The two are interleaved across layers.
+
+The reported result for DeepSeek-V4-Pro at 1M tokens is **27% of DeepSeek-V3.2's single-token inference FLOPs and 10% of its KV cache**. Those are vendor numbers on a specific model and workload, not a universal constant, but the direction is the point: compression makes the cache smaller, and sparsity makes the remaining attention cheaper.
+
+The same pattern appears across the 2026 frontier: hybrid attention with a cheap selector, a compressed cache and a small full-attention window. The details differ by model; the serving questions do not.
+
+## What this changes in the serving stack
+
+Long context is a system property, not just a kernel choice.
+
+- **Prefill** becomes the dominant TTFT term. [Chunked prefill](../chunked-prefill/) keeps decode streams alive while a long prompt is processed. [Context parallelism](../parallelism/) splits a prompt that does not fit on one device.
+- **Decode** reads the KV cache on every step. Sparse attention reduces the selected reads; [KV offloading](../kv-offload/) can move the cold part of the cache out of HBM. Neither removes the capacity limit by itself.
+- **Disaggregation** becomes more attractive: [prefill and decode](../disaggregation/) have different optimal parallelism when prompts are huge. The KV transfer is larger, so the network and the transfer engine matter more.
+- **Routing and caching** matter more: a long prefix that is already cached is valuable. [Prefix caching](../prefix-caching/) and KV-aware routing should send a follow-up to the replica that already holds the prefix.
+- **Capacity planning** must use the real context distribution, not the advertised maximum. A 1M-token window that is used by 1% of requests can still dominate the memory bill.
+
+The [Inference Lab](../lab/) is the fastest way to see the trade-off: pick a model, raise the prompt length, and watch TTFT, KV memory and concurrency move together.
+
+## How to evaluate a long-context stack
+
+Do not accept a single "1M context" number. Measure the things your users will feel:
+
+1. **Effective context**, not advertised context. Run retrieval and reasoning evals at the target length: RULER, LongBench, needle-in-a-haystack, and a task from your own domain. Accuracy often falls before the window does.
+2. **TTFT and ITL at the target prompt and output lengths**, at p50, p95 and p99. Long prompts change the queueing behaviour, not just the kernel time.
+3. **KV bytes per request** at the real context distribution, including the output tokens, and the concurrency that leaves after the weights and runtime overhead.
+4. **The accuracy of the compressed or sparse path.** Turn the indexer or compression off and compare on your own evals; a small average-score drop can hide a large retrieval failure.
+5. **The cost per successful request**, not tokens per second in isolation. A sparse model that is faster per token but needs more retries is not cheaper.
+
+<Callout type="warn" title="Advertised context is not effective context">
+A model can accept 1M tokens and still be poor at finding a fact at token 900,000. Sparse attention and compression are trained-in approximations; they change what the model can see. Validate on the task, at the length, before you put it in a capacity plan.
+</Callout>
+
+The source list below records the papers and engineering write-ups used for this chapter. Numbers reported by model vendors are labelled as such.
+
+<Sources
+  updated="November 2026"
+  items={[
+    { href: 'https://arxiv.org/abs/2606.19348', title: 'DeepSeek-V4', note: 'CSA/HCA hybrid attention, 1M context and the reported FLOP/KV reductions' },
+    { href: 'https://arxiv.org/abs/2405.04434', title: 'DeepSeek-V2', note: 'multi-head latent attention and the compressed KV cache' },
+    { href: 'https://developer.nvidia.com/blog/co-designing-sparse-attention-for-efficient-long-context-inference/', title: 'Co-designing sparse attention', note: 'indexer and Top-k cost, and the kernel changes that reduce it (2026)' },
+    { href: 'https://arxiv.org/abs/2611.03768', title: 'Multi-layer indexer', note: 'reusing selections across adjacent layers in DeepSeek Sparse Attention (2026)' },
+    { href: 'https://arxiv.org/abs/2404.06654', title: 'RULER', note: 'measuring effective context length beyond a single needle' },
+    { href: 'https://arxiv.org/abs/2308.14508', title: 'LongBench', note: 'long-context tasks for retrieval, summarisation, code and reasoning' },
+    { href: 'https://arxiv.org/abs/2605.19775', title: 'Understanding inference scaling for LLMs', note: 'capacity-bound reasoning workloads and parallelism trade-offs (2026)' },
+  ]}
+/>
+
+<Interview>
+  <Q q="Why does prefill attention scale quadratically while decode attention scales linearly with context?" level="core">
+    Prefill processes all prompt tokens at once, so every query attends to every key: n × n score pairs per layer. Decode processes one new token per step, so its one query attends to n cached keys: n score pairs, plus n KV bytes read. The quadratic term is paid once per prompt; the linear term is paid once per generated token.
+  </Q>
+  <Q q="Does sparse attention reduce KV cache memory? Explain the distinction." level="core">
+    No. The cache still stores K and V (or the MLA latent) for every token, because a future query may select any of them. Sparse attention reduces the number of keys **read and attended to** per query, so it lowers attention compute and KV read traffic. Memory capacity falls only with compression (MLA, GQA, CSA/HCA) or lower-precision KV.
+  </Q>
+  <Q q="What does the indexer do in DSA, and why can it become the bottleneck?" level="mid">
+    It scores every cached key with a cheap dot product, then keeps the top-k for full attention. The scan is deliberate: you cannot know which keys matter without looking. At long context the indexer touches the whole cache on every layer and step, and NVIDIA measured indexer plus Top-k at 47% of a DeepSeek V3.2 prefill layer at 128K. Fusing Top-k, reusing the previous selection and sharing selections across layers reduce that overhead.
+  </Q>
+  <Q q="How do CSA and HCA differ, and why interleave them?" level="mid">
+    CSA compresses every m tokens into one KV entry and then applies sparse attention over the compressed entries. HCA compresses much more aggressively, with a larger m. Interleaving them keeps some layers at higher resolution and others at a much smaller cache, trading detail for memory and compute. The result is a much smaller cache and attention matrix at the cost of an approximation the model must be trained to tolerate.
+  </Q>
+  <Q q="A model vendor claims 1M-token context. What do you measure before capacity planning?" level="senior">
+    Effective retrieval and reasoning accuracy at 1M on RULER, LongBench, needle tasks and a domain task; TTFT and ITL at the real prompt/output mix and at p95/p99; KV bytes per request at the output length; the concurrency left after weights and runtime overhead; and the quality delta with sparse attention or compression disabled. Then convert those into cost per successful request, not tokens per second alone.
+  </Q>
+  <Q q="When would you choose more compression versus more sparsity?" level="senior">
+    Compress when HBM capacity or KV read bytes are the limit: more concurrency, longer contexts, or lower cost per request. Add sparsity when attention compute or KV read time dominates prefill/decode at long context and the model was trained for it. In practice use both, then validate the combination on the task because the errors are not additive in a simple way.
+  </Q>
+</Interview>

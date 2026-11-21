@@ -24,28 +24,28 @@ export const paths: Path[] = [
     title: 'Inference engineer interview',
     who: 'Preparing for an ML systems or inference interview.',
     outcome: 'Reason from first principles about memory, bandwidth and scheduling, and answer the usual follow-up questions.',
-    steps: ['transformer', 'gpu', 'prefill-decode', 'roofline', 'kv-cache', 'batching', 'paged-attention', 'prefix-caching', 'scheduler', 'speculative-decoding', 'quantization', 'parallelism', 'metrics', 'capacity-planning'],
+    steps: ['transformer', 'gpu', 'prefill-decode', 'roofline', 'kv-cache', 'long-context', 'batching', 'paged-attention', 'prefix-caching', 'kv-offload', 'scheduler', 'speculative-decoding', 'quantization', 'parallelism', 'metrics', 'capacity-planning'],
   },
   {
     id: 'platform',
     title: 'Platform and SRE on Kubernetes',
     who: 'You run the cluster and the model servers on it.',
     outcome: 'Size a deployment, get GPUs and weights into pods, pick scaling signals and debug a slow or failing replica.',
-    steps: ['prefill-decode', 'kv-cache', 'batching', 'metrics', 'benchmarking', 'serving-stack', 'routing-autoscaling', 'capacity-planning', 'gpus-on-kubernetes', 'gpu-sharing', 'model-loading', 'observability'],
+    steps: ['prefill-decode', 'kv-cache', 'kv-offload', 'batching', 'metrics', 'benchmarking', 'serving-stack', 'routing-autoscaling', 'capacity-planning', 'gpus-on-kubernetes', 'gpu-sharing', 'model-loading', 'observability'],
   },
   {
     id: 'performance',
     title: 'Performance engineering',
     who: 'You want every last token per second out of the hardware.',
     outcome: 'Read a roofline, find the bottleneck of a decode step and choose between kernels, precision and parallelism to move it.',
-    steps: ['gpu', 'roofline', 'kv-cache', 'flash-attention', 'kernels', 'chunked-prefill', 'quantization', 'speculative-decoding', 'interconnects', 'parallelism', 'moe', 'disaggregation'],
+    steps: ['gpu', 'roofline', 'kv-cache', 'flash-attention', 'kernels', 'chunked-prefill', 'quantization', 'speculative-decoding', 'interconnects', 'parallelism', 'moe', 'disaggregation', 'long-context', 'kv-offload'],
   },
   {
     id: 'apps',
     title: 'Building apps and agents',
     who: 'You call models from a product and want to use them well.',
     outcome: 'Shape prompts for cache hits, constrain outputs, budget for reasoning and tools, and measure what users feel.',
-    steps: ['tokenization', 'sampling', 'prefill-decode', 'prefix-caching', 'structured-output', 'reasoning-agents', 'multimodal', 'embedding-serving', 'metrics', 'quality-safety'],
+    steps: ['tokenization', 'sampling', 'prefill-decode', 'prefix-caching', 'long-context', 'structured-output', 'reasoning-agents', 'multimodal', 'embedding-serving', 'metrics', 'quality-safety'],
   },
 ];
 

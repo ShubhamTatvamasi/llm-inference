@@ -1,0 +1,76 @@
+---
+/* When does reloading a KV prefix from a lower tier beat recomputing it?
+   First-order latency model; the note explains why goodput can still favour offload. */
+---
+<div data-viz="offload-breakeven"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, select, slider, stats, legend, C, fmt } from '../../lib/viz';
+
+  const TIERS = [
+    { id: 'host', label: 'Host DRAM', bw: 50, note: 'primary tier over PCIe / NVLink-C2C' },
+    { id: 'nvme', label: 'Local NVMe', bw: 7, note: 'secondary tier; survives restarts' },
+    { id: 'object', label: 'Object store', bw: 1, note: 'shared and durable, but high latency' },
+    { id: 'peer', label: 'Remote peer (RDMA)', bw: 50, note: 'P2P transfer over RDMA/NIXL' },
+  ] as const;
+
+  const W = 940, H = 250;
+  const ROWS = [
+    { key: 'reload', label: 'Reload from tier', color: C.decode },
+    { key: 'recompute', label: 'Recompute the prefix', color: C.prefill },
+    { key: 'effective', label: 'Effective with hit rate', color: C.kv },
+  ] as const;
+
+  mountAll('offload-breakeven', (root) => {
+    let tier = TIERS[0] as (typeof TIERS)[number];
+    let gb = 10; let recomputeMs = 400; let hit = 70;
+
+    const bar = ctrlBar(root);
+    const g1 = group(bar);
+    select(g1, 'Reload from', TIERS.map((t) => ({ value: t.id, label: t.label })), tier.id, (v) => { tier = TIERS.find((t) => t.id === v)!; render(); });
+    const g2 = group(bar);
+    slider(g2, { label: 'KV to reload', min: 1, max: 128, value: gb, format: (v) => `${v} GB`, onInput: (v) => { gb = v; render(); } });
+    slider(g2, { label: 'Recompute prefix', min: 20, max: 5000, step: 10, value: recomputeMs, format: (v) => `${fmt.int(v)} ms`, onInput: (v) => { recomputeMs = v; render(); } });
+    const g3 = group(bar);
+    slider(g3, { label: 'Cache hit rate', min: 0, max: 100, value: hit, format: (v) => `${v}%`, onInput: (v) => { hit = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Reload time, recompute time and effective time at a chosen hit rate' });
+    const st = stats(root, ['Reload', 'Recompute', 'Effective', 'Latency verdict']);
+    legend(root, ROWS.map((r) => [r.label, r.color] as [string, string]));
+    const note = document.createElement('div');
+    note.className = 'narr';
+    root.appendChild(note);
+
+    function render() {
+      clear(svg);
+      const reload = (gb / tier.bw) * 1000;
+      const effective = (hit / 100) * reload + (1 - hit / 100) * recomputeMs;
+      const values = { reload, recompute: recomputeMs, effective };
+      const max = Math.max(reload, recomputeMs, effective, 1);
+      const X = 200, BW = W - X - 30;
+
+      text(svg, X, 22, `${gb} GB reload vs recompute`, { class: 't-bold' });
+      text(svg, X + BW, 22, `${tier.label}: ${tier.bw} GB/s effective`, { 'text-anchor': 'end', class: 't-small t-dim' });
+
+      ROWS.forEach((r, i) => {
+        const y = 52 + i * 62;
+        const v = values[r.key];
+        text(svg, 18, y + 15, r.label, { class: 't-small t-bold', 'font-size': 12 });
+        rect(svg, X, y, BW, 24, C.surface2, { rx: 5 });
+        rect(svg, X, y, Math.max(3, (v / max) * BW), 24, r.color, { rx: 5 });
+        text(svg, X + BW, y + 16, fmt.ms(v), { 'text-anchor': 'end', class: 't-mono t-small', fill: r.color });
+      });
+
+      const beats = reload < recomputeMs;
+      st.set('Reload', fmt.ms(reload), `${gb} GB at ${tier.bw} GB/s`);
+      st.set('Recompute', fmt.ms(recomputeMs), 'this prefix, on this engine');
+      st.set('Effective', fmt.ms(effective), `${hit}% hit rate`);
+      st.set('Latency verdict', beats ? 'Reload wins' : 'Recompute wins', beats ? 'before counting freed HBM' : 'at this tier and size', beats ? C.good : C.waste);
+
+      note.innerHTML = beats
+        ? `Reloading is <b>${(recomputeMs / reload).toFixed(1)}× faster</b> than recomputing this prefix. Offload wins even at a low hit rate. The freed HBM can also raise concurrency.`
+        : `Recomputing is <b>${(reload / recomputeMs).toFixed(1)}× faster</b> at this tier and size. Offload is still worth testing when a hit avoids a long prefill and frees HBM for more users; compare <b>goodput</b>, not just one request’s latency.`;
+    }
+    render();
+  });
+</script>
