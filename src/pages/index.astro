@@ -53,6 +53,30 @@ const homeTools = [
     body: 'The formulas and figures behind every estimate on the site, on one printable page, each linked to the chapter that derives it.',
     go: 'Open the cheat sheet' },
 ];
+
+// the guided tour is a storyboard over the lifecycle animation, not a separate set of pages
+const tour = [
+  { stage: 'client', title: 'It starts with a request', ch: 'serving-stack', label: 'The serving stack',
+    body: 'The app sends a streaming chat request: messages, sampling settings and stream: true. Everything after this exists to turn that request into a stream of tokens.' },
+  { stage: 'gateway', title: 'Auth, quotas, routing', ch: 'serving-stack', label: 'The serving stack',
+    body: 'The gateway authenticates the caller, enforces per-tenant token limits and picks a model pool. It must pass the stream through without buffering.' },
+  { stage: 'router', title: 'Pick the right replica', ch: 'routing-autoscaling', label: 'Routing & autoscaling',
+    body: 'Round-robin is a poor fit for LLMs. A KV-aware router sends repeat prompts to replicas whose cache already holds the prefix, and steers around overloaded queues.' },
+  { stage: 'tokenizer', title: 'Text becomes token IDs', ch: 'tokenization', label: 'Tokenization',
+    body: 'The tokenizer applies the model’s exact vocabulary and chat template. Token counts, not word counts, set the context limit and the bill.' },
+  { stage: 'scheduler', title: 'Choose the next batch', ch: 'scheduler', label: 'Scheduler & preemption',
+    body: 'The scheduler decides what runs in the next step: prefill work, decode work or both, under a token budget. Continuous batching keeps the GPU busy.' },
+  { stage: 'prefill', title: 'Read the prompt once', ch: 'prefill-decode', label: 'Prefill vs decode',
+    body: 'Prefill processes the whole prompt in one wide, compute-bound pass. Its duration is time to first token.' },
+  { stage: 'decode', title: 'One token per step', ch: 'prefill-decode', label: 'Prefill vs decode',
+    body: 'Decode is memory-bound: every step streams the weights from HBM. Batching amortises that read across many requests.' },
+  { stage: 'kv', title: 'The KV cache remembers', ch: 'kv-cache', label: 'The KV cache',
+    body: 'Keys and values for every past token are kept so decode does not recompute the prompt. Its size, not the weights, often caps concurrency.' },
+  { stage: 'sampler', title: 'Logits become a token', ch: 'sampling', label: 'Logits → next token',
+    body: 'Temperature, top-p, top-k or a grammar mask turn the logits into one token. The token is appended to the sequence and the loop continues.' },
+  { stage: 'detok', title: 'Stream the answer back', ch: 'serving-stack', label: 'The serving stack',
+    body: 'The detokenizer turns IDs into text and streams each chunk over SSE. When the request ends, its KV blocks are freed.' },
+];
 ---
 <Base>
   <main class="home" id="main" tabindex="-1">
@@ -68,6 +92,7 @@ const homeTools = [
         <a class="btn big" href={u('lab/')}>Open the Inference Lab</a>
         <button class="btn big ghost" type="button" data-palette-open><kbd>⌘K</kbd> Search</button>
       </div>
+      <button class="tour-link" type="button" data-tour-start aria-haspopup="dialog" aria-controls="tour">New here? Take the 2-minute tour <span aria-hidden="true">→</span></button>
     </section>
 
     <section class="lifecycle reveal">
@@ -88,7 +113,7 @@ const homeTools = [
       <div class="tool-grid">
         {homeTools.map((t) => (
           <a class="tool" href={t.href} data-spot>
-            <span class="tool-k">{t.k}</span>
+            <span class="tool-k">{t.k}{t.k === 'Review' && <span class="nav-badge" data-due-badge aria-hidden="true" hidden></span>}</span>
             <b>{t.title}</b>
             <span>{t.body}</span>
             <span class="tool-go">{t.go} →</span>
@@ -168,6 +193,34 @@ const homeTools = [
     <footer class="home-foot">Token by Token · LLM inference &amp; serving, visualized</footer>
   </main>
 
+  <div class="tour" id="tour" data-tour role="dialog" aria-modal="false" aria-labelledby="tour-h" hidden>
+    <div class="tour-top">
+      <div>
+        <span class="tour-k">Guided tour · one request</span>
+        <h3 class="tour-h" id="tour-h">A request, step by step</h3>
+      </div>
+      <button class="tour-x" type="button" data-tour-close aria-label="Close tour">×</button>
+    </div>
+    <div class="tour-body" aria-live="polite">
+      {tour.map((s, i) => (
+        <section class="tour-step" data-tour-step={i} data-stage={s.stage} hidden={i !== 0}>
+          <h4>{s.title}</h4>
+          <p>{s.body}</p>
+          <a class="tour-ch" href={chapterUrl(s.ch)}>{s.label} →</a>
+        </section>
+      ))}
+    </div>
+    <div class="tour-foot">
+      <div class="tour-dots">
+        {tour.map((s, i) => (
+          <button class="tour-dot" type="button" data-tour-dot={i} aria-label={`Step ${i + 1}: ${s.title}`} aria-current={i === 0 ? 'step' : undefined}></button>
+        ))}
+      </div>
+      <button class="btn" type="button" data-tour-prev disabled>Back</button>
+      <button class="btn primary" type="button" data-tour-next>Next</button>
+    </div>
+  </div>
+
   <script is:inline type="application/json" id="home-chapters" set:html={JSON.stringify(chapters.map((c) => [c.slug, c.short, chapterUrl(c.slug)]))} />
   <script>
     // returning readers: the main button resumes the chapter they were last on
@@ -194,6 +247,69 @@ const homeTools = [
     });
   </script>
 
+  <script>
+    // guided tour: a storyboard over the lifecycle animation on this page
+    const tourEl = document.querySelector<HTMLElement>('[data-tour]');
+    if (tourEl) {
+      const start = document.querySelector<HTMLButtonElement>('[data-tour-start]');
+      const steps = [...tourEl.querySelectorAll<HTMLElement>('[data-tour-step]')];
+      const dots = [...tourEl.querySelectorAll<HTMLButtonElement>('[data-tour-dot]')];
+      const prev = tourEl.querySelector<HTMLButtonElement>('[data-tour-prev]')!;
+      const next = tourEl.querySelector<HTMLButtonElement>('[data-tour-next]')!;
+      const KEY = 'tbt-tour';
+      let i = 0; let opener: HTMLElement | null = null;
+      const label = () => { if (start) start.innerHTML = 'Replay the 2-minute tour <span aria-hidden="true">→</span>'; };
+      try { if (localStorage.getItem(KEY) === 'done') label(); } catch {}
+      const focus = (stage: string | undefined) => dispatchEvent(new CustomEvent('tbt:tour', { detail: { active: true, stage } }));
+      const reveal = (stage: string | undefined) => {
+        if (!stage) return;
+        const el = document.querySelector<SVGRectElement>(`[data-stage="${stage}"]`);
+        if (!el) return;
+        const r = el.getBoundingClientRect();
+        const panelTop = tourEl.getBoundingClientRect().top;
+        if (r.bottom > panelTop - 16) scrollBy({ top: r.bottom - panelTop + 24, behavior: 'smooth' });
+        else if (r.top < 76) scrollBy({ top: r.top - 88, behavior: 'smooth' });
+      };
+      const show = (n: number) => {
+        i = Math.max(0, Math.min(steps.length - 1, n));
+        steps.forEach((s, j) => { s.hidden = j !== i; });
+        dots.forEach((d, j) => { if (j === i) d.setAttribute('aria-current', 'step'); else d.removeAttribute('aria-current'); });
+        prev.disabled = i === 0;
+        next.textContent = i === steps.length - 1 ? 'Finish' : 'Next';
+        focus(steps[i].dataset.stage);
+        reveal(steps[i].dataset.stage);
+      };
+      const open = () => {
+        opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        tourEl.hidden = false;
+        document.body.classList.add('tour-open');
+        show(0);
+        document.querySelector('.lifecycle')?.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+        next.focus({ preventScroll: true });
+      };
+      const close = (completed = false) => {
+        tourEl.hidden = true;
+        document.body.classList.remove('tour-open');
+        dispatchEvent(new CustomEvent('tbt:tour', { detail: { active: false } }));
+        if (completed) { try { localStorage.setItem(KEY, 'done'); } catch {} label(); }
+        opener?.focus({ preventScroll: true });
+      };
+      start?.addEventListener('click', open);
+      tourEl.querySelector('[data-tour-close]')?.addEventListener('click', () => close(false));
+      prev.addEventListener('click', () => show(i - 1));
+      next.addEventListener('click', () => { if (i === steps.length - 1) close(true); else show(i + 1); });
+      dots.forEach((d, j) => d.addEventListener('click', () => show(j)));
+      addEventListener('keydown', (e) => {
+        if (tourEl.hidden) return;
+        const el = e.target as HTMLElement;
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return;
+        if (e.key === 'Escape') { e.preventDefault(); close(false); }
+        else if (e.key === 'ArrowRight') { e.preventDefault(); if (i === steps.length - 1) close(true); else show(i + 1); }
+        else if (e.key === 'ArrowLeft') { e.preventDefault(); show(i - 1); }
+      });
+    }
+  </script>
+
   <style>
     .home { max-width: 1200px; margin: 0 auto; padding: 0 24px 60px; }
     /* only hide sections when scripting is available to reveal them again; with JS off, the
@@ -206,7 +322,7 @@ const homeTools = [
 
     .hero { position: relative; text-align: center; padding: 72px 0 48px; }
     .hero > :not(.hero-glow) { animation: rise 0.8s cubic-bezier(.2,.7,.2,1) both; }
-    .hero > :nth-child(3) { animation-delay: 0.06s; } .hero > :nth-child(4) { animation-delay: 0.12s; } .hero > :nth-child(5) { animation-delay: 0.18s; }
+    .hero > :nth-child(3) { animation-delay: 0.06s; } .hero > :nth-child(4) { animation-delay: 0.12s; } .hero > :nth-child(5) { animation-delay: 0.18s; } .hero > :nth-child(6) { animation-delay: 0.24s; }
     @keyframes rise { from { opacity: 0; transform: translateY(14px); filter: blur(4px); } }
     .hero-glow { position: absolute; z-index: -1; left: 50%; top: 40px; width: min(820px, 90vw); height: 320px; transform: translateX(-50%); background: radial-gradient(closest-side, rgba(139,124,255,0.28), rgba(34,211,238,0.10) 60%, transparent); filter: blur(30px); pointer-events: none; animation: breathe 8s ease-in-out infinite; }
     @keyframes breathe { 50% { opacity: 0.6; transform: translateX(-50%) scale(1.08); } }
@@ -216,6 +332,9 @@ const homeTools = [
     h1 { font-size: clamp(2.4rem, 6.4vw, 4.6rem); line-height: 1.02; letter-spacing: -0.045em; font-weight: 720; margin: 22px 0 18px; }
     .sub { max-width: 700px; margin: 0 auto; color: var(--text-dim); font-size: clamp(1rem, 1.6vw, 1.16rem); line-height: 1.65; }
     .cta { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-top: 30px; }
+    .tour-link { margin: 16px auto 0; display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; border: 0; border-radius: 8px; background: none; color: var(--link); font: inherit; font-size: 0.9rem; cursor: pointer; }
+    .tour-link:hover { color: var(--text); text-decoration: underline; }
+    .tour-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     .btn.big { padding: 11px 18px; font-size: 0.95rem; border-radius: 12px; }
     .btn.ghost { background: transparent; }
     .btn.ghost kbd { margin-right: 2px; }
@@ -228,6 +347,7 @@ const homeTools = [
     .sec-head p { color: var(--text-dim); margin: 0; }
     section { margin-top: 64px; }
     .hero { margin-top: 0; }
+    .lifecycle { scroll-margin-top: 76px; }
 
     .bento { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; }
     .card { --mx: 50%; --my: 0%; position: relative; grid-column: span 3; /* two parts per row */ padding: 22px 22px 14px; border: 1px solid var(--border); border-radius: 20px; background: var(--surface); overflow: hidden; isolation: isolate; transition: border-color 0.25s, transform 0.25s; }
@@ -262,6 +382,7 @@ const homeTools = [
     .tool:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); transform: translateY(-2px); background-size: auto; }
     .tool:hover::before { opacity: 1; }
     .tool-k { font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent); }
+    .tool-k .nav-badge { margin-left: 7px; vertical-align: middle; }
     .tool b { font-size: 1.15rem; letter-spacing: -0.02em; }
     .tool span:not(.tool-k):not(.tool-go) { color: var(--text-dim); font-size: 0.9rem; line-height: 1.55; flex: 1; }
     .tool-go { color: var(--link); font-size: 0.88rem; font-weight: 560; margin-top: 4px; }
@@ -276,6 +397,30 @@ const homeTools = [
     .feat b { display: block; margin-bottom: 6px; letter-spacing: -0.01em; }
     .feat span { color: var(--text-dim); font-size: 0.88rem; line-height: 1.55; }
     .home-foot { margin-top: 64px; padding-top: 22px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 0.82rem; text-align: center; }
+
+    /* guided tour over the lifecycle: a fixed, non-modal storyboard */
+    .tour { position: fixed; z-index: 90; left: 50%; bottom: 18px; transform: translateX(-50%); width: min(600px, calc(100vw - 32px)); padding: 16px 18px; border: 1px solid var(--border-strong); border-radius: 18px; background: var(--surface-solid); box-shadow: 0 24px 70px -10px rgba(0,0,0,0.6); }
+    .tour[hidden] { display: none; }
+    .tour-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .tour-k { font-family: var(--font-mono); font-size: 0.66rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent); }
+    .tour-h { margin: 3px 0 0; font-size: 1.02rem; letter-spacing: -0.015em; }
+    .tour-x { appearance: none; border: 0; background: none; color: var(--text-faint); font-size: 1.15rem; line-height: 1; padding: 2px 6px; border-radius: 6px; cursor: pointer; }
+    .tour-x:hover { color: var(--text); background: var(--surface-2); }
+    .tour-x:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .tour-body { margin-top: 8px; min-height: 104px; }
+    .tour-step { margin: 0; }
+    .tour-step[hidden] { display: none; }
+    .tour-step h4 { margin: 0 0 4px; font-size: 1rem; letter-spacing: -0.01em; }
+    .tour-step p { margin: 0 0 6px; color: var(--text-dim); font-size: 0.9rem; line-height: 1.5; }
+    .tour-ch { font-size: 0.84rem; }
+    .tour-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    .tour-dots { display: flex; gap: 0; margin-right: auto; }
+    .tour-dot { width: 24px; height: 24px; padding: 0; border: 0; border-radius: 50%; background: none; cursor: pointer; display: grid; place-items: center; }
+    .tour-dot::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--border-strong); }
+    .tour-dot[aria-current='step']::before { background: var(--accent); transform: scale(1.3); }
+    .tour-dot:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .tour-foot .btn { padding: 6px 12px; font-size: 0.82rem; }
+    :global(body.tour-open) { padding-bottom: 240px; }
 
     @media (max-width: 900px) {
       .bento { grid-template-columns: 1fr; }
@@ -292,6 +437,12 @@ const homeTools = [
       .hero { padding: 44px 0 24px; }
       .swatches, .features { grid-template-columns: 1fr; }
       .hpath-grid { grid-template-columns: 1fr; }
+      .tour { bottom: 10px; width: calc(100vw - 24px); padding: 12px 14px; }
+      .tour-foot { display: grid; grid-template-columns: 1fr auto; gap: 6px 8px; }
+      .tour-dots { grid-column: 1 / -1; justify-content: center; margin: 0; }
+      .tour-foot .btn:first-of-type { justify-self: start; }
+      .tour-foot .btn:last-of-type { justify-self: end; }
+      :global(body.tour-open) { padding-bottom: 300px; }
     }
   </style>
 </Base>

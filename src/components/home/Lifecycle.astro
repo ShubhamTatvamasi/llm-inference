@@ -63,7 +63,7 @@ const links = {
     function node(key: string, x: number, y: number, w: number, h: number, title: string, sub: string, color: string) {
       const a = s('a', { href: links[key] ?? '#', class: 'lc-node' }, stat);
       s('title', { text: `${title} — open chapter` }, a);
-      const r = rect(a, x, y, w, h, C.surface2, { rx: 12, stroke: C.border, 'stroke-width': 1.2 });
+      const r = rect(a, x, y, w, h, C.surface2, { rx: 12, stroke: C.border, 'stroke-width': 1.2, 'data-stage': key });
       rect(a, x, y + 10, 3, h - 20, color, { rx: 2 });
       text(a, x + 14, y + 20, title, { class: 't-bold', 'font-size': 13 });
       text(a, x + 14, y + 38, sub, { class: 't-dim', 'font-size': 10.5 });
@@ -77,7 +77,7 @@ const links = {
     text(stat, 351, 144, 'POST /v1/chat/completions', { 'text-anchor': 'middle', class: 't-faint t-mono', 'font-size': 10 });
 
     // client
-    rect(stat, 16, 40, 180, 332, C.surface, { rx: 16, stroke: C.border });
+    stage.client = rect(stat, 16, 40, 180, 332, C.surface, { rx: 16, stroke: C.border, 'data-stage': 'client' });
     text(stat, 32, 62, 'Client', { class: 't-bold', 'font-size': 13 });
     text(stat, 180, 62, 'app / SDK', { class: 't-faint', 'text-anchor': 'end', 'font-size': 10.5 });
     rect(stat, 54, 78, 128, 30, C.accentSoft, { rx: 10 });
@@ -137,6 +137,32 @@ const links = {
     btn.addEventListener('click', () => { paused = !paused; btn.textContent = paused ? 'Play' : 'Pause'; });
     if (reducedMotion()) { paused = true; btn.textContent = 'Play'; t = T.prefill + 5 * T.step; draw(t); }
     void lp;
+
+    // The guided tour pauses the loop and asks for one stage at a time.
+    let tourActive = false; let tourWasPaused = false;
+    function focusStage(key: string) {
+      const r = stage[key];
+      if (!r) return;
+      setActive([key]);
+      const x = Number(r.getAttribute('x') ?? 0) + Number(r.getAttribute('width') ?? 0) / 2;
+      follow(x);
+    }
+    addEventListener('tbt:tour', (ev) => {
+      const d = (ev as CustomEvent<{ active: boolean; stage?: string }>).detail;
+      if (!d) return;
+      if (d.active) {
+        if (!tourActive) { tourWasPaused = paused; tourActive = true; }
+        paused = true; btn.textContent = 'Play';
+        t = T.prefill + 5 * T.step; // a populated frame: token flowing, KV cache warm
+        draw(t);
+        if (d.stage) focusStage(d.stage);
+      } else if (tourActive) {
+        tourActive = false;
+        paused = tourWasPaused;
+        btn.textContent = paused ? 'Play' : 'Pause';
+        if (paused || reducedMotion()) draw(t);
+      }
+    });
 
     function setActive(keys: string[]) {
       for (const [k, r] of Object.entries(stage)) {

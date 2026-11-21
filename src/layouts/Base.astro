@@ -66,8 +66,9 @@ const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×6
         </a>
         <nav class="top-nav" aria-label="Tools">
           {tools.map((t) => (
-            <a href={u(`${t.slug}/`)} class={here === t.slug ? 'on' : ''} aria-current={here === t.slug ? 'page' : undefined} title={t.title}>
+            <a href={u(`${t.slug}/`)} class={here === t.slug ? 'on' : ''} aria-current={here === t.slug ? 'page' : undefined} title={t.title} data-review-link={t.slug === 'review' ? '' : undefined}>
               <Fragment set:html={toolSvg(t)} /><span>{t.label}</span>
+              {t.slug === 'review' && <span class="nav-badge" data-due-badge aria-hidden="true" hidden></span>}
             </a>
           ))}
         </nav>
@@ -110,6 +111,37 @@ const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×6
 
     <script>
       import { loadSearchIndex, searchItems, type SearchItem } from '../lib/search';
+
+      // how many reviewed cards are due today; the review deck keeps its schedule in
+      // localStorage, so a small badge can surface it on every page without a backend
+      const REVIEW_KEY = 'tbt-review';
+      const dueBadges = document.querySelectorAll<HTMLElement>('[data-due-badge]');
+      const today = () => { const d = new Date(); return Math.floor((d.getTime() - d.getTimezoneOffset() * 60000) / 864e5); };
+      const paintDue = () => {
+        let n = 0;
+        try {
+          const prog = JSON.parse(localStorage.getItem(REVIEW_KEY) || '{}') as Record<string, { d?: number }>;
+          const day = today();
+          for (const id in prog) { const d = prog[id]?.d; if (typeof d === 'number' && d <= day) n++; }
+        } catch {}
+        const words = `${n} review card${n === 1 ? '' : 's'} due`;
+        dueBadges.forEach((el) => {
+          el.hidden = n === 0;
+          el.textContent = n > 99 ? '99+' : String(n);
+          el.title = n ? words : '';
+          const link = el.closest<HTMLAnchorElement>('[data-review-link]');
+          if (link) {
+            if (!link.dataset.baseLabel) link.dataset.baseLabel = 'Review';
+            link.setAttribute('aria-label', n ? `${link.dataset.baseLabel}, ${words}` : link.dataset.baseLabel);
+          }
+        });
+      };
+      paintDue();
+      addEventListener('storage', (e) => { if (e.key === REVIEW_KEY) paintDue(); });
+      addEventListener('pageshow', paintDue);
+      addEventListener('tbt:review-saved', paintDue);
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) paintDue(); });
+
       // theme: system | light | dark
       const root = document.documentElement;
       const applyTheme = (mode: string) => {
@@ -232,6 +264,8 @@ const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×6
       .top-nav a:hover { color: var(--text); background: var(--surface-2); }
       .top-nav a.on { color: var(--accent); background: var(--accent-soft); }
       .top-nav svg { width: 16px; height: 16px; flex: none; }
+      .nav-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); font-family: var(--font-mono); font-size: 0.64rem; font-weight: 700; line-height: 1; }
+      .nav-badge[hidden] { display: none; }
       @media (max-width: 1480px) { .search-btn { min-width: 200px; } }
       @media (max-width: 1400px) { .top-nav svg { display: none; } .top-nav a { padding: 0 9px; } .top-nav { margin-left: 10px; padding-left: 10px; } }
       @media (max-width: 1220px) { .search-btn { min-width: 0; width: 36px; padding: 0; justify-content: center; } .sb-label, .sb-kbd { display: none; } }

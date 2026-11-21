@@ -91,7 +91,7 @@ const data = {
     const KEY = 'tbt-review';
     let prog: Prog = {};
     try { prog = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch {}
-    const save = () => { try { localStorage.setItem(KEY, JSON.stringify(prog)); } catch {} };
+    const save = () => { try { localStorage.setItem(KEY, JSON.stringify(prog)); } catch {} dispatchEvent(new Event('tbt:review-saved')); };
     let visited = new Set<string>();
     try { visited = new Set(JSON.parse(localStorage.getItem('tbt-visited') || '[]')); } catch {}
 
