@@ -6,6 +6,7 @@ description: Follow one chat request from the SDK call to the last streamed toke
 import Viz from '../components/Viz.astro';
 import Callout from '../components/Callout.astro';
 import Interview from '../components/Interview.astro';
+import Sources from '../components/Sources.astro';
 import Q from '../components/Q.astro';
 import StackPipeline from '../components/viz/StackPipeline.astro';
 import StackFlags from '../components/viz/StackFlags.astro';
@@ -118,6 +119,17 @@ Operational rules of thumb:
 - Treat a **TP group** (or a multi-node PP group) as **one unit**: if one rank dies, the whole replica is down.
 - Watch **GPU health** through DCGM: Xid errors, ECC errors, thermal throttling.
 - Scale on **queue depth and KV usage**, not CPU or GPU utilization. See [routing & autoscaling](../routing-autoscaling/).
+
+<Sources
+  updated="November 2026"
+  items={[
+    { href: 'https://cloud.google.com/blog/topics/ai-infrastructure/llm-d-1-0-an-open-source-stack-for-distributed-inference', title: 'llm-d 1.0', note: 'cache-aware routing, multi-tenant QoS, tiered KV cache and zero-downtime upgrades (2026)' },
+    { href: 'https://gateway-api-inference-extension.sigs.k8s.io/', title: 'Gateway API Inference Extension', note: 'InferencePool, the Endpoint Picker and inference-aware routing on Kubernetes' },
+    { href: 'https://llm-d.ai/docs/infrastructure/gateway', title: 'llm-d Gateway guide', note: 'Gateway Mode and the supported gateway implementations' },
+    { href: 'https://docs.vllm.ai/', title: 'vLLM documentation', note: 'the engine behind most self-hosted OpenAI-compatible stacks' },
+    { href: 'https://docs.sglang.ai/', title: 'SGLang documentation', note: 'RadixAttention, HiCache and an alternative serving engine' },
+  ]}
+/>
 
 <Interview>
   <Q q="Walk through what happens between a client calling /v1/chat/completions and seeing the first token." level="core">

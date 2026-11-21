@@ -6,6 +6,7 @@ description: The one operation that lets tokens read from each other. Q·Kᵀ, s
 import Viz from '../components/Viz.astro';
 import Callout from '../components/Callout.astro';
 import Interview from '../components/Interview.astro';
+import Sources from '../components/Sources.astro';
 import Q from '../components/Q.astro';
 import AttnSteps from '../components/viz/AttnSteps.astro';
 import AttnHeads from '../components/viz/AttnHeads.astro';
@@ -82,6 +83,17 @@ Attention compares every query with every key, so for a prompt of $n$ tokens the
 </Viz>
 
 During **decode** the picture is different. A single new query reads $n$ keys, so attention cost per step is linear in context length, but those keys have to be **read from memory**. That is why long-context decode is limited by memory bandwidth spent on the KV cache, as the [roofline](../roofline/) chapter shows.
+
+<Sources
+  updated="November 2026"
+  items={[
+    { href: 'https://arxiv.org/abs/1706.03762', title: 'Attention Is All You Need', note: 'the original scaled dot-product attention and multi-head formulation' },
+    { href: 'https://arxiv.org/abs/2205.14135', title: 'FlashAttention', note: 'IO-aware tiling and online softmax without materialising the N×N matrix' },
+    { href: 'https://arxiv.org/abs/2305.13245', title: 'GQA', note: 'grouped-query attention and the KV-cache reduction it buys' },
+    { href: 'https://arxiv.org/abs/2606.19348', title: 'DeepSeek-V4', note: 'CSA/HCA hybrid attention for million-token context (2026)' },
+    { href: 'https://developer.nvidia.com/blog/co-designing-sparse-attention-for-efficient-long-context-inference/', title: 'Co-designing sparse attention', note: 'why the indexer and Top-k dominate long-context decode (2026)' },
+  ]}
+/>
 
 <Interview>
   <Q q="Walk through scaled dot-product attention." level="core">

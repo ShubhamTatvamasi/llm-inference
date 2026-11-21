@@ -13,6 +13,8 @@ const here = Astro.url.pathname.replace(/\/$/, '').split('/').pop();
 const fullTitle = title ? `${title} · ${SITE}` : `${SITE} — LLM inference & serving, visualized`;
 const canonical = new URL(Astro.url.pathname, Astro.site);
 const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×630 social preview card
+// optional, cookie-less analytics; unset in local builds and forks
+const analyticsCode = (import.meta.env.PUBLIC_GOATCOUNTER_CODE ?? '').trim();
 ---
 <!doctype html>
 <html lang="en">
@@ -49,6 +51,9 @@ const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×6
         } catch {}
       })();
     </script>
+    {analyticsCode && (
+      <script is:inline async data-goatcounter={`https://${analyticsCode}.goatcounter.com/count`} src="https://gc.zgo.at/count.js"></script>
+    )}
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
@@ -111,6 +116,7 @@ const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×6
 
     <script>
       import { loadSearchIndex, searchItems, type SearchItem } from '../lib/search';
+      import { track } from '../lib/analytics';
 
       // how many reviewed cards are due today; the review deck keeps its schedule in
       // localStorage, so a small badge can surface it on every page without a backend
@@ -197,6 +203,7 @@ const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×6
       const list = pal.querySelector<HTMLUListElement>('[data-palette-list]')!;
       let items: SearchItem[] | null = null; let failed = false;
       let sel = 0; let shown: SearchItem[] = []; let opener: HTMLElement | null = null;
+      let missTimer: ReturnType<typeof setTimeout> | undefined; let lastMiss = '';
       const esc = (x: string) => x.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
       const mark = () => {
         list.querySelectorAll<HTMLElement>('[role="option"]').forEach((a, i) => { a.classList.toggle('sel', i === sel); a.setAttribute('aria-selected', String(i === sel)); });
@@ -210,7 +217,16 @@ const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×6
         mark();
         list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' });
       };
-      const filter = () => { shown = items ? searchItems(items, input.value) : []; sel = 0; render(); };
+      const filter = () => {
+        shown = items ? searchItems(items, input.value) : []; sel = 0; render();
+        // after a pause, record a query that found nothing (the query is the event title,
+        // capped at 80 chars; see the README for the privacy note)
+        const q = input.value.trim();
+        clearTimeout(missTimer);
+        missTimer = setTimeout(() => {
+          if (items && q.length >= 3 && !shown.length && q !== lastMiss) { lastMiss = q; track('/events/search-miss', q.slice(0, 80)); }
+        }, 900);
+      };
       const ensure = () => {
         if (items) return;
         failed = false;
@@ -220,7 +236,7 @@ const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×6
         opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
         pal.hidden = false; input.value = ''; ensure(); filter(); requestAnimationFrame(() => input.focus());
       };
-      const close = () => { pal.hidden = true; opener?.focus(); opener = null; };
+      const close = () => { clearTimeout(missTimer); pal.hidden = true; opener?.focus(); opener = null; };
       const move = (d: number) => { if (!shown.length) return; sel = (sel + d + shown.length) % shown.length; mark(); list.querySelector('.sel')?.scrollIntoView({ block: 'nearest' }); };
       document.querySelectorAll<HTMLElement>('[data-palette-open]').forEach((b) => {
         b.addEventListener('click', open);

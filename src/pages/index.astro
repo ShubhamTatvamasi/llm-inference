@@ -248,6 +248,7 @@ const tour = [
   </script>
 
   <script>
+    import { track } from '../lib/analytics';
     // guided tour: a storyboard over the lifecycle animation on this page
     const tourEl = document.querySelector<HTMLElement>('[data-tour]');
     if (tourEl) {
@@ -284,6 +285,7 @@ const tour = [
         tourEl.hidden = false;
         document.body.classList.add('tour-open');
         show(0);
+        track('/events/tour-start');
         document.querySelector('.lifecycle')?.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
         next.focus({ preventScroll: true });
       };
@@ -291,7 +293,7 @@ const tour = [
         tourEl.hidden = true;
         document.body.classList.remove('tour-open');
         dispatchEvent(new CustomEvent('tbt:tour', { detail: { active: false } }));
-        if (completed) { try { localStorage.setItem(KEY, 'done'); } catch {} label(); }
+        if (completed) { try { localStorage.setItem(KEY, 'done'); } catch {} label(); track('/events/tour-finish'); }
         opener?.focus({ preventScroll: true });
       };
       start?.addEventListener('click', open);

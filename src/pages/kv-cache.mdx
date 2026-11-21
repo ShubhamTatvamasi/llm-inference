@@ -6,6 +6,7 @@ description: Why every serving engine keeps a KV cache, exactly how big it gets,
 import Viz from '../components/Viz.astro';
 import Callout from '../components/Callout.astro';
 import Interview from '../components/Interview.astro';
+import Sources from '../components/Sources.astro';
 import Q from '../components/Q.astro';
 import KVGrowth from '../components/viz/KVGrowth.astro';
 import KVCalculator from '../components/viz/KVCalculator.astro';
@@ -106,6 +107,16 @@ A serving engine treats the KV cache as **the central resource** to manage:
 <Callout type="tip" title="Rule of thumb">
 Rough decode speed per sequence ≈ memory bandwidth ÷ (weight bytes + this sequence's KV bytes). As contexts grow, reading the KV cache starts to cost as much time as reading the weights.
 </Callout>
+
+<Sources
+  updated="November 2026"
+  items={[
+    { href: 'https://arxiv.org/abs/2309.06180', title: 'PagedAttention', note: 'block tables, prefix sharing and copy-on-write; the design behind vLLM' },
+    { href: 'https://arxiv.org/abs/2405.04434', title: 'DeepSeek-V2', note: 'multi-head latent attention and the compressed KV cache' },
+    { href: 'https://docs.vllm.ai/', title: 'vLLM documentation', note: 'KV cache, prefix caching and offloading in a production engine' },
+    { href: 'https://vllm.ai/blog/2026-09-10-tiered-kv-offloading', title: 'Tiered KV cache offloading', note: 'host, filesystem and peer tiers, and when reloading beats recomputation (2026)' },
+  ]}
+/>
 
 <Interview>
   <Q q="Why do we cache K and V but not Q?" level="core">

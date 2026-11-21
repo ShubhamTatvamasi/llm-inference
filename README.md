@@ -24,6 +24,25 @@ npm test           # invariant tests for the model maths and the hardware data
 npm run check      # after a build: fails on broken links, bad #anchors, duplicate ids, dead search results
 ```
 
+## Analytics (optional)
+
+Analytics uses [GoatCounter](https://www.goatcounter.com/), which is cookie-less and stores no IP addresses. The count script is only rendered when `PUBLIC_GOATCOUNTER_CODE` is set at build time; local builds and forks stay silent.
+
+```bash
+PUBLIC_GOATCOUNTER_CODE=yourcode npm run build
+```
+
+On GitHub, add a repository **variable** named `GOATCOUNTER_CODE` under Settings → Secrets and variables → Actions → Variables. The deploy workflow passes it to the build. Your GoatCounter site then lives at `https://<code>.goatcounter.com`.
+
+Custom events tracked alongside pageviews:
+
+- `/events/search-miss` — a query of 3+ characters that found nothing; the query text is the event title, capped at 80 characters
+- `/events/lab-preset` — a scenario chosen in the Inference Lab
+- `/events/review-session` — a completed spaced-repetition session, with the card count
+- `/events/tour-start` and `/events/tour-finish` — the home guided tour
+
+If you would rather not collect search text, remove the `track('/events/search-miss', …)` call in `src/layouts/Base.astro`.
+
 ## Project layout
 
 ```

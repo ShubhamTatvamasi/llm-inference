@@ -27,6 +27,9 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+        env:
+          # optional: set the GOATCOUNTER_CODE repository variable to enable analytics
+          PUBLIC_GOATCOUNTER_CODE: ${{ vars.GOATCOUNTER_CODE }}
       - name: Check links, anchors and the search index
         run: npm run check
       - uses: actions/upload-pages-artifact@v5

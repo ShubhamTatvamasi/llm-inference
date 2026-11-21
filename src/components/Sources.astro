@@ -1,0 +1,27 @@
+---
+/* A compact, dated reading list at the end of a chapter. Links are external and
+   intentionally not fetched at build time; the "last checked" date records the
+   editorial review, not an automated link check. */
+interface Item { href: string; title: string; note?: string }
+interface Props { updated?: string; items: Item[] }
+const { updated = 'November 2026', items } = Astro.props;
+---
+<section class="sources" aria-labelledby="sources-and-further-reading">
+  <h2 id="sources-and-further-reading">Sources and further reading</h2>
+  <p class="sources-updated">Last checked <time datetime="2026-11-21">{updated}</time>.</p>
+  <ul>
+    {items.map((s) => (
+      <li><a href={s.href}>{s.title}</a>{s.note && <span class="src-note"> — {s.note}</span>}</li>
+    ))}
+  </ul>
+</section>
+
+<style>
+  .sources { margin: 2.2rem 0 0; padding: 1.1rem 1.2rem; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-2); }
+  .sources h2 { margin: 0 0 4px; font-size: 1.12rem; letter-spacing: -0.015em; }
+  .sources-updated { margin: 0 0 8px; color: var(--text-faint); font-size: 0.8rem; }
+  .sources ul { margin: 0; padding-left: 1.15rem; display: grid; gap: 5px; }
+  .sources li { color: var(--text-dim); font-size: 0.9rem; line-height: 1.5; }
+  .sources a { color: var(--link); }
+  .src-note { color: var(--text-dim); }
+</style>

@@ -6,6 +6,7 @@ description: Store and compute with fewer bits. FP8, INT8, INT4 and FP4 explaine
 import Viz from '../components/Viz.astro';
 import Callout from '../components/Callout.astro';
 import Interview from '../components/Interview.astro';
+import Sources from '../components/Sources.astro';
 import Q from '../components/Q.astro';
 import QuantBits from '../components/viz/QuantBits.astro';
 import QuantMatrix from '../components/viz/QuantMatrix.astro';
@@ -93,6 +94,17 @@ Quantization is not just for weights. An **FP8 KV cache** halves the cache's mem
 2. Include the slices most likely to regress: **math and reasoning, code, long context, structured output and tool calls**, and non-English languages.
 3. Watch **output length** too. Quantized models sometimes ramble or stop early, which shifts cost and latency.
 4. Set acceptance thresholds **before** running the evals, and keep the BF16 model deployable for rollback.
+
+<Sources
+  updated="November 2026"
+  items={[
+    { href: 'https://arxiv.org/abs/2209.05433', title: 'FP8 Formats for Deep Learning', note: 'the E4M3/E5M2 formats and their numerical trade-offs' },
+    { href: 'https://arxiv.org/abs/2210.17323', title: 'GPTQ', note: 'one-shot weight quantization with Hessian-based error compensation' },
+    { href: 'https://arxiv.org/abs/2306.00978', title: 'AWQ', note: 'activation-aware weight quantization and per-group scales' },
+    { href: 'https://arxiv.org/abs/2211.10438', title: 'SmoothQuant', note: 'moving activation outliers into the weights for W8A8' },
+    { href: 'https://docs.vllm.ai/', title: 'vLLM documentation', note: 'supported weight and KV-cache quantization formats and kernels' },
+  ]}
+/>
 
 <Interview>
   <Q q="What do the exponent and mantissa bits control in a float format?" level="core">

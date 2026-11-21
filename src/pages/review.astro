@@ -76,6 +76,7 @@ const data = {
 
   <script is:inline type="application/json" id="review-data" set:html={JSON.stringify(data)} />
   <script>
+    import { track } from '../lib/analytics';
     type Card = { i: string; c: string; q: string; l: 'core' | 'mid' | 'senior' };
     type Ch = { s: string; n: string; t: string; p: string; u: string };
     type Prog = Record<string, { b: number; d: number }>;
@@ -132,7 +133,7 @@ const data = {
       return el.innerHTML;
     };
 
-    let queue: Card[] = []; let done = 0; let total = 0; let shown = false; let cur: Card | undefined;
+    let queue: Card[] = []; let done = 0; let total = 0; let shown = false; let cur: Card | undefined; let tracked = false;
     const stats = () => {
       const t = today(); const d = deck();
       let due = 0, fresh = 0, learning = 0, known = 0;
@@ -151,7 +152,7 @@ const data = {
       const due = d.filter((c) => prog[c.i] && prog[c.i].d <= t).sort((a, b) => prog[a.i].d - prog[b.i].d);
       const fresh = d.filter((c) => !prog[c.i]);
       queue = [...due, ...fresh].slice(0, SESSION);
-      done = 0; total = queue.length;
+      done = 0; total = queue.length; tracked = false;
       next();
     };
     const fmtIv = (days: number) => (days <= 0 ? 'in a few cards' : days === 1 ? 'tomorrow' : days < 14 ? `in ${days} days` : `in ${Math.round(days / 7)} weeks`);
@@ -172,6 +173,7 @@ const data = {
             ? `${done ? `You reviewed ${done} card${done > 1 ? 's' : ''}. ` : ''}${more} more ${more > 1 ? 'are' : 'is'} ready in this deck.`
             : `${done ? `You reviewed ${done} card${done > 1 ? 's' : ''}. ` : ''}Every card in this deck is scheduled for a later day. Come back tomorrow, or pick another deck.`;
         $<HTMLButtonElement>('[data-again]').hidden = !more;
+        if (!tracked && done > 0) { tracked = true; track('/events/review-session', `${done} card${done === 1 ? '' : 's'}`); }
         return;
       }
       cardEl.hidden = false; doneEl.hidden = true;

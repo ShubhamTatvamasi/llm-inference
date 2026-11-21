@@ -7,6 +7,7 @@
 <script>
   import { mountAll, svgRoot, s, rect, text, line, clear, h, select, slider, stats, C, fmt, hatchDefs, uniq } from '../../lib/viz';
   import { chapterUrl } from '../../lib/url';
+  import { track } from '../../lib/analytics';
   import { GPUS, MODELS, getGPU, getModel } from '../../data/hardware';
   import { evaluate, sweep, decodeStep, peakFlops, type LabIn } from './labModel';
   import { B_STEPS, P_STEPS, O_STEPS, W_DT, KV_DT, TPS, SLO_STEPS, DEFAULT, EXERCISES, summarize, suggest, bestBatch, toInput, type St } from './labCoach';
@@ -65,7 +66,7 @@
     h('span', { class: 'lab-k', text: 'Try a scenario' }, pre);
     const presetBtns = PRESETS.map((p) => {
       const b = h('button', { type: 'button', class: 'chipbtn', text: p.name }, pre);
-      b.addEventListener('click', () => { st = { ...p.st }; syncControls(); lookEl.innerHTML = `<b>What to notice:</b> ${p.look}`; lookEl.hidden = false; presetBtns.forEach((x) => x.classList.toggle('on', x === b)); update(false); });
+      b.addEventListener('click', () => { st = { ...p.st }; syncControls(); lookEl.innerHTML = `<b>What to notice:</b> ${p.look}`; lookEl.hidden = false; presetBtns.forEach((x) => x.classList.toggle('on', x === b)); update(false); track('/events/lab-preset', p.name); });
       return b;
     });
     const lookEl = h('div', { class: 'lab-look', hidden: true }, root);

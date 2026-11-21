@@ -6,6 +6,7 @@ description: Run prefill and decode on separate GPU pools and ship the KV cache 
 import Viz from '../components/Viz.astro';
 import Callout from '../components/Callout.astro';
 import Interview from '../components/Interview.astro';
+import Sources from '../components/Sources.astro';
 import Q from '../components/Q.astro';
 import DisaggTimeline from '../components/viz/DisaggTimeline.astro';
 import DisaggRatio from '../components/viz/DisaggRatio.astro';
@@ -78,6 +79,17 @@ The transfer path matters a lot:
 <Callout type="warn" title="Common pitfalls">
 Without RDMA, transfers through CPU memory and TCP can cost more than they save. Prefix caching gets harder because each pool keeps its own cache unless the router is aware of both. Failure handling also gets more complex: a decode worker that dies mid-stream loses KV that only it held.
 </Callout>
+
+<Sources
+  updated="November 2026"
+  items={[
+    { href: 'https://arxiv.org/abs/2401.09670', title: 'DistServe', note: 'disaggregating prefill and decode for goodput-optimised serving' },
+    { href: 'https://arxiv.org/abs/2311.18677', title: 'Splitwise', note: 'phase splitting and the machine-cost argument for separate pools' },
+    { href: 'https://arxiv.org/abs/2407.00079', title: 'Mooncake', note: 'KV-cache-centric serving and transfer at Kimi scale' },
+    { href: 'https://docs.vllm.ai/en/stable/features/disagg_prefill/', title: 'vLLM disaggregated prefill', note: 'KV connectors, NIXL and the deployment shape' },
+    { href: 'https://vllm.ai/blog/2026-10-14-nixl-push-connector', title: 'Push-based KV transfer', note: 'moving transfer setup off the time-to-first-token path (2026)' },
+  ]}
+/>
 
 <Interview>
   <Q q="What is disaggregated prefill/decode serving?" level="core">
