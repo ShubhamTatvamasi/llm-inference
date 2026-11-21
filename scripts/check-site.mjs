@@ -5,6 +5,7 @@
      - #anchors that are not on the target page (chapter cross-links, the search index)
      - duplicate ids on a page (an anchor would land on the wrong one)
      - pages without exactly one <h1>, a <title> or a meta description
+     - missing social-card images (og:image / twitter:image), which live in <meta content="…">
    No dependencies: plain Node. */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -43,6 +44,15 @@ for (const [file, { markup, ids }] of pages) {
   const seen = new Set();
   for (const id of ids) { if (seen.has(id)) report(file, `duplicate id="${id}"`); seen.add(id); }
   for (const m of markup.matchAll(/\s(?:href|src)="([^"]*)"/g)) checkLink(file, m[1], url);
+  // social-card images live in <meta content="…"> (og:image / twitter:image), which the href/src
+  // scan above deliberately skips; a missing one would silently ship a broken share card.
+  for (const m of markup.matchAll(/<meta\b[^>]*?(?:property|name)="(?:og:image|twitter:image)"[^>]*?content="([^"]*)"/gi)) {
+    let t;
+    try { t = new URL(decode(m[1]), url); } catch { continue; }
+    if (!t.pathname.startsWith(BASE)) continue;
+    const rel = decodeURIComponent(t.pathname.slice(BASE.length)).replace(/^\/+/, '');
+    if (rel && !fs.existsSync(path.join(dist, rel))) report(file, `broken og/twitter:image "${m[1]}" (no ${rel})`);
+  }
   const h1 = (markup.match(/<h1[\s>]/g) ?? []).length;
   if (h1 !== 1) report(file, `expected exactly one <h1>, found ${h1}`);
   if (!/<title>[^<]+<\/title>/.test(markup)) report(file, 'missing <title>');

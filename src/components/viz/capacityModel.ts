@@ -2,7 +2,7 @@
    Roofline-style estimates: decode reads weights + KV once per step; prefill is compute-bound.
    Efficiency factors are rough; real numbers come from load tests. */
 import { kvBytesPerToken, kvReplication, type GPU, type Model } from '../../data/hardware';
-import { peakFlops, touchedWeightBytes, attnFlopsPerCtx } from '../lab/labModel';
+import { peakFlops, touchedWeightBytes, attnFlopsPerCtx, BW_EFF, FLOP_EFF, STEP_OVERHEAD, MEM_UTIL, runtimeOverhead } from '../lab/labModel';
 
 export interface PlanIn {
   model: Model; gpu: GPU; tp: number;
@@ -15,7 +15,8 @@ export interface PlanIn {
   memUtil?: number;                 // gpu_memory_utilization
 }
 
-const BW_EFF = 0.75, FLOP_EFF = 0.5, OVERHEAD_S = 0.002;
+// same efficiency constants as the Lab (src/components/lab/labModel.ts), imported so the two
+// first-order models cannot drift apart
 
 export function flopsTotal(g: GPU, tp: number, wBytes: number) {
   return peakFlops(g, wBytes) * tp * FLOP_EFF; // same precision → tensor-core rules as the Lab
@@ -28,7 +29,7 @@ export function stepTime(m: Model, g: GPU, tp: number, wBytes: number, kvBytes: 
   const mem = (touchedWeightBytes(m, wBytes, B) + B * ctx * kvBytesPerToken(m, kvBytes) * kvReplication(m, tp)) / bw;
   const comp = (2 * m.activeParams * B + attnFlopsPerCtx(m) * ctx * B) / flopsTotal(g, tp, wBytes);
   const comm = tp > 1 ? 2 * m.layers * 12e-6 * Math.log2(tp) : 0; // two all-reduces per layer
-  return Math.max(mem, comp) + comm + OVERHEAD_S;
+  return Math.max(mem, comp) + comm + STEP_OVERHEAD;
 }
 
 /** Seconds to prefill one prompt (linear matmuls + quadratic attention). */
@@ -41,11 +42,11 @@ export function prefillTime(m: Model, g: GPU, tp: number, wBytes: number, prompt
 }
 
 export function plan(p: PlanIn) {
-  const memUtil = p.memUtil ?? 0.9;
+  const memUtil = p.memUtil ?? MEM_UTIL;
   const totalMem = p.gpu.memGB * 1e9 * p.tp;
   const budget = totalMem * memUtil;
   const weights = p.model.params * p.wBytes;
-  const overhead = Math.max(1.5e9 * p.tp, 0.04 * totalMem);
+  const overhead = runtimeOverhead(totalMem, p.tp);
   const kvAvail = budget - weights - overhead;
   const fits = kvAvail > 0;
   const kvTok = kvBytesPerToken(p.model, p.kvBytes) * kvReplication(p.model, p.tp); // across the TP group

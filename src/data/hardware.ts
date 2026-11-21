@@ -1,37 +1,10 @@
-import { ACCELS, CALC_GPUS } from './accelerators';
+import { type GPU, GPUS, getGPU } from './gpus';
+export { type GPU, GPUS, getGPU };
 
 /* Shared, reusable reference numbers so every chapter quotes the same specs.
-   GPU numbers are spec-sheet peak, DENSE (no 2:4 sparsity). Treat as approximate.
-   Model numbers come from the public model configs. */
-
-export interface GPU {
-  id: string;
-  name: string;
-  memGB: number;        // HBM / VRAM capacity (GB, decimal as marketed)
-  bwTBs: number;        // memory bandwidth TB/s
-  bf16TF: number;       // dense BF16/FP16 tensor TFLOPS
-  fp8TF: number | null; // dense FP8 TFLOPS (null = unsupported)
-  fp4TF: number | null; // dense FP4 TFLOPS
-  int8TOPS: number | null;
-  linkGBs: number;      // GPU↔GPU bandwidth per GPU, GB/s. NVLink/Infinity Fabric: BOTH directions summed
-                        // (H100 900 = 450 each way). PCIe cards: per direction. Halve NVLink for α–β maths.
-  sms: number;          // streaming multiprocessors / compute units
-  l2MB: number;         // last-level on-chip cache (MI300X: 256 MB Infinity Cache; its true L2 is 4 MB per XCD)
-  smemKB: number;       // on-chip shared memory (configurable L1/SMEM) per SM, KB
-  pricePerHr: number;   // rough cloud on-demand USD/GPU-hour (illustrative)
-}
-
-/** The GPUs offered in chapter calculators and the Lab, derived from the full accelerator catalog
-    (src/data/accelerators.ts) so every page quotes the same specs. pricePerHr = midpoint of the
-    catalog's on-demand range. */
-export const GPUS: GPU[] = CALC_GPUS.map(([catalogId, id, name]) => {
-  const a = ACCELS.find((x) => x.id === catalogId)!;
-  return {
-    id, name, memGB: a.memGB, bwTBs: a.bwTBs, bf16TF: a.bf16 ?? 0, fp8TF: a.fp8 ?? null, fp4TF: a.fp4 ?? null,
-    int8TOPS: a.int8 ?? null, linkGBs: a.link?.GBs ?? 32, sms: a.cores ?? 0, l2MB: a.sramMB ?? 0,
-    smemKB: a.smemKB ?? 0, pricePerHr: a.price ? Math.round(((a.price[0] + a.price[1]) / 2) * 100) / 100 : 0,
-  };
-});
+   GPU numbers come from src/data/gpus.ts (the calculator list, in sync with the full catalog in
+   accelerators.ts — verified by test/specs.test.mjs). They are spec-sheet peak, DENSE (no 2:4
+   sparsity). Treat as approximate. Model numbers come from the public model configs. */
 
 export interface Model {
   id: string;
@@ -90,7 +63,6 @@ export const kvBytesPerGpu = (m: Model, tp: number, bytesPerElem = 2) =>
 /** Weight bytes. */
 export const weightBytes = (m: Model, bytesPerParam = 2) => m.params * bytesPerParam;
 
-export const getGPU = (id: string) => GPUS.find((g) => g.id === id)!;
 export const getModel = (id: string) => MODELS.find((m) => m.id === id)!;
 export const GB = 1e9;
 export const GiB = 1024 ** 3;

@@ -11,6 +11,9 @@ export const FLOP_EFF = 0.5;   // achieved / peak tensor FLOPs (MFU)
 export const STEP_OVERHEAD = 0.002; // s per step: scheduler, sampling, launch gaps
 export const MEM_UTIL = 0.9;   // gpu_memory_utilization
 
+/** Rough per-replica runtime overhead (activations, CUDA graphs, workspace). */
+export const runtimeOverhead = (totalMemBytes: number, tp: number) => Math.max(1.5e9 * tp, 0.04 * totalMemBytes);
+
 export interface LabIn {
   model: Model; gpu: GPU; tp: number;
   wBytes: number;   // bytes per weight
@@ -87,7 +90,7 @@ export function memory(p: LabIn) {
   const total = p.gpu.memGB * 1e9 * p.tp;
   const budget = total * MEM_UTIL;
   const weights = p.model.params * p.wBytes;
-  const overhead = Math.max(1.5e9 * p.tp, 0.04 * total); // activations, CUDA graphs, workspace
+  const overhead = runtimeOverhead(total, p.tp); // activations, CUDA graphs, workspace
   const kvAvail = budget - weights - overhead;
   const kvTok = kvBytesPerToken(p.model, p.kvBytes) * kvReplication(p.model, p.tp); // across the TP group
   const perSeq = kvTok * (p.prompt + p.output); // a full-length request's KV

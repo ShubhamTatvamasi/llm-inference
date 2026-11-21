@@ -19,6 +19,8 @@ npm install
 npm run dev        # http://localhost:4321/llm-inference/
 npm run build      # outputs to dist/
 npm run preview
+npm run typecheck  # type-checks the pure-TS core (data, lib, model logic) — TS 7-safe
+npm test           # invariant tests for the model maths and the hardware data
 npm run check      # after a build: fails on broken links, bad #anchors, duplicate ids, dead search results
 ```
 

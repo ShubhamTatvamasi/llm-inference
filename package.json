@@ -8,7 +8,12 @@
     "build": "astro build",
     "preview": "astro preview",
     "check": "node scripts/check-site.mjs",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "test": "node --import ./test/register.mjs --test test/",
     "astro": "astro"
+  },
+  "engines": {
+    "node": ">=24"
   },
   "dependencies": {
     "@astrojs/markdown-remark": "^7.3.5",

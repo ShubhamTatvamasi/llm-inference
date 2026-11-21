@@ -5,7 +5,7 @@
 <div class="lab" data-viz="inference-lab"></div>
 
 <script>
-  import { mountAll, svgRoot, s, rect, text, line, clear, h, select, slider, stats, C, fmt, hatchDefs } from '../../lib/viz';
+  import { mountAll, svgRoot, s, rect, text, line, clear, h, select, slider, stats, C, fmt, hatchDefs, uniq } from '../../lib/viz';
   import { chapterUrl } from '../../lib/url';
   import { GPUS, MODELS, getGPU, getModel } from '../../data/hardware';
   import { evaluate, sweep, decodeStep, peakFlops, type LabIn } from './labModel';
@@ -167,7 +167,7 @@
     h('span', { class: 'lab-note', html: 'First-order model: 75% of peak bandwidth, 50% of peak FLOPs, 2 ms per-step overhead, 90% memory utilisation. Prefill and decode take turns on the GPU, so throughput and cost include the time spent reading prompts. Real engines differ by tens of percent, so use it for intuition and confirm with a <a href="' + chapterUrl('benchmarking') + '">benchmark</a>.' }, share);
     shareBtn.addEventListener('click', async () => { try { await navigator.clipboard.writeText(location.href); shareBtn.textContent = 'Copied ✓'; setTimeout(() => (shareBtn.textContent = 'Copy link to this setup'), 1600); } catch {} });
 
-    const hatch = hatchDefs(svgMem, 'lab-hatch', C.waste);
+    const hatchId = uniq('lh'); const hatch = hatchDefs(svgMem, hatchId, C.waste);
 
     function update(clearPreset = true) {
       if (clearPreset) { presetBtns.forEach((x) => x.classList.remove('on')); lookEl.hidden = true; }
@@ -256,7 +256,7 @@
 
     /* ---- 1 memory ---- */
     function drawMem(inp: LabIn, r: ReturnType<typeof evaluate>, fits: boolean, over: boolean) {
-      clear(svgMem); hatchDefs(svgMem, 'lab-hatch', C.waste);
+      clear(svgMem); hatchDefs(svgMem, hatchId, C.waste);
       const m = r.mem; const X = 14, Wd = 432, Y = 34, Hh = 46;
       const scale = Math.max(m.total, m.weights + m.overhead);
       const px = (b: number) => (b / scale) * Wd;

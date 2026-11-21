@@ -1,0 +1,31 @@
+{
+  /* Focused type-check for the pure-TypeScript core (data + lib + model logic), which the Astro
+     build does not type-check. Run with `npm run typecheck`; wired into CI. The .astro components
+     and the import.meta.glob data files are out of scope here (Astro build + check cover them). */
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["esnext", "dom"],
+    "strict": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "types": [],
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  },
+  "include": [
+    "test/astro-env.d.ts",
+    "src/data/**/*.ts",
+    "src/lib/**/*.ts",
+    "src/components/lab/*.ts",
+    "src/components/hw/*.ts",
+    "src/components/viz/*.ts"
+  ],
+  "exclude": [
+    "src/data/content.ts",
+    "src/data/graph.ts",
+    "src/data/search.ts"
+  ]
+}

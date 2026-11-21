@@ -7,7 +7,8 @@ let pending: Promise<SearchItem[]> | undefined;
 
 export function loadSearchIndex(): Promise<SearchItem[]> {
   const src = document.querySelector<HTMLElement>('[data-search-src]')?.dataset.searchSrc;
-  pending ??= fetch(src!).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`search index: HTTP ${r.status}`))));
+  if (!src) return Promise.reject(new Error('search index: no [data-search-src] element on the page'));
+  pending ??= fetch(src).then((r) => (r.ok ? r.json() : Promise.reject(new Error(`search index: HTTP ${r.status}`))));
   pending.catch(() => { pending = undefined; }); // allow a retry after a network failure
   return pending;
 }
