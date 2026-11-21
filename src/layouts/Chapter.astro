@@ -63,7 +63,7 @@ const shorts = Object.fromEntries(chapters.map((c) => [c.slug, c.short]));
   </Fragment>
   <div class="shell">
     <Sidebar current={slug} />
-    <main class="main" id="main" data-chapter={slug}>
+    <main class="main" id="main" data-chapter={slug} tabindex="-1">
       <article class="prose">
         <header class="ch-head">
           <div class="ch-meta">

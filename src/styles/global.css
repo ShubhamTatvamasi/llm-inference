@@ -16,7 +16,7 @@
   --border-strong: rgba(148, 163, 207, 0.24);
   --text: #eceef6;
   --text-dim: #a3abc2;
-  --text-faint: #6c7591;
+  --text-faint: #7a84a1;
   --accent: #8b7cff;
   --accent-2: #22d3ee;
   --accent-soft: rgba(139, 124, 255, 0.14);
@@ -78,7 +78,7 @@
     --border-strong: rgba(20, 24, 40, 0.18);
     --text: #0d1020;
     --text-dim: #4a5168;
-    --text-faint: #8a91a6;
+    --text-faint: #667085;
     --accent: #5b45f0;
     --accent-2: #0891b2;
     --accent-soft: rgba(91, 69, 240, 0.09);
@@ -125,7 +125,7 @@
     --border-strong: rgba(20, 24, 40, 0.18);
     --text: #0d1020;
     --text-dim: #4a5168;
-    --text-faint: #8a91a6;
+    --text-faint: #667085;
     --accent: #5b45f0;
     --accent-2: #0891b2;
     --accent-soft: rgba(91, 69, 240, 0.09);
@@ -365,7 +365,7 @@ body.viz-full-open { overflow: hidden; }
 
 /* print / save as PDF: content only, on a white page, with every diagram kept whole */
 @media print {
-  :root, :root[data-theme='dark'] { --bg: #fff; --bg-elev: #fff; --surface: #fff; --surface-solid: #fff; --surface-2: #f3f4f8; --surface-3: #e8eaf1; --border: #d5d8e2; --border-strong: #b8bccb; --text: #0d1020; --text-dim: #3c4257; --text-faint: #6c7591; --accent: #4b35e0; --link: #4b35e0; --accent-soft: #eeecff; --shadow: none; color-scheme: light; }
+  :root, :root[data-theme='dark'] { --bg: #fff; --bg-elev: #fff; --surface: #fff; --surface-solid: #fff; --surface-2: #f3f4f8; --surface-3: #e8eaf1; --border: #d5d8e2; --border-strong: #b8bccb; --text: #0d1020; --text-dim: #3c4257; --text-faint: #626b80; --accent: #4b35e0; --link: #4b35e0; --accent-soft: #eeecff; --shadow: none; color-scheme: light; }
   body::before, body::after, .topbar, .progress, .sidebar, .nav-scrim, .toc, .toc-inline, .pager, .conn-map, .skip-link, .palette, .viz-full-btn, .h-anchor, .ctrl, .gl-pop { display: none !important; }
   body { font-size: 11pt; background: #fff; }
   .shell { display: block !important; max-width: none !important; }

@@ -5,6 +5,7 @@ import { chapters, parts } from '../data/chapters';
 import { chapterUrl, u } from '../lib/url';
 import { paths } from '../data/paths';
 import { readingMinutes } from '../data/content';
+import { ACCELS } from '../data/accelerators';
 
 const colours = [
   ['Prefill', 'var(--c-prefill)', 'Processing the prompt: one wide, compute-bound pass'],
@@ -27,9 +28,34 @@ const partIcons: Record<string, string> = {
   beyond: '<path d="M4 5h16v11H9l-5 4z"/><path d="M12 8v5M9.5 10.5h5"/>',
   k8s: '<path d="M12 2.5 20.5 7v10L12 21.5 3.5 17V7z"/><circle cx="12" cy="12" r="2.6"/><path d="M12 5.5v3.9M12 14.6v3.9M6.4 8.8l3.3 1.9M14.3 13.3l3.3 1.9M6.4 15.2l3.3-1.9M14.3 10.7l3.3-1.9"/>',
 };
+// counts in the copy are derived from the data, so adding a chapter, part, tool or accelerator
+// cannot leave the headings and blurbs claiming the old number
+const numWord = (n: number) => ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten', 'Eleven', 'Twelve'][n] ?? String(n);
+const accelCount = ACCELS.length;
+
+const homeTools = [
+  { href: u('lab/'), k: 'Inference Lab', title: 'Turn every knob at once',
+    body: 'Pick a model, GPU and workload. Memory, step time, the roofline, the throughput–latency curve and cost all update together, with a plain-English note on what is limiting you.',
+    go: 'Open the Lab' },
+  { href: u('hardware/'), k: 'Inference Hardware', title: 'Know your silicon',
+    body: 'Every inference GPU and accelerator, from RTX cards to Rubin racks, TPUs and Trainium. Sort, compare, and find the cheapest hardware for your model.',
+    go: 'Browse hardware' },
+  { href: u('map/'), k: 'Concept Map', title: 'See how the ideas connect',
+    body: `All ${chapters.length} chapters and the links between them. Click any topic for the shortest reading path to it.`,
+    go: 'Explore the map' },
+  { href: u('glossary/'), k: 'Glossary', title: 'Never get stuck on a term',
+    body: 'TTFT, GQA, MIG, goodput… Short definitions, also shown on hover inside every chapter.',
+    go: 'Browse terms' },
+  { href: u('review/'), k: 'Review', title: 'Make it stick',
+    body: 'Every chapter’s interview questions as spaced-repetition flashcards. Answer from memory, grade yourself, and hard cards come back sooner.',
+    go: 'Start a session' },
+  { href: u('cheatsheet/'), k: 'Cheat Sheet', title: 'The numbers to remember',
+    body: 'The formulas and figures behind every estimate on the site, on one printable page, each linked to the chapter that derives it.',
+    go: 'Open the cheat sheet' },
+];
 ---
 <Base>
-  <main class="home" id="main">
+  <main class="home" id="main" tabindex="-1">
     <section class="hero">
       <div class="hero-glow" aria-hidden="true"></div>
       <div class="pill"><span class="dot"></span>{chapters.length} chapters · live, interactive diagrams</div>
@@ -56,46 +82,18 @@ const partIcons: Record<string, string> = {
     <section class="tools reveal">
       <div class="sec-head">
         <span class="eyebrow">Learn by doing</span>
-        <h2>Six ways in</h2>
+        <h2>{numWord(homeTools.length)} ways in</h2>
         <p>Experiment first and read later, or the other way round.</p>
       </div>
       <div class="tool-grid">
-        <a class="tool" href={u('lab/')} data-spot>
-          <span class="tool-k">Inference Lab</span>
-          <b>Turn every knob at once</b>
-          <span>Pick a model, GPU and workload. Memory, step time, the roofline, the throughput–latency curve and cost all update together, with a plain-English note on what is limiting you.</span>
-          <span class="tool-go">Open the Lab →</span>
-        </a>
-        <a class="tool" href={u('hardware/')} data-spot>
-          <span class="tool-k">Inference Hardware</span>
-          <b>Know your silicon</b>
-          <span>Every inference GPU and accelerator, from RTX cards to Rubin racks, TPUs and Trainium. Sort, compare, and find the cheapest hardware for your model.</span>
-          <span class="tool-go">Browse hardware →</span>
-        </a>
-        <a class="tool" href={u('map/')} data-spot>
-          <span class="tool-k">Concept Map</span>
-          <b>See how the ideas connect</b>
-          <span>All {chapters.length} chapters and the links between them. Click any topic for the shortest reading path to it.</span>
-          <span class="tool-go">Explore the map →</span>
-        </a>
-        <a class="tool" href={u('glossary/')} data-spot>
-          <span class="tool-k">Glossary</span>
-          <b>Never get stuck on a term</b>
-          <span>TTFT, GQA, MIG, goodput… Short definitions, also shown on hover inside every chapter.</span>
-          <span class="tool-go">Browse terms →</span>
-        </a>
-        <a class="tool" href={u('review/')} data-spot>
-          <span class="tool-k">Review</span>
-          <b>Make it stick</b>
-          <span>Every chapter’s interview questions as spaced-repetition flashcards. Answer from memory, grade yourself, and hard cards come back sooner.</span>
-          <span class="tool-go">Start a session →</span>
-        </a>
-        <a class="tool" href={u('cheatsheet/')} data-spot>
-          <span class="tool-k">Cheat Sheet</span>
-          <b>The numbers to remember</b>
-          <span>The formulas and figures behind every estimate on the site, on one printable page, each linked to the chapter that derives it.</span>
-          <span class="tool-go">Open the cheat sheet →</span>
-        </a>
+        {homeTools.map((t) => (
+          <a class="tool" href={t.href} data-spot>
+            <span class="tool-k">{t.k}</span>
+            <b>{t.title}</b>
+            <span>{t.body}</span>
+            <span class="tool-go">{t.go} →</span>
+          </a>
+        ))}
       </div>
     </section>
 
@@ -122,7 +120,7 @@ const partIcons: Record<string, string> = {
     <section class="parts">
       <div class="sec-head reveal">
         <span class="eyebrow">Curriculum</span>
-        <h2>Eight parts, from a single matmul to a GPU fleet</h2>
+        <h2>{numWord(parts.length)} parts, from a single matmul to a GPU fleet</h2>
         <p>Read it in order or jump around. Every chapter has live diagrams and ends with interview-style questions.</p>
       </div>
       <div class="bento">
@@ -162,7 +160,7 @@ const partIcons: Record<string, string> = {
 
     <section class="features reveal">
       <div class="feat"><b>Live, not static</b><span>Play, pause, step and scrub every simulation, or change the inputs and watch the result update.</span></div>
-      <div class="feat"><b>Real numbers</b><span>Calculators use real model configs (Llama, Qwen, DeepSeek, Mixtral) and real specs for 76 accelerators, from RTX cards and Apple silicon to MI355X, TPUs and Rubin.</span></div>
+      <div class="feat"><b>Real numbers</b><span>Calculators use real model configs (Llama, Qwen, DeepSeek, Mixtral) and real specs for {accelCount} accelerators, from RTX cards and Apple silicon to MI355X, TPUs and Rubin.</span></div>
       <div class="feat"><b>Interview-ready</b><span>Each chapter closes with core, mid and senior-level questions you can try before revealing the answer.</span></div>
       <div class="feat"><b>Keyboard-first</b><span><kbd>⌘K</kbd> or <kbd>/</kbd> to search, <kbd>[</kbd> and <kbd>]</kbd> for the previous and next chapter.</span></div>
     </section>
@@ -198,9 +196,13 @@ const partIcons: Record<string, string> = {
 
   <style>
     .home { max-width: 1200px; margin: 0 auto; padding: 0 24px 60px; }
-    .reveal { opacity: 0; transform: translateY(18px); transition: opacity 0.7s cubic-bezier(.2,.7,.2,1), transform 0.7s cubic-bezier(.2,.7,.2,1); }
-    .reveal.in { opacity: 1; transform: none; }
-    @media (prefers-reduced-motion: reduce) { .reveal { opacity: 1; transform: none; transition: none; } }
+    /* only hide sections when scripting is available to reveal them again; with JS off, the
+       content stays visible instead of leaving large blank gaps */
+    @media (scripting: enabled) {
+      .reveal { opacity: 0; transform: translateY(18px); transition: opacity 0.7s cubic-bezier(.2,.7,.2,1), transform 0.7s cubic-bezier(.2,.7,.2,1); }
+      .reveal.in { opacity: 1; transform: none; }
+    }
+    @media (scripting: enabled) and (prefers-reduced-motion: reduce) { .reveal { opacity: 1; transform: none; transition: none; } }
 
     .hero { position: relative; text-align: center; padding: 72px 0 48px; }
     .hero > :not(.hero-glow) { animation: rise 0.8s cubic-bezier(.2,.7,.2,1) both; }
@@ -248,13 +250,13 @@ const partIcons: Record<string, string> = {
     .card-list a:hover .arr { opacity: 1; transform: none; color: var(--accent); }
 
     .tool-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
-    .hpath-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+    .hpath-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
     .hpath { display: flex; flex-direction: column; gap: 5px; padding: 16px 18px; border-radius: 16px; border: 1px solid var(--border); background: var(--surface); color: var(--text); transition: border-color 0.25s, transform 0.25s; }
     .hpath:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); transform: translateY(-2px); background-size: 0 0; }
     .hpath b { font-size: 1.02rem; letter-spacing: -0.015em; }
     .hpath span { color: var(--text-dim); font-size: 0.88rem; line-height: 1.5; flex: 1; }
     .hpath .hpath-m { flex: none; font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-faint); margin-top: 4px; }
-    @media (max-width: 1180px) { .tool-grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 1180px) { .tool-grid { grid-template-columns: repeat(2, 1fr); } .hpath-grid { grid-template-columns: repeat(3, 1fr); } }
     .tool { --mx: 50%; --my: 0%; position: relative; display: flex; flex-direction: column; gap: 6px; padding: 20px; border-radius: 18px; border: 1px solid var(--border); background: var(--surface); color: var(--text); overflow: hidden; isolation: isolate; transition: border-color 0.25s, transform 0.25s; }
     .tool::before { content: ''; position: absolute; inset: 0; z-index: -1; background: radial-gradient(360px circle at var(--mx) var(--my), var(--accent-soft), transparent 60%); opacity: 0; transition: opacity 0.3s; }
     .tool:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); transform: translateY(-2px); background-size: auto; }
@@ -281,11 +283,15 @@ const partIcons: Record<string, string> = {
       .swatches { grid-template-columns: 1fr 1fr; }
       .features { grid-template-columns: 1fr 1fr; }
       .tool-grid { grid-template-columns: 1fr; }
+      .hpath-grid { grid-template-columns: 1fr 1fr; }
+      /* five paths in two columns: let the odd one out span the row instead of trailing alone */
+      .hpath:last-child:nth-child(odd) { grid-column: 1 / -1; }
     }
     @media (max-width: 560px) {
       .home { padding: 0 16px 40px; }
       .hero { padding: 44px 0 24px; }
       .swatches, .features { grid-template-columns: 1fr; }
+      .hpath-grid { grid-template-columns: 1fr; }
     }
   </style>
 </Base>

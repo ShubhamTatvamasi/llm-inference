@@ -47,7 +47,9 @@ const links = {
   mountAll('lifecycle', (root) => {
     const links = JSON.parse(root.dataset.links || '{}') as Record<string, string>;
     const hud = (k: string) => root.closest('.lc-wrap')!.querySelector<HTMLElement>(`[data-hud="${k}"]`)!;
-    const svg = svgRoot(root, W, H, { 'aria-label': 'Animated lifecycle of one LLM request from client to GPU and back' });
+    // role="group", not the svgRoot default "img": the stages are links, and role="img"
+    // would hide them from screen readers and keyboard navigation
+    const svg = svgRoot(root, W, H, { role: 'group', 'aria-label': 'Animated lifecycle of one LLM request from client to GPU and back' });
     const defs = s('defs', {}, svg);
     const glow = s('filter', { id: 'lc-glow', x: '-50%', y: '-50%', width: '200%', height: '200%' }, defs);
     s('feGaussianBlur', { stdDeviation: 4, result: 'b' }, glow);
@@ -229,6 +231,8 @@ const links = {
   .lc :global(.t-mono) { font-family: var(--font-mono); }
   .lc :global(.lc-node) { cursor: pointer; }
   .lc :global(.lc-node:hover rect:first-of-type) { fill: var(--surface-3); }
+  .lc :global(.lc-node:focus-visible) { outline: none; }
+  .lc :global(.lc-node:focus-visible rect:first-of-type) { stroke: var(--accent); stroke-width: 2.4; }
   .lc-hud { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 22px; padding: 12px 20px 14px; border-top: 1px solid var(--border); background: color-mix(in srgb, var(--surface-2) 55%, transparent); }
   .hud-item { display: flex; flex-direction: column; min-width: 92px; }
   .hud-k { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-faint); font-weight: 600; }
