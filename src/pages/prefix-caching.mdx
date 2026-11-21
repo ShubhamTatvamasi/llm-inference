@@ -61,7 +61,7 @@ SGLang's **RadixAttention** organizes cached prefixes as a **radix tree** (a com
 
 The two engines' approaches converge in practice:
 
-| | vLLM automatic prefix caching | SGLang RadixAttention |
+| Aspect | vLLM automatic prefix caching | SGLang RadixAttention |
 |---|---|---|
 | Index | Hash table of full-block hashes | Radix tree over token sequences |
 | Granularity | Full blocks (e.g. 16 tokens) | Token-level edges (page-aligned in practice) |

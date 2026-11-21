@@ -65,7 +65,8 @@
     button(bar, 'Send request', () => start(), { primary: true, icon: 'play' });
     const cancelBtn = button(bar, 'Cancel (client disconnects)', () => cancel());
 
-    const svg = svgRoot(root, W, H, { 'aria-label': 'Request lifecycle through the serving stack' });
+    // group, not "img": each stage is a focusable button inside the drawing
+    const svg = svgRoot(root, W, H, { role: 'group', 'aria-label': 'Request lifecycle through the serving stack' });
     const say = narration(root);
     const wire = h('div', { class: 'sp-wire' }, root);
     const wireL = h('div', { class: 'sp-box' }, wire);
@@ -104,7 +105,9 @@
     text(gStatic, 30, H - 14, 'Click any stage for details.', { class: 't-small t-faint' });
     const nodes = STAGES.map((st, i) => {
       const x = nx(i);
-      const grp = s('g', { style: 'cursor:pointer', tabindex: 0, role: 'button', 'aria-label': `${st.name}: show details` }, gStatic);
+      // the visual text stays outside the focus target; a transparent rect on top carries the
+      // button role and name, so the name is not compared against the SVG text inside it
+      const grp = s('g', { style: 'cursor:pointer' }, gStatic);
       const pick = () => { sel = st.id; showDetails(); };
       grp.addEventListener('click', pick);
       grp.addEventListener('keydown', (e) => { const k = (e as KeyboardEvent).key; if (k === 'Enter' || k === ' ') { e.preventDefault(); pick(); } });
@@ -114,6 +117,7 @@
       text(grp, x + NW / 2 + 2, NY + 26, st.name, { 'text-anchor': 'middle', class: 't-bold', 'font-size': 12.5 });
       text(grp, x + NW / 2 + 2, NY + 46, st.sub, { 'text-anchor': 'middle', class: 't-small t-dim' });
       text(grp, x + NW / 2 + 2, NY + 62, `${i + 1}`, { 'text-anchor': 'middle', class: 't-small t-faint t-mono' });
+      rect(grp, x, NY, NW, NH, 'transparent', { rx: 12, class: 'sp-hit', tabindex: 0, role: 'button', 'aria-label': `${st.name}, ${st.sub}, stage ${i + 1}: show details` });
       return { ring, box };
     });
 
@@ -218,5 +222,7 @@
   .sp-dot { width: 10px; height: 10px; border-radius: 3px; }
   .sp-dsub { color: var(--text-faint); font-size: 0.8rem; }
   .sp-links { font-size: 0.85rem; color: var(--text-faint); }
+  :global(.sp-hit) { outline: none; }
+  :global(.sp-hit:focus-visible) { stroke: var(--accent); stroke-width: 2.5; }
   @media (max-width: 640px) { .sp-wire { grid-template-columns: 1fr; } }
 </style>

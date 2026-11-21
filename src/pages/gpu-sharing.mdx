@@ -94,7 +94,7 @@ Two consequences matter in practice. First, `--gpu-memory-utilization` on a MIG 
 
 ## Choosing a mechanism
 
-| | Time-slicing | MPS | MIG | vGPU |
+| Aspect | Time-slicing | MPS | MIG | vGPU |
 |---|---|---|---|---|
 | Concurrency | Takes turns | Concurrent kernels | Parallel, partitioned | Takes turns (or MIG-backed) |
 | Memory isolation | None | Per-client limit | Hardware | Per-VM framebuffer |

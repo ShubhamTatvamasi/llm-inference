@@ -27,7 +27,7 @@ const data = {
       <span class="cm-hint">Tip: hover to preview, click to pin.</span>
     </div>
     <aside class="cm-card" data-cm-card aria-live="polite"></aside>
-    <div class="cm-scroll"><svg class="cm-svg" data-cm-svg role="img" aria-label="Concept map of chapters"></svg></div>
+    <div class="cm-scroll"><svg class="cm-svg" data-cm-svg role="group" aria-label="Concept map of chapters"></svg></div>
   </div>
   <script is:inline type="application/json" id="cmap-data" set:html={JSON.stringify(data)} />
 
@@ -86,11 +86,16 @@ const data = {
     const edgeEls = D.edges.map((e) => ({ e, el: s('path', { d: edgePath(e.from, e.to), class: 'cm-e', 'stroke-width': Math.min(3.2, 0.8 + e.weight * 0.45) }, eg) }));
     const nodeEls = D.nodes.map((n) => {
       const p = pos.get(n.slug)!;
-      const g = s('g', { class: 'cm-n', tabindex: 0, role: 'button', 'aria-label': `${n.n}. ${n.title}` }, svg);
+      // the visual text stays outside the focus target so the button's accessible name is not
+      // compared against SVG text; a transparent rect on top handles pointer and keyboard input
+      const num = String(n.n).padStart(2, '0');
+      const short = n.short.length > 19 ? n.short.slice(0, 18) + '…' : n.short;
+      const g = s('g', { class: 'cm-n' }, svg);
       s('rect', { x: p.x, y: p.y, width: NW, height: NH, rx: 10 }, g);
-      s('text', { x: p.x + 10, y: p.y + 17, text: String(n.n).padStart(2, '0'), class: 'cm-num' }, g);
-      s('text', { x: p.x + 10, y: p.y + 34, text: n.short.length > 19 ? n.short.slice(0, 18) + '…' : n.short, class: 'cm-label' }, g);
+      s('text', { x: p.x + 10, y: p.y + 17, text: num, class: 'cm-num' }, g);
+      s('text', { x: p.x + 10, y: p.y + 34, text: short, class: 'cm-label' }, g);
       const step = s('text', { x: p.x + NW - 10, y: p.y + 17, class: 'cm-step', 'text-anchor': 'end' }, g);
+      s('rect', { x: p.x, y: p.y, width: NW, height: NH, rx: 10, class: 'cm-hit', fill: 'transparent', tabindex: 0, role: 'button', 'aria-label': `${num} ${short} — ${n.title}, open chapter` }, g);
       if (seen.has(n.slug)) s('circle', { cx: p.x + NW - 9, cy: p.y + NH - 10, r: 3.5, class: 'cm-seen' }, g);
       g.addEventListener('mouseenter', () => { if (!pinned) { render(n.slug); showCard(n.slug); } });
       g.addEventListener('mouseleave', () => { if (!pinned) { render(null); showCard(null); } });
@@ -164,13 +169,15 @@ const data = {
     .cm-svg :global(.cm-e.dim) { opacity: 0.12; }
     .cm-svg :global(.cm-e.on.pre) { stroke: var(--c-prefill); opacity: 0.95; }
     .cm-svg :global(.cm-e.on.post) { stroke: var(--c-decode); opacity: 0.95; }
-    .cm-svg :global(.cm-n) { cursor: pointer; outline: none; }
-    .cm-svg :global(.cm-n rect) { fill: var(--surface-2); stroke: var(--border-strong); transition: all 0.2s; }
-    .cm-svg :global(.cm-n:hover rect), .cm-svg :global(.cm-n:focus-visible rect) { stroke: var(--accent); }
-    .cm-svg :global(.cm-n.focus rect) { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
-    .cm-svg :global(.cm-n.pre rect) { stroke: var(--c-prefill); fill: var(--c-prefill-soft); }
-    .cm-svg :global(.cm-n.post rect) { stroke: var(--c-decode); fill: var(--c-decode-soft); }
+    .cm-svg :global(.cm-n) { cursor: pointer; }
+    .cm-svg :global(.cm-n rect:not(.cm-hit)) { fill: var(--surface-2); stroke: var(--border-strong); transition: all 0.2s; }
+    .cm-svg :global(.cm-n:hover rect:not(.cm-hit)), .cm-svg :global(.cm-n:focus-within rect:not(.cm-hit)) { stroke: var(--accent); }
+    .cm-svg :global(.cm-n.focus rect:not(.cm-hit)) { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+    .cm-svg :global(.cm-n.pre rect:not(.cm-hit)) { stroke: var(--c-prefill); fill: var(--c-prefill-soft); }
+    .cm-svg :global(.cm-n.post rect:not(.cm-hit)) { stroke: var(--c-decode); fill: var(--c-decode-soft); }
     .cm-svg :global(.cm-n.dim) { opacity: 0.35; }
+    .cm-svg :global(.cm-n rect.cm-hit) { fill: transparent; stroke: none; outline: none; }
+    .cm-svg :global(.cm-n rect.cm-hit:focus-visible) { stroke: var(--accent); stroke-width: 2.5; }
     .cm-svg :global(.cm-num) { font-family: var(--font-mono); font-size: 10px; fill: var(--text-faint); }
     .cm-svg :global(.cm-label) { font-size: 12.5px; font-weight: 600; fill: var(--text); }
     .cm-svg :global(.cm-step) { font-family: var(--font-mono); font-size: 10px; font-weight: 700; fill: var(--c-prefill); }

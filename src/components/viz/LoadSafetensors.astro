@@ -55,7 +55,7 @@
     const bar = ctrlBar(root);
     segmented(bar, [{ value: 'st', label: 'model.safetensors' }, { value: 'pk', label: 'pytorch_model.bin (pickle)' }], mode, (v) => { mode = v as 'st' | 'pk'; render(); });
     segmented(bar, [1, 2, 4, 8].map((n) => ({ value: String(n), label: `TP ${n}` })), String(tp), (v) => { tp = Number(v); render(); });
-    const svg = svgRoot(root, W, H, { 'aria-label': 'Byte layout of a safetensors file and the slices each tensor-parallel rank reads' });
+    const svg = svgRoot(root, W, H, { role: 'group', 'aria-label': 'Byte layout of a safetensors file and the slices each tensor-parallel rank reads' });
     const st = stats(root, ['Selected tensor', 'Absolute byte range', 'Each rank reads', 'Header']);
     const say = narration(root);
 

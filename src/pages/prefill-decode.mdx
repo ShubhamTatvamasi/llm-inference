@@ -52,7 +52,7 @@ $$
 \text{Arithmetic intensity} = \frac{2 N d^2}{2 d^2 + 4 N d} \;\approx\; N \quad (\text{when } N \ll d)
 $$
 
-| | Prefill | Decode |
+| Aspect | Prefill | Decode |
 |---|---|---|
 | Tokens per forward pass | the whole prompt (hundreds to thousands) | 1 per sequence |
 | Bottleneck | <span class="chip compute">compute</span> (tensor-core FLOPs) | <span class="chip weight">memory bandwidth</span> (bytes from HBM) |

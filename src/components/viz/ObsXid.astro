@@ -30,7 +30,7 @@
 
   mountAll('obs-xid', (root) => {
     let sel = XIDS.findIndex((x) => x.code === '79');
-    const svg = svgRoot(root, W, H, { 'aria-label': 'Xid codes with their likely cause, blast radius and action' });
+    const svg = svgRoot(root, W, H, { role: 'group', 'aria-label': 'Xid codes with their likely cause, blast radius and action' });
     const st = stats(root, ['Xid', 'Usually', 'Blast radius']);
     const say = narration(root);
 

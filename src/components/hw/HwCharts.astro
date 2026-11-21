@@ -100,7 +100,8 @@ const { kind } = Astro.props;
     const W = 900, H = 520, L = 62, R = 20, T = 18, B = 50;
     legendBar(root, hidden, draw);
     const wrap = h('div', { class: 'hwch-plot' }, root);
-    const svg = svgRoot(wrap, W, H, { 'aria-label': 'Memory capacity versus memory bandwidth for every accelerator' });
+    // group: the points are focusable buttons that open the spec sheet
+    const svg = svgRoot(wrap, W, H, { role: 'group', 'aria-label': 'Memory capacity versus memory bandwidth for every accelerator' });
     const tip = tooltip(wrap);
     const xMin = log(0.1), xMax = log(40000), yMin = log(0.1), yMax = log(2000);
     const X = (v: number) => L + ((log(v) - xMin) / (xMax - xMin)) * (W - L - R);
@@ -140,7 +141,7 @@ const { kind } = Astro.props;
     segmented(top, [{ value: 'low', label: 'Fastest precision (FP8/FP4)' }, { value: 'bf16', label: 'BF16 only' }], mode, (v) => { mode = v as typeof mode; draw(); });
     legendBar(top, hidden, draw);
     const wrap = h('div', { class: 'hwch-plot' }, root);
-    const svg = svgRoot(wrap, W, H, { 'aria-label': 'Ridge point (FLOPs per byte) by release year' });
+    const svg = svgRoot(wrap, W, H, { role: 'group', 'aria-label': 'Ridge point (FLOPs per byte) by release year' });
     const tip = tooltip(wrap);
     const years = ACCELS.map((a) => a.year);
     const x0 = Math.min(...years) - 0.5, x1 = Math.max(...years) + 0.7;

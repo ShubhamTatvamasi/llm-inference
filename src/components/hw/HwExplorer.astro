@@ -75,14 +75,16 @@
     const bar = h('div', { class: 'hwx-bar' }, root);
     const g1 = h('div', { class: 'hwx-row' }, bar);
     segmented(g1, [{ value: 'all', label: 'All' }, ...(Object.keys(GROUP_LABEL) as Group[]).map((g) => ({ value: g, label: GROUP_LABEL[g] }))], st.grp, (v) => { st.grp = v as typeof st.grp; render(); });
-    select(g1, '', [{ value: 'all', label: 'Every segment' }, ...(Object.keys(SEGMENT_LABEL) as Segment[]).map((s) => ({ value: s, label: SEGMENT_LABEL[s] }))], st.seg, (v) => { st.seg = v as typeof st.seg; render(); });
+    const segSel = select(g1, '', [{ value: 'all', label: 'Every segment' }, ...(Object.keys(SEGMENT_LABEL) as Segment[]).map((s) => ({ value: s, label: SEGMENT_LABEL[s] }))], st.seg, (v) => { st.seg = v as typeof st.seg; render(); });
+    segSel.setAttribute('aria-label', 'Filter by segment');
     checkbox(g1, 'Previous generations', st.prev, (v) => { st.prev = v; render(); });
     const search = h('input', { class: 'text-input hwx-q', type: 'search', placeholder: 'Search: “hbm3e”, “nvl72”, “tpu”…', 'aria-label': 'Search accelerators' }, g1) as HTMLInputElement;
     search.addEventListener('input', () => { st.q = search.value.trim().toLowerCase(); render(); });
 
     const g2 = h('div', { class: 'hwx-row hwx-model' }, bar);
     h('span', { class: 'hwx-k', text: 'Decode ceiling for' }, g2);
-    select(g2, '', MODELS.map((m) => ({ value: m.id, label: m.name })), st.m, (v) => { st.m = v; persist(); render(); });
+    const modelSel = select(g2, '', MODELS.map((m) => ({ value: m.id, label: m.name })), st.m, (v) => { st.m = v; persist(); render(); });
+    modelSel.setAttribute('aria-label', 'Model for the decode ceiling');
     segmented(g2, PREC.map(({ value, label }) => ({ value, label })), st.p, (v) => { st.p = v as Prec; persist(); render(); });
 
     const count = h('div', { class: 'hwx-count' }, root);
@@ -131,7 +133,7 @@
       });
       const tb = h('tbody', {}, table);
       for (const a of list) {
-        const r = h('tr', { class: a.id === st.sel ? 'on' : '', tabindex: 0, 'data-id': a.id }, tb);
+        const r = h('tr', { class: a.id === st.sel ? 'on' : '', tabindex: 0, 'data-id': a.id, 'aria-label': `Open ${a.name} spec sheet` }, tb);
         const cc = h('td', { class: 'hwx-c' }, r);
         const cb = h('input', { type: 'checkbox', checked: st.cmp.includes(a.id), 'aria-label': `Compare ${a.name}`, disabled: !st.cmp.includes(a.id) && st.cmp.length >= 4 }, cc) as HTMLInputElement;
         cb.addEventListener('click', (e) => e.stopPropagation());
