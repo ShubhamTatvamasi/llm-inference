@@ -203,7 +203,7 @@ const tour = [
     </div>
     <div class="tour-body" aria-live="polite">
       {tour.map((s, i) => (
-        <section class="tour-step" data-tour-step={i} data-stage={s.stage} hidden={i !== 0}>
+        <section class="tour-step" data-tour-step={i} data-tour-stage={s.stage} hidden={i !== 0}>
           <h4>{s.title}</h4>
           <p>{s.body}</p>
           <a class="tour-ch" href={chapterUrl(s.ch)}>{s.label} →</a>
@@ -276,8 +276,8 @@ const tour = [
         dots.forEach((d, j) => { if (j === i) d.setAttribute('aria-current', 'step'); else d.removeAttribute('aria-current'); });
         prev.disabled = i === 0;
         next.textContent = i === steps.length - 1 ? 'Finish' : 'Next';
-        focus(steps[i].dataset.stage);
-        reveal(steps[i].dataset.stage);
+        focus(steps[i].dataset.tourStage);
+        reveal(steps[i].dataset.tourStage);
       };
       const open = () => {
         opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;

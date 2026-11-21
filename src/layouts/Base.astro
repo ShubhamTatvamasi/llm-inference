@@ -67,7 +67,7 @@ const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×6
         <nav class="top-nav" aria-label="Tools">
           {tools.map((t) => (
             <a href={u(`${t.slug}/`)} class={here === t.slug ? 'on' : ''} aria-current={here === t.slug ? 'page' : undefined} title={t.title} data-review-link={t.slug === 'review' ? '' : undefined}>
-              <Fragment set:html={toolSvg(t)} /><span>{t.label}</span>
+              <Fragment set:html={toolSvg(t)} /><span>{t.label}</span>{' '}
               {t.slug === 'review' && <span class="nav-badge" data-due-badge aria-hidden="true" hidden></span>}
             </a>
           ))}
@@ -132,7 +132,8 @@ const ogImage = new URL(u('og.png'), Astro.site).href; // public/og.png: 1200×6
           const link = el.closest<HTMLAnchorElement>('[data-review-link]');
           if (link) {
             if (!link.dataset.baseLabel) link.dataset.baseLabel = 'Review';
-            link.setAttribute('aria-label', n ? `${link.dataset.baseLabel}, ${words}` : link.dataset.baseLabel);
+            // keep the visible "Review <n>" contiguous in the name (WCAG 2.5.3)
+            link.setAttribute('aria-label', n ? `${link.dataset.baseLabel} ${n} card${n === 1 ? '' : 's'} due` : link.dataset.baseLabel);
           }
         });
       };

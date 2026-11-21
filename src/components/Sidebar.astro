@@ -13,7 +13,7 @@ const { current } = Astro.props;
       The full lifecycle
     </a>
     <div class="sb-tools" aria-label="Tools">
-      {tools.map((t) => <a href={u(`${t.slug}/`)} class={current === t.slug ? 'on' : ''} data-review-link={t.slug === 'review' ? '' : undefined}><Fragment set:html={toolSvg(t)} />{t.label}{t.slug === 'review' && <span class="nav-badge" data-due-badge aria-hidden="true" hidden></span>}</a>)}
+      {tools.map((t) => <a href={u(`${t.slug}/`)} class={current === t.slug ? 'on' : ''} data-review-link={t.slug === 'review' ? '' : undefined}><Fragment set:html={toolSvg(t)} />{t.label}{' '}{t.slug === 'review' && <span class="nav-badge" data-due-badge aria-hidden="true" hidden></span>}</a>)}
     </div>
     <div class="sb-progress"><div class="sb-pbar"><i data-progress-fill></i></div><span data-progress-text>0 / {chapters.length} explored</span></div>
     {parts.map((p) => (
