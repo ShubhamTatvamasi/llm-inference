@@ -1,0 +1,150 @@
+---
+/* Where a request's prefix is found when several replicas share a cache service.
+   L1 and L2 are private to a replica; the shared L3 pool is the only tier that can
+   answer for another replica. The control plane finds the block; the data plane moves it. */
+---
+<div data-viz="cache-service-flow"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, select, button, stats, legend, rafLoop, arrowDefs, uniq, C, fmt } from '../../lib/viz';
+  import { kvGiB, reloadMs, type CacheInputs } from './cacheModel';
+
+  type NodeId = 'req' | 'a-l1' | 'a-l2' | 'b-l1' | 'b-l2' | 'c-l1' | 'c-l2' | 'pool' | 'recompute';
+
+  const INPUT: CacheInputs = { promptTokens: 8000, prefillTps: 12000, kvKiB: 128, tierGBs: 25, reuse: 0.8, replicas: 3 };
+
+  const SCENARIOS = [
+    { id: 'l1', label: 'This replica’s HBM (L1)', path: ['req', 'a-l1'], match: 'L1 HBM', route: 'request → L1 (hit)', bw: 0, lookup: 1, note: 'The router landed the request on the replica that still holds the prefix in HBM. No lookup over the network, no copy: the best case, and the only one a single-replica cache can offer.' },
+    { id: 'l2', label: 'This replica’s host DRAM (L2)', path: ['req', 'a-l1', 'a-l2', 'a-l1'], match: 'L2 host DRAM', route: 'L1 miss → L2 hit → HBM', bw: 50, lookup: 2, note: 'The prefix was evicted from HBM but survives in the replica’s pinned host memory. The index says where it is, then the block is copied back over PCIe or NVLink-C2C before attention can read it.' },
+    { id: 'pool', label: 'Shared L3 pool', path: ['req', 'a-l1', 'a-l2', 'pool', 'a-l2', 'a-l1'], match: 'L3 shared', route: 'L1 miss → L2 miss → L3 hit → L2 → HBM', bw: 25, lookup: 4, note: 'Another replica computed this prefix. The shared index points at the L3 copy, which is promoted through host DRAM into HBM. This is the case a cache service exists for: reuse across engines and nodes.' },
+    { id: 'peer', label: 'Another replica’s host cache', path: ['req', 'a-l1', 'a-l2', 'b-l2', 'a-l2', 'a-l1'], match: 'peer L2', route: 'L1 miss → L2 miss → peer hit → L2 → HBM', bw: 50, lookup: 5, note: 'A peer holds the only copy outside HBM. The transfer is a direct RDMA/NIXL read between registered buffers; no shared store is involved, but the peer must stay alive for the duration of the copy.' },
+    { id: 'miss', label: 'Nowhere (recompute)', path: ['req', 'a-l1', 'a-l2', 'pool', 'recompute'], match: 'miss', route: 'L1 miss → L2 miss → L3 miss → prefill → write back', bw: 0, lookup: 6, note: 'Every tier misses. The request pays the full prefill, and the new blocks are written back to L2 and, asynchronously, to L3 so the next request can reuse them.' },
+  ] as const;
+
+  const W = 940, H = 420;
+  const REPLICAS = [
+    { id: 'a', label: 'Replica A · vLLM', x: 20, y: 70 },
+    { id: 'b', label: 'Replica B · SGLang', x: 20, y: 170 },
+    { id: 'c', label: 'Replica C · TensorRT-LLM', x: 20, y: 270 },
+  ];
+  const BOXES: { id: NodeId; label: string; sub: string; x: number; y: number; w: number; h: number; color: string }[] = [
+    { id: 'req', label: 'request', sub: '→ Replica A', x: 20, y: 43, w: 128, h: 20, color: C.accent },
+    ...REPLICAS.flatMap((r) => [
+      { id: `${r.id}-l1` as NodeId, label: 'L1 HBM', sub: 'active blocks', x: r.x + 12, y: r.y + 30, w: 108, h: 34, color: C.kv },
+      { id: `${r.id}-l2` as NodeId, label: 'L2 host DRAM', sub: 'pinned · private', x: r.x + 132, y: r.y + 30, w: 106, h: 34, color: C.decode },
+    ]),
+    { id: 'pool', label: 'Shared L3 KV pool', sub: 'Mooncake Store · HiCache · Redis', x: 420, y: 70, w: 270, h: 276, color: C.comm },
+    { id: 'recompute', label: 'Recompute prefill', sub: 'no cache hit', x: 754, y: 154, w: 166, h: 78, color: C.waste },
+  ];
+
+  const center = (id: NodeId) => {
+    const b = BOXES.find((x) => x.id === id)!;
+    return { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+  };
+
+  mountAll('cache-service-flow', (root) => {
+    let sc: (typeof SCENARIOS)[number] = SCENARIOS[2];
+    let active = false; let anim = 0;
+
+    const bar = ctrlBar(root);
+    const g = group(bar);
+    select(g, 'Prefix found in', SCENARIOS.map((x) => ({ value: x.id, label: x.label })), sc.id, (v) => {
+      sc = SCENARIOS.find((x) => x.id === v)!; active = false; anim = 0; render();
+    });
+    button(g, 'Trace the lookup', () => { active = true; anim = 0; drawDot(); }, { primary: true, icon: 'play' });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'A request looking up a cached prefix across replicas and a shared KV pool' });
+    const st = stats(root, ['Match', 'Lookup', 'Bytes moved', 'Transfer']);
+    legend(root, [['L1 HBM', C.kv], ['L2 host DRAM', C.decode], ['L3 shared', C.comm], ['Recompute', C.waste]]);
+    const note = document.createElement('div');
+    note.className = 'narr';
+    root.appendChild(note);
+    let dyn: SVGGElement;
+
+    const pathFor = () => sc.path as readonly NodeId[];
+
+    function along(ids: readonly NodeId[], t: number) {
+      const pts = ids.map(center);
+      const segs = pts.slice(1).map((p, i) => Math.hypot(p.x - pts[i].x, p.y - pts[i].y));
+      const total = segs.reduce((a, b) => a + b, 0);
+      let d = Math.max(0, Math.min(1, t)) * total;
+      for (let i = 0; i < segs.length; i++) {
+        if (d <= segs[i]) { const u = segs[i] ? d / segs[i] : 0; return { x: pts[i].x + (pts[i + 1].x - pts[i].x) * u, y: pts[i].y + (pts[i + 1].y - pts[i].y) * u }; }
+        d -= segs[i];
+      }
+      return pts[pts.length - 1];
+    }
+
+    function drawDot() {
+      if (!dyn) return;
+      clear(dyn);
+      if (!active) return;
+      const p = along(pathFor(), anim);
+      s('circle', { cx: p.x, cy: p.y, r: 7, fill: C.accent }, dyn);
+      text(dyn, p.x, p.y - 14, anim < 0.5 ? 'look up' : 'move bytes', { 'text-anchor': 'middle', class: 't-small t-bold', fill: C.accent });
+    }
+
+    rafLoop(root, (dt) => {
+      if (!active) return;
+      anim = Math.min(1, anim + dt / 1.7);
+      drawDot();
+      if (anim >= 1) active = false;
+    });
+
+    function render() {
+      clear(svg);
+      const ids = pathFor();
+      const arrow = arrowDefs(svg, uniq('cache-arrow'), C.accent);
+      rect(svg, 18, 8, 904, 30, C.surface2, { rx: 8, stroke: C.border });
+      text(svg, 20, 24, 'Control plane: token index, placement, leases, pin / evict', { class: 't-small t-bold', fill: C.text });
+
+      // the highlighted route sits under the boxes: the highlight is carried by the boxes
+      const pts = ids.map(center).map((p) => `${p.x},${p.y}`).join(' ');
+      s('polyline', { points: pts, fill: 'none', stroke: C.accent, 'stroke-width': 2.2, 'stroke-linejoin': 'round', 'marker-end': arrow, opacity: 0.9 }, svg);
+
+      REPLICAS.forEach((r) => {
+        rect(svg, r.x, r.y, 250, 76, C.surface, { rx: 12, stroke: C.border });
+        text(svg, r.x + 12, r.y + 17, r.label, { class: 't-small t-bold' });
+        text(svg, r.x + 238, r.y + 17, 'private', { 'text-anchor': 'end', class: 't-small t-faint' });
+      });
+
+      BOXES.forEach((b) => {
+        const on = ids.includes(b.id);
+        if (b.id === 'req') {
+          rect(svg, b.x, b.y, b.w, b.h, on ? C.surface2 : C.surface, { rx: 10, stroke: on ? C.accent : C.border, 'stroke-width': on ? 1.6 : 1 });
+          text(svg, b.x + b.w / 2, b.y + b.h / 2, 'request → Replica A', { 'text-anchor': 'middle', class: 't-small t-bold', fill: on ? C.accent : C.dim });
+          return;
+        }
+        if (b.id === 'pool') {
+          rect(svg, b.x, b.y, b.w, b.h, on ? C.surface2 : C.surface, { rx: 14, stroke: on ? C.accent : C.border, 'stroke-width': on ? 2 : 1 });
+          rect(svg, b.x, b.y, 5, b.h, C.comm, { rx: 2 });
+          text(svg, b.x + 18, b.y + 26, 'Shared L3 KV pool', { class: 't-bold', 'font-size': 13 });
+          text(svg, b.x + 18, b.y + 46, 'the only tier visible to every replica', { class: 't-small t-dim' });
+          const rows = ['Mooncake Store / SGLang HiCache', 'Redis or InfiniStore index + data', 'S3 / NVMe / object storage', 'peer replicas over RDMA'];
+          rows.forEach((r, i) => {
+            rect(svg, b.x + 16, b.y + 72 + i * 46, b.w - 32, 34, C.commSoft, { rx: 8, stroke: C.border });
+            text(svg, b.x + 30, b.y + 89 + i * 46, r, { class: 't-small' });
+          });
+          text(svg, b.x + 18, b.y + 258, 'one namespace · many engines', { class: 't-small t-faint' });
+          return;
+        }
+        rect(svg, b.x, b.y, b.w, b.h, on ? C.surface2 : C.surface, { rx: 10, stroke: on ? C.accent : C.border, 'stroke-width': on ? 2 : 1 });
+        rect(svg, b.x, b.y, 4, b.h, b.color, { rx: 2 });
+        text(svg, b.x + 12, b.y + 14, b.label, { class: 't-small t-bold', 'font-size': 12 });
+        text(svg, b.x + 12, b.y + 27, b.sub, { class: 't-small t-faint', 'font-size': 10 });
+      });
+
+      dyn = s('g', {}, svg);
+      const bytes = sc.match === 'L1 HBM' || sc.match === 'miss' ? 0 : kvGiB(INPUT) * 1024 ** 3;
+      const transfer = sc.bw > 0 ? reloadMs({ ...INPUT, tierGBs: sc.bw }) : 0;
+      st.set('Match', sc.match, sc.match === 'miss' ? 'recompute runs' : 'prefill skipped', sc.match === 'miss' ? C.waste : C.good);
+      st.set('Lookup', fmt.ms(sc.lookup), 'index / placement');
+      st.set('Bytes moved', bytes ? fmt.bytes(bytes, 0) : '—', bytes ? '8K tokens × 128 KiB' : 'already in HBM');
+      st.set('Transfer', transfer ? fmt.ms(transfer) : '—', sc.bw ? `at ${sc.bw} GB/s effective` : 'no copy');
+
+      note.innerHTML = `<b>Path: ${sc.route}.</b> ${sc.note}`;
+      drawDot();
+    }
+    render();
+  });
+</script>

@@ -1,0 +1,223 @@
+---
+layout: ../layouts/Chapter.astro
+title: KV Cache as a Service
+description: Prefix caching stops at one replica’s HBM. LMCache, Mooncake, SGLang HiCache and Dynamo KVBM turn the KV cache into a shared, tiered service that engines can look up, pin and reuse across a cluster.
+---
+import Viz from '../components/Viz.astro';
+import Callout from '../components/Callout.astro';
+import Interview from '../components/Interview.astro';
+import Sources from '../components/Sources.astro';
+import Q from '../components/Q.astro';
+import CacheServiceFlow from '../components/viz/CacheServiceFlow.astro';
+import CacheServiceEcon from '../components/viz/CacheServiceEcon.astro';
+
+[Prefix caching](../prefix-caching/) is one of the best deals in serving: an identical system prompt or an earlier turn is prefilled once and reused for free. But the cache it builds lives inside **one engine process, on one GPU**. Add replicas, restart a pod, split prefill from decode, or let a router spread one conversation across the fleet, and that carefully built cache becomes a private, fragile copy.
+
+A **KV cache service** moves the cache out of the engine's fate. It owns KV blocks in a separate tier or process, exposes a lookup and control API, and moves bytes between GPUs, hosts, local disks and a shared cluster pool. LMCache, Mooncake, SGLang's HiCache, NVIDIA Dynamo's KV Block Manager and AIBrix are five different answers to the same question: *how do we make a prefix computed on one GPU reusable on another?*
+
+## A private cache stops paying as you scale
+
+Suppose 80% of requests share a prefix that already exists somewhere in the cluster. If the cache is private to each replica and the router spreads requests uniformly, a request lands on the replica that holds the prefix only **1/R** of the time:
+
+$$
+h_{\text{private}} \approx \frac{h_{\text{cluster}}}{R}
+$$
+
+With 8 replicas that is 10%, not 80%. Every replica also starts cold after a deploy, and a P/D deployment has two caches that never see each other's work. The fix is not a bigger HBM cache; it is a cache that is **addressable across replicas**.
+
+<Callout type="key" title="A cache service is a reuse layer, not a bigger swap file">
+Local prefix caching answers “is this prefix in *my* HBM?” A service answers “where in the cluster is this prefix, what does it cost to fetch, and who is allowed to use it?” The engine still keeps a local L1; the service extends the lookup beyond it.
+</Callout>
+
+## Two planes: what the service actually does
+
+Every system in this chapter separates a small, fast **control plane** from a bulk **data plane**. Confusing the two is the usual source of disappointment.
+
+| | Control plane | Data plane |
+|---|---|---|
+| **Job** | Find a block, decide placement, enforce quotas and pinning | Move bytes between HBM, host memory, disk and peers |
+| **Unit** | A chained block or page hash, sequence id, tenant, model version | A KV chunk, typically 16–512 tokens or one page |
+| **Latency** | Microseconds to a few milliseconds | Milliseconds to seconds, dominated by bytes ÷ bandwidth |
+| **Examples** | LMCache Controller; Mooncake Master; HiCache's HiRadixTree; Dynamo's KVBM leader | CUDA IPC, pinned-memory copies, GPUDirect Storage, NIXL over RDMA, zero-copy page transfers |
+
+The control API is what makes it a *service*: lookup, pin, unpin, evict, move, compress, and per-tenant quota. The data plane is what makes it fast: batched copies, layer-wise pipelining, zero-copy, and topology-aware path selection across NICs.
+
+<Callout type="warn" title="Redis is usually the index, not the cache">
+A common architecture puts the **prefix hash index and cluster membership** in Redis, while the tensors stay in engine and cache-node memory. Copying every KV tensor into Redis would put a network round trip and a second serialisation on the hottest path. Use Redis for control-plane state; use InfiniStore, Mooncake Store, NVMe or an object store for bytes.
+</Callout>
+
+## A request through the hierarchy
+
+The tiers have different names in different systems, but the shape is the same:
+
+- **L1 / G1 — HBM.** The blocks the attention kernel can read directly. Fastest and smallest.
+- **L2 / G2 — host DRAM.** Pinned memory reachable over PCIe or NVLink-C2C. In SGLang HiCache, L1 and L2 are **private to the instance**; only L3 can be shared.
+- **L3 / G3–G4 — local NVMe, a shared pool, object storage, peers.** Larger and slower. This is the tier that makes cross-replica reuse possible.
+
+A request hashes its blocks, walks the index from the first block, and stops at the first miss. Every hit is reused; only the remaining tokens are prefilled. On a lower-tier hit, the block is promoted into host memory and then HBM, ideally **layer by layer** so the GPU can start on layer *n* while layer *n+1* is still arriving.
+
+<Viz title="Where a shared prefix comes from" label="Live">
+  <CacheServiceFlow />
+  <Fragment slot="caption">
+    <p>Switch the source and trace the lookup. L1 is free; L2 costs a host copy; the shared pool and a peer cost a network transfer. A miss pays the full prefill and then writes the new blocks back. The return path through L2 is deliberate: the host tier is the staging point for every lower tier.</p>
+  </Fragment>
+</Viz>
+
+Three implementation details decide whether this feels like a cache or a slow copy:
+
+- **Chunk size.** Bigger chunks amortise metadata and I/O setup but delay the first reusable byte; smaller chunks make eviction and prefix reuse finer-grained. LMCache defaults to 256-token chunks; Mooncake's blocks range from 16 to 512 tokens.
+- **Layout.** GPU kernels want layer-first KV; storage wants a whole page contiguous. Page-first host layouts and zero-copy handoff avoid turning one logical transfer into hundreds of small copies.
+- **Overlap.** Prefetching from L3 into L2, and copying L2 into HBM layer by layer, hides most of the transfer behind prefill or decode. A cache service that blocks the whole model on a transfer has given the latency back.
+
+## The systems
+
+The five production designs differ mainly in **where the shared tier lives** and **who owns the scheduler**.
+
+| System | Tiers and unit | Shared scope | Control plane | What it is known for |
+|---|---|---|---|---|
+| **LMCache** | Engine-side worker plus a controller; CPU, disk, Redis, Mooncake, InfiniStore, peers | Cross-engine and cross-node; a transport mode for P/D | Controller: lookup, pin, move, compress, quota | The engine-external cache layer: storage mode for reuse, transport mode for disaggregation; multi-process mode shares one host cache across DP ranks |
+| **Mooncake** | Distributed DRAM and SSD pool built from cluster nodes; 16–512-token blocks | Cluster-wide pool; Conductor routes to the best prefix | Master service: directory, placement, leases, tenant quota | KV-centric serving at Kimi scale: thousands of nodes, over 100B tokens a day; a topology-aware Transfer Engine that stripes a transfer across NICs |
+| **SGLang HiCache** | L1 HBM, L2 host, L3 file / Mooncake / 3FS / NIXL / AIBrix | L1 and L2 private; L3 shared only if its backend is configured to be | HiRadixTree; prefetch policy; write-through, selective or write-back | The clearest three-level cache model, with layer-wise transfer/compute overlap and GPU-assisted copy kernels |
+| **NVIDIA Dynamo KVBM** | G1 HBM, G2 host, G3 NVMe, G4 object or remote storage (with a pooled-flash G3.5 in some designs) | Node-local by default; NIXL reaches remote peers and storage | KVBM leader and workers over ZMQ; a KV-aware router | Tiering plus routing in one orchestration layer; S3-compatible G4 and NIXL as the data plane |
+| **AIBrix** | L1 DRAM in the pod (S3FIFO) plus an L2 cluster | L2 shared across engine replicas | `KVCache` CRD; Redis membership; a gateway prefix index | One store for both offload and P/D reuse, with open L2 backends (InfiniStore, HPKV, PrisKV, RocksDB) |
+
+The vLLM **Production Stack** is the easiest way to try one of these on Kubernetes: a Helm chart, a router with prefix- and session-aware modes, and LMCache as the remote cache server. It is a reference deployment, not a separate cache technology.
+
+The 2026 direction is convergence. LMCache and Mooncake are becoming interchangeable backends under HiCache; AIBrix uses one KV data plane for offload and disaggregation; Dynamo treats cache, transfer and routing as one problem. Expect the *interfaces* to stabilise before the implementations do.
+
+## What a hit is worth
+
+A hit replaces prefill with a lookup and a reload:
+
+$$
+t_{\text{eff}} = (1-h)\,t_{\text{prefill}} + h\,(t_{\text{lookup}} + t_{\text{reload}})
+\qquad
+t_{\text{reload}} \approx \frac{\text{prefix tokens} \times \text{KV bytes/token}}{\text{effective tier bandwidth}}
+$$
+
+For an 8K-token Llama 3.1 8B prefix, the KV is about 1 GiB. At 50 GB/s that is roughly 20 ms, against roughly 670 ms to prefill it at 12k tokens/s. At 8 replicas, the private cache keeps 10% of the reuse and the shared pool keeps 80%: about **602 ms vs 149 ms** of effective TTFT. The net GPU time saved is about **144 GPU-hours per million requests**.
+
+<Viz title="Private vs shared cache at N replicas" label="Calculator">
+  <CacheServiceEcon />
+  <Fragment slot="caption">
+    <p>The private-cache curve falls as <code>reuse / replicas</code>; the shared curve stays flat at the cluster reuse rate. The vertical gap is the service. Move the tier to an object store or switch to a larger KV footprint and watch the reload line climb toward the prefill line; once it crosses, a hit is a net loss, no matter how high the hit rate.</p>
+  </Fragment>
+</Viz>
+
+Reported results are large, and workload-specific. Treat them as evidence that the effect is real, not as constants:
+
+- **LMCache + vLLM:** up to **15× throughput** across multi-round QA and document analysis in the authors' evaluation.
+- **Mooncake:** **59–498%** higher effective request capacity in trace replay; **115%** and **107%** more requests on A800 and H800 clusters than the previous system. Its global cache raised the hit rate by up to **136%** and cut prefill compute by up to **48%** versus local caches.
+- **SGLang HiCache:** on a DeepSeek-V4-Flash multi-turn benchmark, adding a Mooncake L3 raised effective input throughput from **9.4K to 145.5K tokens/s** with a hit rate near **98%**.
+- **AIBrix:** roughly **30%** lower TTFT and **2–3×** multi-turn throughput in its reported benchmarks.
+- **CacheBlend** (now part of LMCache): **2.2–3.3×** lower TTFT and **2.8–5×** higher throughput for RAG by reusing non-prefix chunks.
+- **CacheGen:** **3.5–4.3×** smaller KV streams and **3.2–3.7×** lower fetch-and-process delay.
+
+<Callout type="warn" title="Hit rate is not the objective">
+A 90% hit rate on a tier that is slower than recomputation is worse than a 20% hit rate on a fast one. Compare `hit × reload + (1 − hit) × prefill` against `prefill`, then check goodput: a cache that frees HBM can raise concurrency even when a single reload is slower.
+</Callout>
+
+## Prefixes, chunks and the RAG problem
+
+A block is reusable only when its **entire prefix** matches, because the K/V of a token depends on everything before it. The key is a chained hash:
+
+$$
+h_i = \operatorname{hash}(h_{i-1},\ \text{tokens in block } i,\ \text{extra keys})
+$$
+
+The extra keys are where correctness lives: the model, tokenizer and chat template, the LoRA adapter id, multimodal input hashes, and a tenant **cache salt**. Only full blocks are cached; the trailing partial block is always recomputed. A timestamp at the start of a system prompt changes every later hash and destroys reuse, which is why stable content belongs first.
+
+Two extensions break the prefix-only assumption:
+
+- **CacheBlend** reuses a precomputed KV chunk even when it is *not* the prefix, selectively recomputing a small fraction of tokens at chunk boundaries to restore cross-attention. That is what makes RAG document caching work when the same retrieved chunks appear in different orders.
+- **CacheGen** compresses the KV bitstream itself (delta coding, layer-aware quantization, arithmetic coding) and adapts the compression level to available bandwidth. It trades a little quality for much less network time.
+
+Chunk granularity is a real tuning knob. LMCache's evaluation also found that **context truncation**, a common way to fit a context window, can cut the prefix cache hit ratio roughly in half. Truncating the oldest turns is cheap; it is not free.
+
+## The cache is a security boundary
+
+A shared prefix cache leaks information even when it returns the right bytes. If a hit is faster than a miss, an attacker can test whether a candidate prefix was cached and reconstruct another tenant's prompt block by block. The published attacks — **PROMPTPEEK**, **EarlyBird**, **InputSnatch** — reached high success rates against unprotected vLLM and SGLang deployments; vLLM assigned the timing channel **CVE-2025-46570**, and predictable hash collisions enabled cache poisoning in **CVE-2025-25183**.
+
+The defence is a per-request **cache salt** mixed into the first block's hash, so every descendant hash is namespaced to that principal:
+
+$$
+h_0 = H(\sigma_p \,\|\, \text{tokens}_{0..B-1}), \qquad \sigma_p = \operatorname{HMAC}_{K}(\text{secret}, \text{principal id})
+$$
+
+vLLM has accepted a `cache_salt` field since 0.9 and hashes with SHA-256 by default. The salt is only as good as the component that sets it: **the gateway must derive it from the authenticated identity, overwrite any client-supplied value, and never expose the engine around the gateway**. A salt equal to the tenant name is guessable; a random per-process seed changes after a restart and empties the cache.
+
+Sharing a common preamble across tenants is often safe if the salt is injected at the **divergence boundary** rather than at the root: blocks every tenant shares carry no discriminating signal, and one 2026 study estimates that boundary salting keeps about **93%** of the prefix benefit while removing the cross-principal timing signal.
+
+<Callout type="warn" title="The cache service widens the blast radius">
+A shared pool holds prompt and document content in host memory, on disk and on the network. Encrypt at rest and in transit, namespace every key by tenant and model version, expire entries, and keep the storage ports off tenant networks. `/metrics` and the KV event stream can leak cached tokens and salts too. For regulated tenants, partition the pool or disable cross-tenant reuse; isolation is a policy decision, not a hash function.
+</Callout>
+
+## Operating a cache service
+
+The useful signals are different from the engine's:
+
+- **Hit rate by tier** (L1, L2, L3) and **bytes moved per request**. A high L1 hit rate with a low L3 hit rate is a capacity problem; a high L3 hit rate with rising TTFT is a bandwidth problem.
+- **Lookup latency** at p50/p99, separated from transfer and prefill. The control plane should not appear in the tail.
+- **Prefetch precision and coverage.** Prefetching blocks nobody reuses pollutes the tier; prefetching too late hides nothing.
+- **Eviction rate, occupancy and fragmentation.** A full tier with a falling hit rate is a sizing or policy smell, not a hit.
+- **TTFT attribution:** queueing, lookup, prefill, transfer, decode. Without it, a cache regression looks like a model regression.
+- **Cache-node health and network utilisation.** The bottleneck moves from HBM to PCIe to the NIC to the cache node's own memory.
+
+Sizing follows one rule: **the warm tier must be larger than the GPU's KV cache**, or the service churns blocks it just evicted. Dynamo's guidance is a CPU cache of at least 100 GB and a disk tier at least as large as the CPU tier; LMCache advises giving its L1 as much host memory as the node can spare. Eviction policy matters as much as size: LRU is the default, AIBrix uses S3FIFO, and Mooncake's adaptive storage strategy — a hierarchy down to SSD plus semantics-aware eviction that excludes one-shot web-search chunks and retains long-lived context-cache entries — reported a **93%** hit-rate improvement.
+
+Failure handling is the part demos skip. A cache node dies: requests must fall back to recompute, not fail. The index goes stale: a routing miss is acceptable, a wrong KV block is not, so verify the key before reuse. A model or tokenizer changes: version the key and invalidate the old namespace. A cold cache and a traffic spike arrive together: rate-limit the prefetch and write-back so the cache does not become the bottleneck it was meant to remove.
+
+## When not to run one
+
+| Situation | Better choice |
+|---|---|
+| One replica, or sticky session routing already gets the reuse | Local prefix caching is enough |
+| Reuse is low, or prompts are shorter than one block | The lookup and transfer dominate; skip the service |
+| The reload tier is slower than recomputing the prefix | Use a faster tier, a bigger prefix, or recompute |
+| Strict tenant isolation with no trusted salt boundary | Partition the cache, or turn cross-tenant reuse off |
+| The model and tokenizer change every few days | Version keys and budget for cold caches; the hit rate will be lumpy |
+| No RDMA, no fast local tier, and no spare host memory | A shared cache over TCP is often slower than prefill |
+
+<Sources
+  updated="November 2026"
+  items={[
+    { href: 'https://docs.lmcache.ai/developer_guide/architecture.html', title: 'LMCache architecture', note: 'engine-external worker and controller; L1/L2/L3-style tiers; storage and transport modes' },
+    { href: 'https://arxiv.org/abs/2510.09665', title: 'LMCache: An Efficient KV Cache Layer for Enterprise-Scale LLM Inference', note: 'up to 15× throughput with vLLM; batched movement, connector design and control API' },
+    { href: 'https://kvcache-ai.github.io/Mooncake/design/architecture.html', title: 'Mooncake Store architecture', note: 'Master, clients, distributed object pool and the Transfer Engine' },
+    { href: 'https://arxiv.org/abs/2407.00079', title: 'Mooncake: A KVCache-centric Disaggregated Architecture', note: 'Conductor, global cache, 59–498% effective capacity at Kimi scale' },
+    { href: 'https://docs.sglang.io/docs/advanced_features/hicache_design', title: 'SGLang HiCache design', note: 'L1 GPU / L2 host / L3 storage, HiRadixTree, prefetch and write-back policies' },
+    { href: 'https://www.sglang.io/blog/hicache', title: 'HiCache: hybrid-model caching up to 15.5× input throughput', note: 'DeepSeek-V4-Flash multi-turn result with a Mooncake L3 (2026)' },
+    { href: 'https://docs.nvidia.com/dynamo/dev/design-docs/component-design/kvbm-design', title: 'NVIDIA Dynamo KVBM design', note: 'G1–G4 block pools, NIXL transfers, leader/worker connector' },
+    { href: 'https://aibrix.readthedocs.io/latest/features/scaling-performance/kvcache-offloading.html', title: 'AIBrix KVCache offloading', note: 'L1 DRAM with S3FIFO plus a shared L2 cluster and the KVCache CRD' },
+    { href: 'https://docs.vllm.ai/projects/production-stack/en/latest/use_cases/sharing-kv-cache.html', title: 'vLLM Production Stack: sharing KV cache', note: 'LMCache as a remote cache server behind a prefix-aware router' },
+    { href: 'https://arxiv.org/abs/2405.16444', title: 'CacheBlend', note: 'non-prefix chunk reuse with selective recomputation; 2.2–3.3× lower TTFT for RAG' },
+    { href: 'https://arxiv.org/abs/2310.07240', title: 'CacheGen', note: 'KV compression and bandwidth-adaptive streaming; 3.5–4.3× smaller cache' },
+    { href: 'https://docs.vllm.ai/en/stable/design/prefix_caching/', title: 'vLLM automatic prefix caching', note: 'chained block hashing, SHA-256 default and cache_salt isolation' },
+    { href: 'https://arxiv.org/abs/2608.09225', title: 'Governing the KV Cache', note: 'HMAC-keyed namespace isolation and boundary salting against timing side channels' },
+    { href: 'https://www.ndss-symposium.org/wp-content/uploads/2025-1772-paper.pdf', title: 'PROMPTPEEK', note: 'prompt reconstruction through a shared KV cache in multi-tenant serving' },
+  ]}
+/>
+
+<Interview>
+  <Q q="What does a KV cache service add to the prefix cache already built into vLLM or SGLang?" level="core">
+    The engine cache is private to one process and one GPU: it answers “is this prefix in my HBM?” A service adds an index and data path that span replicas and nodes, a shared lower tier, and a control API for lookup, pinning, eviction and quota. It turns cache reuse from a per-replica accident into a cluster-wide property, and it survives a restart or a P/D split.
+  </Q>
+  <Q q="Why does a private per-replica cache lose hit rate as you add replicas?" level="core">
+    With uniform routing, a request reaches the replica that holds its prefix only 1/R of the time, so the effective hit rate is roughly the cluster reuse rate divided by the replica count. At 8 replicas an 80% reuse rate becomes 10%. The cache is not worse; it sees only one eighth of the repeats.
+  </Q>
+  <Q q="Separate the control plane from the data plane in a cache service, with examples." level="mid">
+    The control plane finds blocks, decides placement, enforces tenant quotas and pinning, and returns a descriptor. Examples are LMCache's controller, Mooncake's Master and HiCache's HiRadixTree. The data plane moves the bytes: CUDA IPC, pinned host copies, GPUDirect Storage, NIXL over RDMA. A slow lookup hurts every request; a slow data plane hurts only the hits. Putting the tensor index in Redis is a control-plane choice, not a data-plane one.
+  </Q>
+  <Q q="When is a cache hit not worth taking? Write the condition." level="mid">
+    When the lookup plus reload is slower than the prefill it replaces: <code>t_lookup + KV bytes / tier bandwidth &gt; prefill FLOPs / achieved FLOPs</code>. That is common for a short prefix on a slow object store. Also when the reload sits on the critical TTFT path with no overlap, or when keeping the cache evicts HBM that active requests need. Compare goodput, not just one request's latency.
+  </Q>
+  <Q q="How do LMCache, Mooncake and HiCache differ in where the shared tier lives?" level="senior">
+    LMCache keeps a worker beside each engine and a controller above them; the shared tier is whatever remote backend is configured (Redis, Mooncake, InfiniStore, disk), and the same worker can move KV for P/D. Mooncake builds one cluster-wide pool out of the nodes' DRAM and SSD and puts a global Conductor in front of it. HiCache is explicitly L1 HBM, L2 private host memory and L3 a configurable shared backend; only L3 crosses instances. The trade-off is locality versus how much of the cluster can reuse a block.
+  </Q>
+  <Q q="You enable a shared cache for a multi-tenant API. What must the gateway do first?" level="senior">
+    Derive a per-principal salt with an HMAC over a server-held secret, set it on every request, and drop any client-supplied <code>cache_salt</code>. Scope it to the trust boundary (tenant, user or session), keep it stable across restarts, and use a cryptographic hash so an adversary cannot force a collision. Expose only endpoints that carry the salt, close direct access to the engine and the cache storage ports, and assume the event stream and metrics can leak tokens. If the policy forbids cross-tenant reuse, partition the pool instead.
+  </Q>
+  <Q q="What do you monitor after adding a cache service, and what breaks when a cache node dies?" level="senior">
+    Monitor hit rate per tier, lookup p50/p99, bytes moved per request, prefetch precision, eviction rate and TTFT split into lookup, prefill, transfer and decode. On a cache-node failure, requests must fall back to recompute rather than fail; a stale index should produce a miss, never a wrong block; and a cold cache plus a traffic spike must not turn prefetch into a self-inflicted outage. Version keys by model and tokenizer so an upgrade invalidates the namespace cleanly.
+  </Q>
+</Interview>

@@ -1,0 +1,115 @@
+---
+/* Why a *shared* cache service beats N private caches: with uniform routing a private
+   cache keeps only 1/R of the cluster's reuse. First-order TTFT and saved-GPU-time model. */
+---
+<div data-viz="cache-service-econ"></div>
+
+<script>
+  import { mountAll, svgRoot, s, rect, text, clear, ctrlBar, group, select, slider, stats, legend, C, fmt } from '../../lib/viz';
+  import { prefillMs, reloadMs, localHit, ttftLocalMs, ttftSharedMs, gpuHoursSavedPerMillion, kvGiB, type CacheInputs } from './cacheModel';
+
+  const MODELS = [
+    { id: '8b', label: 'Llama 3.1 8B · 128 KiB/token', kvKiB: 128 },
+    { id: '70b', label: 'Llama 3.1 70B · 320 KiB/token', kvKiB: 320 },
+    { id: 'mla', label: 'DeepSeek MLA · 69 KiB/token', kvKiB: 69 },
+  ] as const;
+  const TIERS = [
+    { id: 'host', label: 'Host DRAM', gbs: 50 },
+    { id: 'rdma', label: 'Shared pool (RDMA)', gbs: 25 },
+    { id: 'nvme', label: 'Local NVMe', gbs: 7 },
+    { id: 'object', label: 'Object store', gbs: 1.5 },
+  ] as const;
+
+  const W = 940, H = 300;
+  const X0 = 78, X1 = 906, Y0 = 250, Y1 = 42;
+
+  mountAll('cache-service-econ', (root) => {
+    const S: CacheInputs & { model: string; tier: string } = { promptTokens: 8000, prefillTps: 12000, kvKiB: 128, tierGBs: 50, reuse: 0.8, replicas: 8, model: '8b', tier: 'host' };
+
+    const b1 = ctrlBar(root);
+    const g1 = group(b1);
+    select(g1, 'KV footprint', MODELS.map((m) => ({ value: m.id, label: m.label })), S.model, (v) => {
+      const m = MODELS.find((x) => x.id === v)!; S.model = v; S.kvKiB = m.kvKiB; render();
+    });
+    select(g1, 'Reload from', TIERS.map((t) => ({ value: t.id, label: t.label })), S.tier, (v) => {
+      const t = TIERS.find((x) => x.id === v)!; S.tier = v; S.tierGBs = t.gbs; render();
+    });
+    const g2 = group(b1);
+    slider(g2, { label: 'Prefix', min: 1000, max: 128000, step: 1000, value: S.promptTokens, format: (v) => `${fmt.int(v)} tok`, onInput: (v) => { S.promptTokens = v; render(); } });
+    slider(g2, { label: 'Prefill speed', min: 2000, max: 50000, step: 1000, value: S.prefillTps, format: (v) => `${fmt.int(v)} tok/s`, onInput: (v) => { S.prefillTps = v; render(); } });
+    const g3 = group(b1);
+    slider(g3, { label: 'Reuse in cluster', min: 0, max: 100, value: Math.round(S.reuse * 100), format: (v) => `${v}%`, onInput: (v) => { S.reuse = v / 100; render(); } });
+    slider(g3, { label: 'Replicas', min: 1, max: 64, value: S.replicas, format: (v) => `${v}`, onInput: (v) => { S.replicas = v; render(); } });
+
+    const svg = svgRoot(root, W, H, { 'aria-label': 'Effective time to first token against replica count, for a private cache and a shared cache' });
+    const st = stats(root, ['Prefill', 'Reload', 'TTFT private', 'TTFT shared']);
+    legend(root, [['Private cache (reuse / replicas)', C.waste], ['Shared cache service', C.good], ['Prefill (no cache)', C.prefill], ['Reload from tier', C.decode]]);
+    const note = document.createElement('div');
+    note.className = 'narr';
+    root.appendChild(note);
+
+    const ticks = [1, 2, 4, 8, 16, 32, 64];
+    const xPos = (r: number) => X0 + (Math.log2(Math.max(1, r)) / 6) * (X1 - X0);
+
+    function render() {
+      clear(svg);
+      const pf = prefillMs(S), rl = reloadMs(S);
+      const top = Math.max(pf, rl) * 1.06 || 1;
+      const yPos = (v: number) => Y0 - (v / top) * (Y0 - Y1);
+      const hitL = localHit(S), hitS = S.reuse;
+
+      rect(svg, X0, Y1, X1 - X0, Y0 - Y1, C.surface, { rx: 8, stroke: C.border });
+      for (const t of ticks) {
+        const x = xPos(t);
+        s('line', { x1: x, y1: Y1, x2: x, y2: Y0, stroke: C.border, 'stroke-width': 1, 'stroke-dasharray': '3 5' }, svg);
+        text(svg, x, Y0 + 16, String(t), { 'text-anchor': 'middle', class: 't-small t-faint' });
+      }
+      for (let i = 0; i <= 4; i++) {
+        const v = (top * i) / 4; const y = yPos(v);
+        s('line', { x1: X0, y1: y, x2: X1, y2: y, stroke: C.border, 'stroke-width': 1, 'stroke-dasharray': i === 0 ? '' : '3 5' }, svg);
+        text(svg, X0 - 8, y, fmt.ms(v), { 'text-anchor': 'end', class: 't-small t-faint' });
+      }
+      text(svg, X0, 22, 'Effective TTFT as replicas are added', { class: 't-bold' });
+      text(svg, X1, 22, `prefix ${fmt.int(S.promptTokens)} tok · ${fmt.ms(pf)} to prefill`, { 'text-anchor': 'end', class: 't-small t-dim' });
+      text(svg, (X0 + X1) / 2, H - 12, 'replicas (log scale)', { 'text-anchor': 'middle', class: 't-small t-faint' });
+
+      // reference lines: prefill (a miss) and reload (a perfect hit)
+      s('line', { x1: X0, y1: yPos(pf), x2: X1, y2: yPos(pf), stroke: C.prefill, 'stroke-width': 1.4, 'stroke-dasharray': '6 5' }, svg);
+      text(svg, X1 - 6, yPos(pf) - 8, 'prefill', { 'text-anchor': 'end', class: 't-small t-bold', fill: C.prefill });
+      s('line', { x1: X0, y1: yPos(rl), x2: X1, y2: yPos(rl), stroke: C.decode, 'stroke-width': 1.4, 'stroke-dasharray': '6 5' }, svg);
+      text(svg, X0 + 6, yPos(rl) - 8, 'reload', { class: 't-small t-bold', fill: C.decode });
+
+      const series: { color: string; f: (i: CacheInputs) => number }[] = [
+        { color: C.waste, f: ttftLocalMs },
+        { color: C.good, f: ttftSharedMs },
+      ];
+      for (const sr of series) {
+        const pts: string[] = [];
+        for (let r = 1; r <= 64; r++) pts.push(`${xPos(r)},${yPos(sr.f({ ...S, replicas: r }))}`);
+        s('polyline', { points: pts.join(' '), fill: 'none', stroke: sr.color, 'stroke-width': 2.4, 'stroke-linejoin': 'round' }, svg);
+      }
+
+      const yl = yPos(ttftLocalMs(S)), ys = yPos(ttftSharedMs(S)), x = xPos(S.replicas);
+      s('circle', { cx: x, cy: yl, r: 5, fill: C.waste, stroke: C.surface, 'stroke-width': 2 }, svg);
+      s('circle', { cx: x, cy: ys, r: 5, fill: C.good, stroke: C.surface, 'stroke-width': 2 }, svg);
+      text(svg, x + 9, yl - 9, 'private', { class: 't-small t-bold', fill: C.waste });
+      text(svg, x + 9, ys + 15, 'shared', { class: 't-small t-bold', fill: C.good });
+
+      const saved = gpuHoursSavedPerMillion(S, hitS);
+      st.set('Prefill', fmt.ms(pf), `${fmt.int(S.promptTokens)} tok at ${fmt.int(S.prefillTps)} tok/s`);
+      st.set('Reload', fmt.ms(rl), `${kvGiB(S).toFixed(1)} GiB at ${S.tierGBs} GB/s`);
+      const sharedWins = ttftSharedMs(S) <= ttftLocalMs(S);
+      st.set('TTFT private', fmt.ms(ttftLocalMs(S)), `${Math.round(hitL * 100)}% hit · ${S.replicas} replica${S.replicas > 1 ? 's' : ''}`);
+      st.set('TTFT shared', fmt.ms(ttftSharedMs(S)), `${Math.round(hitS * 100)}% hit · one pool`, sharedWins ? C.good : C.waste);
+
+      if (rl >= pf) {
+        note.innerHTML = `At this size and tier a reload costs <b>${fmt.ms(rl)}</b>, more than the <b>${fmt.ms(pf)}</b> prefill it would replace. A cache hit is now a net loss: use a faster tier, a larger prefix, or recompute. This is why an object store is not an interactive cache tier.`;
+      } else if (S.replicas === 1) {
+        note.innerHTML = `With one replica a private cache and a shared service are the same thing. Add replicas: the private cache keeps only <b>1/R</b> of the cluster's reuse, while the shared pool keeps all of it.`;
+      } else {
+        note.innerHTML = `With <b>${S.replicas}</b> replicas and uniform routing, the private cache keeps <b>${Math.round(hitL * 100)}%</b> of requests, against <b>${Math.round(hitS * 100)}%</b> for the shared pool. A hit saves <b>${fmt.ms(pf - rl)}</b> and about <b>${fmt.int(Math.abs(saved))} GPU-hours</b> per million requests.`;
+      }
+    }
+    render();
+  });
+</script>

@@ -66,6 +66,8 @@ The transfer path matters a lot:
 - **Layouts must match.** If the prefill and decode workers use different TP sizes or block sizes, KV blocks must be re-sharded or re-laid out during transfer.
 - Production stacks such as **llm-d** and **NVIDIA Dynamo** pair this with a router that sends each request to a prefill worker and a decode worker, ideally ones with matching cached prefixes.
 
+The cache that holds the prefix before and after the handoff is often a separate service rather than a connector detail. [KV cache as a service](../cache-service/) covers the shared pool, the control plane and the systems that provide it.
+
 ## When is it worth it?
 
 | Situation | Better choice |

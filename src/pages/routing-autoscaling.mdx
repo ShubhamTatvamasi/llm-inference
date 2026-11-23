@@ -33,7 +33,7 @@ The progression mirrors how production routers evolved:
 
 1. **Round-robin / random.** Fine for identical stateless requests. For LLMs it creates hot spots whenever a few long requests land on the same replica.
 2. **Least outstanding requests / queue-aware.** Balances load using live engine signals (running, waiting, KV usage). This is a large improvement and should be the minimum.
-3. **Prefix / KV-cache-aware.** The router tracks which replica probably holds which prefix (by hashing prompt blocks the same way the engine does) and adds a score bonus for cache affinity. Load still counts, so a hot prefix spills over instead of melting one replica.
+3. **Prefix / KV-cache-aware.** The router tracks which replica probably holds which prefix (by hashing prompt blocks the same way the engine does) and adds a score bonus for cache affinity. Load still counts, so a hot prefix spills over instead of melting one replica. If the prefix is in a [shared cache service](../cache-service/) rather than one replica's HBM, the router can also treat a lower-tier hit as a reason to move the request.
 4. **Adapter-aware.** With [multi-LoRA](../multi-lora/), requests also prefer replicas that already have their adapter loaded.
 
 <Callout type="note" title="How this looks on Kubernetes">

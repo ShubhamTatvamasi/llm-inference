@@ -18,7 +18,7 @@ HBM is the fastest place for a KV cache and the smallest. When the working set o
 3. **Compress** the cache (MLA, FP8/NVFP4, block compression) so it fits.
 4. **Reject or queue** the request.
 
-Most production systems do a mix. This chapter is about the second option: the memory hierarchy, the reload-versus-recompute decision, and the operational details that turn a demo into a cache.
+Most production systems do a mix. This chapter is about the second option: the memory hierarchy, the reload-versus-recompute decision, and the operational details that turn a demo into a cache. The step from a per-engine tier to a shared, cluster-wide cache is covered in [KV cache as a service](../cache-service/).
 
 ## The hierarchy
 

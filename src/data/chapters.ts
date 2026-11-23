@@ -85,6 +85,7 @@ export const chapters: Chapter[] = [
   // IX — The frontier
   { slug: 'long-context', part: 'frontier', title: 'Long Context & Sparse Attention', short: 'Long context', blurb: 'MLA, DSA, CSA/HCA and the indexer: how million-token context changes attention, KV and serving.' },
   { slug: 'kv-offload', part: 'frontier', title: 'KV Cache Offloading', short: 'KV offload', blurb: 'Host DRAM, NVMe, object stores and peers: when reloading a prefix beats recomputing it.' },
+  { slug: 'cache-service', part: 'frontier', title: 'KV Cache as a Service', short: 'Cache services', blurb: 'LMCache, Mooncake, HiCache and Dynamo KVBM: pooling KV across replicas, tiers and clusters.' },
 ];
 
 export const chapterIndex = (slug: string) => chapters.findIndex((c) => c.slug === slug);

@@ -90,6 +90,7 @@ Hosted APIs advertise "prompt caching" with discounted cached input tokens. That
 - **The cache lives in one replica's GPU memory.** Two replicas behind a round-robin load balancer each keep their own cache, so hit rates drop as you add replicas. That is why **cache-aware routing** exists: send requests with the same prefix to the replica that already holds it. See [routing & autoscaling](../routing-autoscaling/).
 - **It competes with running requests.** Cached-but-idle blocks are the first thing evicted when active sequences need memory, so a busy server keeps less history.
 - **It can be tiered.** KV-offload layers can spill evicted blocks to CPU RAM or local SSD and reload them later. That pays off when reloading is faster than recomputing; see the [scheduler chapter](../scheduler/).
+- **It can be a shared service.** A cache layer outside the engine — LMCache, Mooncake, SGLang HiCache, Dynamo KVBM — keeps KV in a pool that other replicas can look up, so reuse survives the router, a restart or a P/D split. See [KV cache as a service](../cache-service/).
 
 <Interview>
   <Q q="How does automatic prefix caching decide that two prompts share K/V?" level="core">

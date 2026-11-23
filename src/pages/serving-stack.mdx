@@ -47,6 +47,8 @@ vLLM, SGLang, TensorRT-LLM (`trtllm-serve`) and llama.cpp (`llama-server`) all e
 
 Whatever you pick, **pin the exact versions** of the engine, model revision, tokenizer and chat template, and the quantized artifacts. A silent change to any of them changes outputs.
 
+The cache can also live outside the engine: [KV cache as a service](../cache-service/) covers the shared pools and tiers that LMCache, Mooncake, SGLang HiCache and Dynamo KVBM add behind these engines.
+
 ## The flags that matter
 
 Engines have hundreds of options, but a handful decide memory, concurrency and latency. Build a `vllm serve` command and watch what each change does:

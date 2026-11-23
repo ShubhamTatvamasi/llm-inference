@@ -231,7 +231,52 @@ export const cheatsheet: CheatSection[] = [
     ],
   },
 
-  // ───────────────────────────── 5. Faster & cheaper
+  // ───────────────────────────── 5. Cache services
+  {
+    id: 'cache',
+    title: 'KV cache services',
+    blurb: 'A shared, tiered KV cache turns one replica’s reuse into the cluster’s reuse. The maths is a hit rate times a time saved.',
+    formulas: [
+      {
+        name: 'Effective TTFT with a cache',
+        tex: String.raw`t_\text{eff} = (1-h)\,t_\text{prefill} + h\,(t_\text{lookup} + t_\text{reload}), \qquad t_\text{reload} \approx \frac{\text{prefix tokens} \times \text{KV bytes/token}}{\text{tier bandwidth}}`,
+        vars: 'h = cache hit rate; the lookup is control plane, the reload is data plane',
+        example: '8K-token 8B prefix: ~1 GiB KV, ~20 ms at 50 GB/s, against ~667 ms to prefill at 12k tok/s; at 80% hits, ~149 ms effective',
+        ch: 'cache-service',
+      },
+      {
+        name: 'Private vs shared hit rate',
+        tex: String.raw`h_\text{private} \approx \frac{h_\text{cluster}}{R}`,
+        vars: 'R = replicas behind a uniform router; a shared cache service keeps h_cluster',
+        example: '80% cluster reuse across 8 replicas leaves about 10% per private cache',
+        ch: 'cache-service',
+      },
+      {
+        name: 'Net GPU time saved per million requests',
+        tex: String.raw`\text{GPU-hours} \approx \frac{10^6 \times h \times (t_\text{prefill} - t_\text{reload})}{3600}`,
+        vars: 'a hit saves prefill but pays the reload; a slow tier makes this negative',
+        example: '80% hits, 667 ms prefill, 20 ms reload: about 144 GPU-hours per million requests',
+        ch: 'cache-service',
+      },
+      {
+        name: 'Capacity for a retained prefix set',
+        tex: String.raw`C = N_\text{prefixes} \times n_\text{tokens} \times \text{KV bytes/token}`,
+        vars: 'size the warm tier above the GPU KV cache, or the service churns what it just evicted',
+        example: '1,000 prefixes × 8K tokens × 128 KiB = ~977 GiB of KV',
+        ch: 'cache-service',
+      },
+    ],
+    numbers: [
+      { label: 'LMCache + vLLM throughput', value: 'up to 15×', note: 'Reported across multi-round QA and document analysis; workload-specific.', ch: 'cache-service' },
+      { label: 'Mooncake effective request capacity', value: '59–498% higher', note: 'Trace replay at Kimi scale; the global cache also raised hit rate by up to 136%.', ch: 'cache-service' },
+      { label: 'SGLang HiCache input throughput', value: '9.4K → 145.5K tokens/s', note: 'DeepSeek-V4-Flash multi-turn, L1+L2+Mooncake L3, hit rate near 98%.', ch: 'cache-service' },
+      { label: 'Dynamo KVBM warm-tier sizing', value: 'CPU cache ≥ 100 GB; disk ≥ CPU', note: 'If the CPU cache is smaller than the GPU cache, KVBM offloads after every forward pass.', ch: 'cache-service' },
+      { label: 'KV chunk / page size', value: '16–512 tokens', note: 'Larger chunks amortise I/O; smaller chunks make eviction and reuse finer-grained.', ch: 'cache-service' },
+      { label: 'Boundary salting', value: '~93%', note: 'of the prefix benefit retained when the salt is injected at the divergence block, not the root.', ch: 'cache-service' },
+    ],
+  },
+
+  // ───────────────────────────── 6. Faster & cheaper
   {
     id: 'faster',
     title: 'Faster and cheaper',
@@ -296,7 +341,7 @@ export const cheatsheet: CheatSection[] = [
     ],
   },
 
-  // ───────────────────────────── 6. Scaling out
+  // ───────────────────────────── 7. Scaling out
   {
     id: 'scale',
     title: 'Scaling out: links, collectives, TP / PP / EP',
@@ -366,7 +411,7 @@ export const cheatsheet: CheatSection[] = [
     ],
   },
 
-  // ───────────────────────────── 7. Production
+  // ───────────────────────────── 8. Production
   {
     id: 'prod',
     title: 'Production: latency, goodput, capacity, cost',
@@ -428,7 +473,7 @@ export const cheatsheet: CheatSection[] = [
     ],
   },
 
-  // ───────────────────────────── 8. Kubernetes
+  // ───────────────────────────── 9. Kubernetes
   {
     id: 'k8s',
     title: 'Running on Kubernetes',
@@ -467,7 +512,7 @@ export const cheatsheet: CheatSection[] = [
     ],
   },
 
-  // ───────────────────────────── 9. Beyond chat
+  // ───────────────────────────── 10. Beyond chat
   {
     id: 'beyond',
     title: 'Beyond chat: reasoning, agents, images, embeddings',
