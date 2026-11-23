@@ -79,7 +79,7 @@ const tour = [
     body: 'The detokenizer turns IDs into text and streams each chunk over SSE. When the request ends, its KV blocks are freed.' },
 ];
 ---
-<Base>
+<Base toolsMenu>
   <main class="home" id="main" tabindex="-1">
     <section class="hero">
       <div class="hero-glow" aria-hidden="true"></div>
@@ -322,6 +322,9 @@ const tour = [
       .reveal.in { opacity: 1; transform: none; }
     }
     @media (scripting: enabled) and (prefers-reduced-motion: reduce) { .reveal { opacity: 1; transform: none; transition: none; } }
+    /* printing or saving the page should never leave sections blank just because they
+       have not been scrolled into view */
+    @media print { .reveal { opacity: 1 !important; transform: none !important; } }
 
     .hero { position: relative; text-align: center; padding: 72px 0 48px; }
     .hero > :not(.hero-glow) { animation: rise 0.8s cubic-bezier(.2,.7,.2,1) both; }

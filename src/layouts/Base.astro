@@ -6,9 +6,9 @@ import '../styles/global.css';
 import { u } from '../lib/url';
 import { tools, toolSvg } from '../data/tools';
 
-interface Props { title?: string; description?: string; wide?: boolean; ogType?: 'website' | 'article' }
+interface Props { title?: string; description?: string; wide?: boolean; ogType?: 'website' | 'article'; toolsMenu?: boolean }
 const SITE = 'Token by Token';
-const { title, ogType = 'website', description = 'LLM inference and serving, visualized: interactive, technical diagrams of every stage of an LLM request — from tokenization to GPU kernels to production serving.' } = Astro.props;
+const { title, ogType = 'website', toolsMenu = false, description = 'LLM inference and serving, visualized: interactive, technical diagrams of every stage of an LLM request — from tokenization to GPU kernels to production serving.' } = Astro.props;
 const here = Astro.url.pathname.replace(/\/$/, '').split('/').pop();
 const fullTitle = title ? `${title} · ${SITE}` : `${SITE} — LLM inference & serving, visualized`;
 const canonical = new URL(Astro.url.pathname, Astro.site);
@@ -55,12 +55,12 @@ const analyticsCode = (import.meta.env.PUBLIC_GOATCOUNTER_CODE ?? '').trim();
       <script is:inline async data-goatcounter={`https://${analyticsCode}.goatcounter.com/count`} src="https://gc.zgo.at/count.js"></script>
     )}
   </head>
-  <body>
+  <body class:list={{ 'has-tools-menu': toolsMenu }}>
     <a class="skip-link" href="#main">Skip to content</a>
     <div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
     <header class="topbar">
       <div class="topbar-in">
-        <button class="icon-btn nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" data-nav-toggle>
+        <button class="icon-btn nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls={toolsMenu ? 'tools-menu' : undefined} data-nav-toggle>
           <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3 6h14M3 10h14M3 14h14"/></svg>
         </button>
         <a class="brand" href={u()}>
@@ -96,6 +96,16 @@ const analyticsCode = (import.meta.env.PUBLIC_GOATCOUNTER_CODE ?? '').trim();
           </button>
         </div>
       </div>
+      {toolsMenu && (
+        <nav class="nav-menu" id="tools-menu" aria-label="Tools" data-nav-menu hidden>
+          {tools.map((t) => (
+            <a href={u(`${t.slug}/`)} class={here === t.slug ? 'on' : ''} aria-current={here === t.slug ? 'page' : undefined} data-review-link={t.slug === 'review' ? '' : undefined}>
+              <Fragment set:html={toolSvg(t)} /><span>{t.label}</span>
+              {t.slug === 'review' && <span class="nav-badge" data-due-badge aria-hidden="true" hidden></span>}
+            </a>
+          ))}
+        </nav>
+      )}
     </header>
 
     <slot />
@@ -187,14 +197,23 @@ const analyticsCode = (import.meta.env.PUBLIC_GOATCOUNTER_CODE ?? '').trim();
       };
       addEventListener('scroll', onScroll, { passive: true }); onScroll();
 
-      // mobile nav
+      // mobile nav: a drawer on chapter/tool pages (Sidebar.astro), and a compact tools
+      // menu in the header on pages without a sidebar (home, 404)
       const navToggles = document.querySelectorAll<HTMLElement>('[data-nav-toggle]');
+      const navMenu = document.querySelector<HTMLElement>('[data-nav-menu]');
       const setNav = (open: boolean) => {
         document.body.classList.toggle('nav-open', open);
         navToggles.forEach((b) => b.setAttribute('aria-expanded', String(open)));
+        if (navMenu) navMenu.hidden = !open;
       };
       navToggles.forEach((b) => b.addEventListener('click', () => setNav(!document.body.classList.contains('nav-open'))));
       document.querySelectorAll('[data-nav-close]').forEach((b) => b.addEventListener('click', () => setNav(false)));
+      navMenu?.querySelectorAll('a').forEach((a) => a.addEventListener('click', () => setNav(false)));
+      document.addEventListener('pointerdown', (e) => {
+        if (!navMenu || navMenu.hidden) return;
+        if (!(e.target as Element).closest('#tools-menu, [data-nav-toggle]')) setNav(false);
+      });
+      addEventListener('resize', () => { if (innerWidth > 1080) setNav(false); });
       addEventListener('keydown', (e) => { if (e.key === 'Escape' && document.body.classList.contains('nav-open')) { setNav(false); navToggles[0]?.focus(); } });
 
       // command palette: the index is one shared, cached JSON file, fetched the first time it is needed
@@ -300,6 +319,15 @@ const analyticsCode = (import.meta.env.PUBLIC_GOATCOUNTER_CODE ?? '').trim();
       .theme-switch[data-mode='light'] .ts-thumb { transform: translateX(30px); }
       .theme-switch[data-mode='dark'] .ts-thumb { transform: translateX(60px); }
       .nav-toggle { display: none; }
+      .has-tools-menu .nav-toggle { display: none; }
+      @media (max-width: 1080px) { .has-tools-menu .nav-toggle { display: grid; } }
+      .nav-menu { position: absolute; z-index: 55; top: calc(100% - 2px); left: 12px; display: grid; gap: 2px; min-width: 232px; padding: 8px; border: 1px solid var(--border-strong); border-radius: 14px; background: var(--surface-solid); box-shadow: 0 26px 60px -18px rgba(0,0,0,0.55); }
+      .nav-menu[hidden] { display: none; }
+      .nav-menu a { position: relative; display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 9px; color: var(--text-dim); font-size: 0.9rem; font-weight: 560; background: none; }
+      .nav-menu a:hover, .nav-menu a.on { color: var(--text); background: var(--accent-soft); }
+      .nav-menu svg { width: 17px; height: 17px; flex: none; color: var(--accent); }
+      .nav-menu .nav-badge { margin-left: auto; }
+      @media (min-width: 1081px) { .nav-menu { display: none; } }
       .search-btn { appearance: none; font: inherit; display: inline-flex; align-items: center; gap: 10px; height: 36px; padding: 0 8px 0 12px; min-width: 260px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text-faint); cursor: pointer; font-size: 0.86rem; transition: border-color 0.15s; }
       .search-btn:hover { border-color: var(--border-strong); color: var(--text-dim); }
       .search-btn svg { width: 16px; height: 16px; }
